@@ -352,14 +352,7 @@ def set_layer_temporal(layer: QgsRasterLayer, dt_str: str, end_str: str = "") ->
     end = (_parse_dt(end_str) or start).addDays(1)
 
     props = layer.temporalProperties()
-    # QGIS < 3.36 exposes the mode on the properties class instead of Qgis.
-    try:
-        mode = Qgis.RasterTemporalMode.FixedTemporalRange
-    except AttributeError:  # pragma: no cover — older QGIS
-        from qgis.core import QgsRasterLayerTemporalProperties
-
-        mode = QgsRasterLayerTemporalProperties.ModeFixedTemporalRange
-    props.setMode(mode)
+    props.setMode(Qgis.RasterTemporalMode.FixedTemporalRange)
     props.setFixedTemporalRange(QgsDateTimeRange(start, end))
     props.setIsActive(True)
 

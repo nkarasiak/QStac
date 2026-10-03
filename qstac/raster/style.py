@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from qgis.core import (
+    Qgis,
     QgsColorRampShader,
     QgsContrastEnhancement,
     QgsMultiBandColorRenderer,
@@ -226,7 +227,7 @@ def _apply_index_renderer(
     ]
     shader = QgsRasterShader()
     ramp_fn = QgsColorRampShader(lo, hi)
-    ramp_fn.setColorRampType(QgsColorRampShader.Interpolated)
+    ramp_fn.setColorRampType(Qgis.ShaderInterpolationMethod.Linear)
     ramp_fn.setClip(False)
     ramp_fn.setColorRampItemList(
         [QgsColorRampShader.ColorRampItem(v, QColor(c), f"{v:.3g}") for v, c in stops]
