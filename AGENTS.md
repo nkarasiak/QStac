@@ -273,7 +273,7 @@ qstac/                   The plugin — the zip is exactly this folder (+ LICENS
     └── theme.py         Palette derived from the running QGIS theme
 
 tests/                   Self-checks (python -m tests.<name>), never shipped
-scripts/                 verify_plugin_zip.py (CI)
+scripts/                 verify_plugin_zip.py, release_notes.py (changelog= → release text) (CI)
 .github/workflows/       ci.yml: lint, security, build zip; a v<version> tag releases
 ```
 

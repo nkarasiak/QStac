@@ -73,10 +73,13 @@ jobs:
           git archive --format=zip --prefix=qstac/ --add-file=LICENSE --add-file=README.md -o "$ZIP" HEAD:qstac
           python3 scripts/verify_plugin_zip.py "$ZIP" qstac "$VERSION"
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+          python3 scripts/release_notes.py "$VERSION" > release-notes.md
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.zip.outputs.zip }}
-          path: ${{ steps.zip.outputs.zip }}
+          path: |
+            ${{ steps.zip.outputs.zip }}
+            release-notes.md
           retention-days: 30
 
   release:
@@ -92,9 +95,7 @@ jobs:
       - uses: softprops/action-gh-release@v3
         with:
           files: ${{ needs.build.outputs.zip }}
-          body: >-
-            QStac ${{ github.ref_name }}. Download the zip below, then install it in QGIS
-            via Plugins > Manage and Install Plugins > Install from ZIP.
+          body_path: release-notes.md
 
       # Publishing to plugins.qgis.org needs a per-plugin token, which exists
       # only once the plugin does: upload the first zip by hand at
