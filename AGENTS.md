@@ -200,7 +200,7 @@ No test suite — testing is done by loading the plugin in QGIS. Eight exception
 
 ```bash
 # Spectral-index path (STAC metadata parsing + VRT pixel function) — needs qgis + GDAL
-P=/home/nkk/miniforge3/envs/qgis
+P=/path/to/conda/envs/qgis
 PYTHONPATH=$P/share/qgis/python $P/bin/python -m tests.test_index
 
 # Collection registry merge — pure stdlib, any Python (keep package __init__s import-free)

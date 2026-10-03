@@ -8,6 +8,8 @@ QGIS can already browse STAC catalogs (Browser > STAC and the Data Source Manage
 
 In QGIS, open *Plugins > Manage and Install Plugins*, search for **QStac** and click *Install Plugin*. QStac is still marked experimental, so tick *Show also experimental plugins* in the Settings tab first.
 
+Or download `qstac-<version>.zip` from the [Releases](https://github.com/nkarasiak/QStac/releases) page and use *Install from ZIP* in the same dialog.
+
 ## What it does
 
 QStac searches STAC catalogs ([Planetary Computer](https://planetarycomputer.microsoft.com/), [Earth Search](https://earth-search.aws.element84.com/v1), [Copernicus Data Space](https://dataspace.copernicus.eu/), or any STAC API you add) by collection, date range and map view. Double click a result and it opens in QGIS as an RGB composite, streamed from the cloud. You never download or manage files.

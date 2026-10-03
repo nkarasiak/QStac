@@ -2,7 +2,7 @@
 """Self-check for spectral-index construction.
 
 Needs a Python with qgis + GDAL on the path, run from the repo root:
-    P=/home/nkk/miniforge3/envs/qgis
+    P=/path/to/conda/envs/qgis
     PYTHONPATH=$P/share/qgis/python $P/bin/python -m tests.test_index
 """
 
