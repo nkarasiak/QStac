@@ -1,0 +1,9 @@
+line-length = 88
+target-version = "py310"
+
+[lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "C901", "SIM", "TCH", "PERF", "FURB", "RUF", "S"]
+
+[lint.per-file-ignores]
+"__init__.py" = ["N802", "N999"]
+"qstac/stac/{auth,detect,net}.py" = ["S310"]  # urllib.request.urlopen wrapped safely with timeout

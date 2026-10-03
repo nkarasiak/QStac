@@ -1,0 +1,1975 @@
+"""QStac dock widget: search a STAC catalog, load scenes as layers."""
+
+from __future__ import annotations
+
+import contextlib
+import html
+import time
+from dataclasses import dataclass, replace
+from datetime import date, timedelta
+from pathlib import Path
+from typing import TYPE_CHECKING, ClassVar
+
+from qgis.core import (
+    Qgis,
+    QgsApplication,
+    QgsCoordinateReferenceSystem,
+    QgsGeometry,
+    QgsProject,
+    QgsRectangle,
+    QgsTask,
+    QgsVectorLayer,
+    QgsWkbTypes,
+)
+from qgis.gui import QgsRubberBand
+from qgis.PyQt import sip
+from qgis.PyQt.QtCore import (
+    QDate,
+    QDir,
+    QEvent,
+    QObject,
+    QSize,
+    Qt,
+    QTimer,
+    QUrl,
+)
+from qgis.PyQt.QtGui import QColor, QDesktopServices, QKeySequence
+from qgis.PyQt.QtWidgets import (
+    QComboBox,
+    QDockWidget,
+    QFileDialog,
+    QHBoxLayout,
+    QLabel,
+    QListWidget,
+    QListWidgetItem,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QShortcut,
+    QSizePolicy,
+    QSlider,
+    QToolBar,
+    QVBoxLayout,
+    QWidget,
+)
+from qgis.utils import pluginMetadata
+
+from .. import settings
+from ..geo import (
+    _WGS84,
+    _filter_by_overlap,
+    _geojson_to_wkt,
+    _transform_from_wgs84,
+)
+from ..log import log
+from ..raster.cog import _HAS_PATH_OPTIONS, clear_asset_headers
+from ..raster.layers import enable_time_stack
+from ..raster.tasks import ExportClipTask
+from ..stac.auth import request_headers
+from ..stac.catalogs import (
+    CATALOG_BY_ID,
+    CATALOGS,
+    DEFAULT_CATALOG,
+    CatalogProvider,
+    make_user_catalog,
+    with_conformance,
+)
+from ..stac.collections import merge_collections
+from ..stac.items import facet_counts, facet_label
+from ..stac.net import StacError
+from ..stac.search import PageToken, fetch_collections, fetch_root
+from ..stac.search_task import StacSearchTask
+from . import styles
+from .collection_combo import _CollectionDelegate, _ComboFilter
+from .constants import (
+    _DATE_CALENDAR_DELAY_MS,
+    _DATE_PRESETS,
+    _SEPARATOR_ROLE,
+    P,
+    _scenes,
+    _shorten_id,
+)
+from .index_dialog import IndexDialog, custom_index_presets, index_key
+from .loading import (
+    _NO_META,
+    LayerLoader,
+    _asset_label,
+    _default_assets,
+    _guess_item_asset,
+    _natural_key,
+    _raster_assets,
+    signed_assets,
+    viewport_bbox_4326,
+)
+from .thumbnails import ThumbnailLoader
+from .widgets import (
+    _CARD_H,
+    ClickableDateEdit,
+    ElidedLabel,
+    RefreshingCombo,
+    _WheelGuard,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from qgis.gui import QgisInterface
+
+    from ..stac.collections import BandPreset, CollectionInfo, IndexPreset
+    from ..stac.items import StacItemResult
+
+    _DateRangeFn = Callable[[QDate], tuple[QDate, QDate]]
+
+__all__ = ["QStacDock"]
+
+
+# Start of the "All" date preset — older than any imagery a STAC API serves.
+_ANYTIME_START = QDate(1900, 1, 1)
+
+
+def _bbox_intersects(
+    a: tuple[float, float, float, float], b: list[float] | None
+) -> bool:
+    """Whether two (west, south, east, north) boxes overlap."""
+    if not b or len(b) != 4:
+        return True  # unknown footprint — let the export try
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+
+def _union(boxes: list[list[float]]) -> list[float]:
+    """The (west, south, east, north) box around all *boxes*."""
+    # ponytail: naive min/max, wrong across the antimeridian (rare for a selection).
+    return [
+        min(b[0] for b in boxes),
+        min(b[1] for b in boxes),
+        max(b[2] for b in boxes),
+        max(b[3] for b in boxes),
+    ]
+
+
+# Collection combo: floor width in characters, and how many rows the popup
+# shows before scrolling (a provider's full listing runs to 250 entries).
+_COLLECTION_MIN_CHARS = 18
+_COLLECTION_MAX_VISIBLE = 14
+
+# GET budget for discovering a user catalog's collections.
+_DISCOVERY_TIMEOUT_S = 10
+
+# Full ``/collections`` listings, per catalog id, for this session. A provider
+# publishes far more than the curated registry names, and the listing is big
+# (Planetary Computer: ~125 entries) but stable, so fetch it once per session.
+_DISCOVERY_CACHE: dict[str, tuple[CollectionInfo, ...]] = {}
+
+# Combo data of the catalog combo's trailing "Add STAC API…" entry.
+_ADD_CATALOG = "__add__"
+
+
+# Friendly (title, suggestion) per StacSearchTask.error_kind. "auth" is handled
+# separately by QStacDock._prompt_auth.
+_ERROR_MESSAGES: dict[str, tuple[str, str]] = {
+    "timeout": (
+        "Search timed out",
+        "Zoom in to a smaller area or raise the HTTP timeout in Settings.",
+    ),
+    "network": (
+        "Network error",
+        "Check your internet connection, then try again.",
+    ),
+    "rate_limit": (
+        "Rate limit reached",
+        "The catalog is throttling requests. Wait a moment and try again.",
+    ),
+    "server": (
+        "Catalog server error",
+        "The STAC server returned an error. Try again shortly.",
+    ),
+    "client": (
+        "Search rejected",
+        "The search request was invalid for this collection.",
+    ),
+    "unknown": (
+        "Search failed",
+        "An unexpected error occurred. See details below.",
+    ),
+}
+
+
+@dataclass
+class _SearchRun:
+    """One search, snapshotted when it starts.
+
+    Its pages ("Load more results") and the loads of its scenes use these,
+    not whatever the catalog combo, collection combo or dates show by then.
+    """
+
+    catalog: CatalogProvider
+    collection: CollectionInfo
+    bbox: tuple[float, float, float, float]
+    date_from: str
+    date_to: str
+    cloud: int | None
+    task: StacSearchTask | None = None  # the page request in flight
+
+
+class QStacDock(QDockWidget):
+    """Dock widget: search a STAC catalog, load scenes as layers."""
+
+    def __init__(self, iface: QgisInterface, parent: QWidget | None = None):
+        super().__init__("QStac", parent)
+        self.iface = iface
+        self.setObjectName("QStacDock")
+        self.setAllowedAreas(
+            Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
+        )
+
+        # Set before _resolve_catalog/_restore_state, which both feed them.
+        self._closed = False
+        self._loader = LayerLoader(iface, self._flash_status, self)
+        self._thumbs = ThumbnailLoader(self)
+        self._resolve_task: QgsTask | None = None
+        self._pending_collection_id: str | None = None
+
+        self._catalog: CatalogProvider = self._resolve_catalog()
+        self._collection_by_id: dict[str, CollectionInfo] = {
+            c.id: c for c in self._catalog.collections
+        }
+        self._run: _SearchRun | None = None  # the search the results belong to
+        self._results: list[StacItemResult] = []
+        self._facet_filter: dict[str, str] = {}  # FACETS key → chosen value
+        self._next_page: PageToken | None = None
+        self._rubber_band: QgsRubberBand | None = None
+
+        # Animated search progress
+        self._progress_timer = QTimer(self)
+        self._progress_timer.setInterval(500)
+        self._progress_timer.timeout.connect(self._on_progress_tick)
+        self._search_start_time: float = 0.0
+        self._progress_dots: int = 0
+
+        self._build_ui()
+        self._connect_signals()
+        self._setup_shortcuts()
+        self._restore_state()
+        self._discover_collections()
+        self._sync_date_presets()
+
+    def _resolve_catalog(self) -> CatalogProvider:
+        """The configured catalog provider.
+
+        A user STAC API has no built-in collection registry: it comes back
+        with none, and :meth:`_list_user_catalog` fetches them in the
+        background, so a dead API never freezes the dock (or QGIS startup).
+        """
+        cat_id = settings.catalog()
+        if cat_id in CATALOG_BY_ID:
+            return CATALOG_BY_ID[cat_id]
+        entry = next((e for e in settings.user_catalogs() if e["id"] == cat_id), None)
+        if entry is None:
+            # Deleted or renamed in the QGIS Browser: persist the fallback.
+            settings.save_all({"catalog": DEFAULT_CATALOG.id})
+            return DEFAULT_CATALOG
+        # The saved listing shows at once; _list_user_catalog refreshes it.
+        catalog = replace(
+            make_user_catalog(entry), collections=settings.saved_collections(cat_id)
+        )
+        if catalog.auth_assets and not _HAS_PATH_OPTIONS:
+            self._notify(
+                f"{catalog.label}: logging in to download images needs GDAL 3.6"
+                " or later, so they load without it.",
+                Qgis.MessageLevel.Warning,
+                8,
+            )
+        self._list_user_catalog(catalog)
+        return catalog
+
+    def _list_user_catalog(self, catalog: CatalogProvider) -> None:
+        """Fetch a user catalog's collections (and extensions) in a task.
+
+        One GET per listing page plus the root, and the first time its OAuth2
+        token, all off the GUI thread. Lands in :meth:`_on_user_catalog`.
+        """
+
+        def _fetch(_task) -> CatalogProvider:
+            headers = request_headers(catalog) or None
+            colls = fetch_collections(
+                catalog.root_url, http_timeout=_DISCOVERY_TIMEOUT_S, headers=headers
+            )
+            if not colls:
+                raise RuntimeError("the API listed no collections")
+            resolved = replace(catalog, collections=tuple(colls))
+            try:
+                root = fetch_root(catalog.root_url, headers, _DISCOVERY_TIMEOUT_S)
+            except Exception as exc:
+                log(
+                    f"{catalog.label}: no conformance classes ({exc})",
+                    Qgis.MessageLevel.Info,
+                )
+                return resolved  # extensions stay off: filtered client-side
+            return with_conformance(resolved, root.get("conformsTo", []))
+
+        task = QgsTask.fromFunction(
+            f"Listing {catalog.label} collections",
+            _fetch,
+            on_finished=lambda exc, result=None: self._on_user_catalog(
+                task, catalog, exc, result
+            ),
+        )
+        self._resolve_task = task
+        self._loader.run_task(task)
+
+    def _on_user_catalog(
+        self,
+        task: QgsTask,
+        catalog: CatalogProvider,
+        exc: Exception | None,
+        result: CatalogProvider | None,
+    ) -> None:
+        """A user catalog's listing landed: show it, or fall back to the default."""
+        if self._closed or sip.isdeleted(self) or task is not self._resolve_task:
+            return  # unloaded, or switched away while it was in flight
+        self._resolve_task = None
+        if exc is None and result is not None:
+            settings.save_collections(result.id, result.collections)
+            self._catalog = result
+            self._collection_by_id = {c.id: c for c in result.collections}
+            self._populate_collections(
+                self._pending_collection_id or self.combo_collection.currentData()
+            )
+            self._pending_collection_id = None
+            return
+        if catalog.collections:
+            # Unreachable or refused now, but listed before: keep that list.
+            if isinstance(exc, StacError) and exc.kind == "auth":
+                self._prompt_auth(str(exc), catalog)
+                return
+            self._notify(
+                f"{catalog.label}: could not refresh its collections ({exc}),"
+                " showing the saved list.",
+                Qgis.MessageLevel.Warning,
+                6,
+            )
+            return
+        # Persist what is actually in use, so a restart does not flip back.
+        settings.save_all({"catalog": DEFAULT_CATALOG.id})
+        self._apply_catalog(DEFAULT_CATALOG)
+        if isinstance(exc, StacError) and exc.kind == "auth":
+            self._prompt_auth(str(exc), catalog)
+            return
+        self._notify(
+            f"{catalog.label} unavailable ({exc}), using {DEFAULT_CATALOG.label}.",
+            Qgis.MessageLevel.Warning,
+            8,
+        )
+
+    def _switch_catalog(self, keep: str | None = None) -> None:
+        """Re-resolve the configured catalog and reset everything it owns.
+
+        Results, thumbnails and paging all belong to one provider, so a switch
+        drops them rather than mixing two catalogs in the list; the search in
+        flight goes too. Loads already running finish with the catalog they
+        started with. *keep* re-selects that collection once it is listed.
+        Called from the catalog combo and from the settings dialog.
+        """
+        self._cancel_search()
+        self._loader.cancel_warming()
+        if self._resolve_task is not None:
+            with contextlib.suppress(RuntimeError):
+                self._resolve_task.cancel()
+            self._resolve_task = None  # its listing is for the previous pick
+        old = self._catalog
+        if old.auth_assets and not any(
+            e["id"] == old.id and e.get("auth_assets") for e in settings.user_catalogs()
+        ):
+            clear_asset_headers(old.id)  # deleted, or no asset login any more
+        self._apply_catalog(self._resolve_catalog(), keep)
+
+    def _switch_catalog_later(self) -> None:
+        """:meth:`_switch_catalog` on the next event-loop turn (out of a popup)."""
+
+        def run() -> None:
+            if not self._closed and not sip.isdeleted(self):
+                self._switch_catalog()
+
+        QTimer.singleShot(0, run)
+
+    def _apply_catalog(self, catalog: CatalogProvider, keep: str | None = None) -> None:
+        """Make *catalog* the one in use and repaint the dock for it."""
+        self._catalog = catalog
+        self._collection_by_id = {c.id: c for c in catalog.collections}
+        self._clear_results()
+        self._set_status("")
+        self._populate_collections(keep)
+        # Listed already (a saved listing): nothing left to wait for.
+        found = keep is not None and self.combo_collection.currentData() == keep
+        self._pending_collection_id = None if found else keep
+        self._discover_collections()
+        # The combo follows what is in use, not what was clicked. Rebuilt,
+        # not just re-synced: the settings dialog may have added, renamed or
+        # removed user catalogs.
+        self._populate_catalogs()
+
+    def _clear_results(self) -> None:
+        """Drop the result list, its thumbnails, paging and search."""
+        self._remove_load_more_item()
+        self.list_results.clear()
+        self._results.clear()
+        self._facet_filter.clear()
+        self.btn_filter.setVisible(False)
+        self._thumbs.clear()
+        self._next_page = None
+        self._run = None
+
+    def _discover_collections(self) -> None:
+        """Extend the curated registry with everything the provider serves.
+
+        The combo is already painted from the registry, so this runs in the
+        background and repaints when it lands — a provider listing is big and
+        an unreachable API must not stall the dock. The listing saved last
+        time is shown meanwhile. Failures stay silent: the saved or curated
+        collections remain.
+        """
+        catalog = self._catalog
+        if catalog.id not in CATALOG_BY_ID:
+            return  # a user catalog's collections already ARE a discovered listing
+        cached = _DISCOVERY_CACHE.get(catalog.id)
+        if cached is not None:
+            self._apply_discovered(catalog.id, cached)
+            return
+        saved = settings.saved_collections(catalog.id)
+        if saved:
+            self._apply_discovered(catalog.id, saved)
+
+        cat_id, root = catalog.id, catalog.root_url
+        timeout = settings.http_timeout()
+
+        def _fetch(_task):
+            return fetch_collections(root, http_timeout=timeout)
+
+        def _finished(exc, result=None) -> None:
+            if exc is not None:
+                log(f"Could not list the collections of {root}: {exc}")
+            if exc is not None or not result or self._closed or sip.isdeleted(self):
+                return
+            _DISCOVERY_CACHE[cat_id] = tuple(result)
+            settings.save_collections(cat_id, tuple(result))
+            self._apply_discovered(cat_id, tuple(result))
+
+        self._loader.run_task(
+            QgsTask.fromFunction("Listing collections", _fetch, on_finished=_finished)
+        )
+
+    def _apply_discovered(
+        self, cat_id: str, discovered: tuple[CollectionInfo, ...]
+    ) -> None:
+        """Merge a discovered listing into the live catalog and repaint."""
+        if cat_id != self._catalog.id:
+            return  # catalog switched while the listing was in flight
+        # Onto the registry, not the live list: a fresh listing replaces the
+        # saved one shown meanwhile, gone collections included.
+        merged = merge_collections(CATALOG_BY_ID[cat_id].collections, discovered)
+        if merged == self._catalog.collections:
+            return
+        self._catalog = replace(self._catalog, collections=merged)
+        self._collection_by_id = {c.id: c for c in merged}
+        # A saved collection missing at startup is a discovered one — restoring
+        # it is the whole point of the listing.
+        self._populate_collections(
+            self._pending_collection_id or self.combo_collection.currentData()
+        )
+        self._pending_collection_id = None  # _populate_collections refreshed the UI
+
+    def closeEvent(self, event):  # noqa: N802
+        # Closing only hides the dock (it is reopened from the toolbar), so the
+        # project/canvas signals stay connected; shutdown() drops them.
+        with contextlib.suppress(RuntimeError):
+            settings.save_dock_geometry(self.saveGeometry())
+        super().closeEvent(event)
+
+    def _restore_state(self) -> None:
+        """Restore last-search inputs and dock geometry from settings."""
+        geom = settings.dock_geometry()
+        if geom:
+            with contextlib.suppress(RuntimeError, TypeError):
+                self.restoreGeometry(geom)
+
+        ls = settings.last_search()
+        coll_id = ls["collection"]
+        if coll_id:
+            idx = self.combo_collection.findData(coll_id)
+            if idx >= 0:
+                self.combo_collection.setCurrentIndex(idx)
+            else:
+                # Not in the curated registry — retry once discovery lands.
+                self._pending_collection_id = coll_id
+        # Block dateChanged so restoring date_from doesn't pop the calendar.
+        if ls["date_from"]:
+            self.date_from.blockSignals(True)
+            self.date_from.setDate(QDate.fromString(str(ls["date_from"]), "yyyy-MM-dd"))
+            self.date_from.blockSignals(False)
+        if ls["date_to"]:
+            self.date_to.setDate(QDate.fromString(str(ls["date_to"]), "yyyy-MM-dd"))
+        # Cloud cover is intentionally NOT restored from the last search — the
+        # configured default always wins, so the settings dialog stays the single
+        # place that decides where the slider opens.
+        self.cloud_slider.setValue(settings.default_cloud_cover())
+        self._update_cloud_visibility()
+
+    def shutdown(self) -> None:
+        """Stop tasks, abort network replies, stop timers.
+
+        Called from the plugin's ``unload()`` before the dock is destroyed so
+        background callbacks can't fire into a deleted Qt object after
+        plugin reload, and no task still writes into the clip dir it deletes.
+        """
+        self._closed = True
+        self._loader.shutdown()
+        self._thumbs.clear()
+        if self._rubber_band is not None:
+            with contextlib.suppress(RuntimeError):
+                self.iface.mapCanvas().scene().removeItem(self._rubber_band)
+            self._rubber_band = None
+        with contextlib.suppress(RuntimeError):
+            self._progress_timer.stop()
+
+    def _build_ui(self) -> None:
+        container = QWidget()
+        # Pin the panel background and default label color so the derived
+        # palette (ui/theme.py) is applied consistently — several children set
+        # only a foreground color and would otherwise sit on an unstyled parent.
+        container.setObjectName("QStacBody")
+        container.setStyleSheet(
+            f"#QStacBody {{ background: {P.panel}; }}"
+            f"#QStacBody QLabel {{ color: {P.text}; }}"
+        )
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(0)
+
+        self._build_toolbar(layout)
+        self._build_collection_combo(layout)
+        layout.addSpacing(8)
+        self._build_date_range(layout)
+        layout.addSpacing(4)
+        self._build_cloud_slider(layout)
+        layout.addSpacing(8)
+        self._build_search_button(layout)
+        layout.addSpacing(4)
+        self._build_results_list(layout)
+
+        self.setWidget(container)
+        self._update_cloud_visibility()
+
+    def _build_toolbar(self, layout: QVBoxLayout) -> None:
+        """Top row: QGIS-Browser-style icons, then the catalog combo."""
+        bar = QToolBar()
+        bar.setIconSize(QSize(16, 16))
+        bar.setStyleSheet("QToolBar { border: none; padding: 0; }")
+
+        # Refilled as it opens: the list is QGIS's STAC connections, which
+        # the QGIS Browser can change at any time.
+        self.combo_catalog = RefreshingCombo(self._populate_catalogs)
+        self.combo_catalog.setMinimumHeight(28)
+        # Takes whatever the icons leave; a long user API name elides in the
+        # closed box but lays out in full in the popup.
+        self.combo_catalog.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self.combo_catalog.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.combo_catalog.setStyleSheet(styles.combo_style(P))
+        # A catalog change drops the results and, for a user API, blocks on a
+        # GET — far too destructive to fire by scrolling past the widget.
+        self.combo_catalog.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._catalog_wheel_guard = _WheelGuard(self.combo_catalog)
+        self.combo_catalog.installEventFilter(self._catalog_wheel_guard)
+
+        icon = QgsApplication.getThemeIcon
+        bar.addAction(icon("mActionAdd.svg"), "Add STAC API…").triggered.connect(
+            self._add_user_catalog
+        )
+        # Enabled on user catalogs only, by _sync_catalog_combo.
+        self.action_edit = bar.addAction(
+            icon("mActionToggleEditing.svg"), "Edit this STAC API…"
+        )
+        self.action_edit.triggered.connect(lambda: self._edit_user_catalog())
+        bar.addAction(
+            icon("mActionRefresh.svg"), "Reload this catalog's collections"
+        ).triggered.connect(self._refresh_collections)
+        bar.addAction(
+            icon("mActionPropertiesWidget.svg"), "Catalog and collection info"
+        ).triggered.connect(self._show_info)
+        bar.addAction(icon("mActionOptions.svg"), "Settings…").triggered.connect(
+            self.open_settings_dialog
+        )
+        bar.addAction(icon("mActionHelpContents.svg"), "Help").triggered.connect(
+            lambda: QDesktopServices.openUrl(
+                QUrl(pluginMetadata(__package__.partition(".")[0], "homepage"))
+            )
+        )
+        bar.addWidget(self.combo_catalog)
+        # After the actions: _sync_catalog_combo enables action_edit.
+        self._populate_catalogs()
+        layout.addWidget(bar)
+        layout.addSpacing(6)
+
+    def _build_collection_combo(self, layout: QVBoxLayout) -> None:
+        """Build the collection dropdown."""
+        self.combo_collection = QComboBox()
+        self.combo_collection.setMinimumHeight(32)
+        # Without this the combo sizes itself to its widest entry, and a
+        # discovered collection with a 90-character title drags the whole dock
+        # out to ~600px. The row gives it every spare pixel anyway; this only
+        # sets the floor, and the delegate elides whatever does not fit.
+        self.combo_collection.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.combo_collection.setMinimumContentsLength(_COLLECTION_MIN_CHARS)
+        # Popup height: capped rather than grown to the screen. Only works
+        # alongside `combobox-popup: 0` in styles.combo_style().
+        self.combo_collection.setMaxVisibleItems(_COLLECTION_MAX_VISIBLE)
+        # _CollectionDelegate paints the popup rows itself, so the closed combo
+        # and its view must be styled to match rather than left to Qt.
+        self.combo_collection.setStyleSheet(styles.combo_style(P))
+        self.combo_collection.setItemDelegate(
+            _CollectionDelegate(self.combo_collection)
+        )
+
+        # Editable only so the box can echo what is being typed: the line edit
+        # is read-only, so clicking it opens the list like any other combo
+        # instead of dropping a caret in a text field. _ComboFilter turns
+        # typing-while-open into a substring filter over 250 collections.
+        self.combo_collection.setEditable(True)
+        self.combo_collection.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        line = self.combo_collection.lineEdit()
+        line.setReadOnly(True)
+        line.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._collection_filter = _ComboFilter(self.combo_collection)
+        # Scrolling the panel past it must not switch the collection.
+        self.combo_collection.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._collection_wheel_guard = _WheelGuard(self.combo_collection)
+        self.combo_collection.installEventFilter(self._collection_wheel_guard)
+
+        self._populate_collections()
+
+        layout.addWidget(self.combo_collection)
+
+    def _populate_catalogs(self) -> None:
+        """Fill the catalog combo: built-ins, user APIs, then "Add STAC API…"."""
+        self.combo_catalog.blockSignals(True)
+        self.combo_catalog.clear()
+        user = [make_user_catalog(e) for e in settings.user_catalogs()]
+        for cat in [*CATALOGS, *user]:
+            self.combo_catalog.addItem(cat.short_label or cat.label, cat.id)
+            self.combo_catalog.setItemData(
+                self.combo_catalog.count() - 1,
+                f"{cat.label}\n{cat.description}",
+                Qt.ItemDataRole.ToolTipRole,
+            )
+        # Always listed — hiding it hides the feature. Picking it opens the
+        # catalog editor instead of switching.
+        self.combo_catalog.addItem("Add STAC API…", _ADD_CATALOG)
+        self.combo_catalog.setItemData(
+            self.combo_catalog.count() - 1,
+            "Any STAC API, with any QGIS authentication (OAuth2, Basic, API key…)",
+            Qt.ItemDataRole.ToolTipRole,
+        )
+        self.combo_catalog.blockSignals(False)
+        self._sync_catalog_combo()
+
+    def _sync_catalog_combo(self) -> None:
+        """Point the catalog combo at the catalog actually in use."""
+        if not hasattr(self, "combo_catalog"):
+            return
+        idx = self.combo_catalog.findData(self._catalog.id)
+        if idx < 0:
+            # Its QGIS connection was deleted or renamed in the Browser.
+            self._switch_catalog_later()
+        self.combo_catalog.blockSignals(True)
+        self.combo_catalog.setCurrentIndex(max(idx, 0))
+        self.combo_catalog.setToolTip(
+            f"{self._catalog.label}\n{self._catalog.description}"
+        )
+        self.action_edit.setEnabled(self._catalog.id not in CATALOG_BY_ID)
+        self.combo_catalog.blockSignals(False)
+
+    def _on_catalog_changed(self) -> None:
+        """Persist the picked catalog, then reset the dock onto it."""
+        cat_id = self.combo_catalog.currentData()
+        if not cat_id or cat_id == self._catalog.id:
+            return
+        if cat_id == _ADD_CATALOG:
+            # Undo the pick; the editor's OK path adds and switches.
+            self._sync_catalog_combo()
+            self._add_user_catalog()
+            return
+        settings.apply_changes(settings.save_all({"catalog": cat_id}))
+        self._switch_catalog()
+
+    def _populate_collections(self, select_id: str | None = None) -> None:
+        """Fill the collection combo from the catalog.
+
+        *select_id* re-selects that collection when it is present, so a
+        repopulate (a discovery landing) does not move the user's choice.
+        """
+        self.combo_collection.blockSignals(True)
+        self.combo_collection.clear()
+
+        catalog = self._catalog
+        seen_categories: set[str] = set()
+        model = self.combo_collection.model()
+        for coll in catalog.collections:
+            if coll.category and coll.category not in seen_categories:
+                seen_categories.add(coll.category)
+                sep_idx = self.combo_collection.count()
+                self.combo_collection.addItem(coll.category)
+                item = model.item(sep_idx)
+                item.setData(True, _SEPARATOR_ROLE)
+                item.setEnabled(False)
+                item.setSelectable(False)
+
+            idx = self.combo_collection.count()
+            self.combo_collection.addItem(coll.label, coll.id)
+            model.item(idx).setToolTip(f"{coll.id}\n{coll.description}")
+        if not catalog.collections:
+            # A user catalog whose listing is still in flight (no data: there
+            # is nothing to search yet).
+            self.combo_collection.addItem("Listing collections…")
+
+        idx = self.combo_collection.findData(select_id) if select_id else -1
+        if idx >= 0:
+            self.combo_collection.setCurrentIndex(idx)
+        else:
+            for i in range(self.combo_collection.count()):
+                if model.item(i).isEnabled():
+                    self.combo_collection.setCurrentIndex(i)
+                    break
+
+        self.combo_collection.blockSignals(False)
+        if hasattr(self, "cloud_slider"):
+            self._update_cloud_visibility()
+
+    def _build_date_range(self, layout: QVBoxLayout) -> None:
+        """Build the date from/to row and preset buttons."""
+        date_row = QHBoxLayout()
+        date_row.setContentsMargins(0, 0, 0, 0)
+        date_row.setSpacing(4)
+
+        self.date_from = ClickableDateEdit()
+        days = settings.default_date_range()
+        self.date_from.setDate(date.today() - timedelta(days=days))
+        self.date_from.setDisplayFormat("yyyy-MM-dd")
+        self.date_from.setFixedHeight(28)
+        self.date_from.setStyleSheet(styles.date_edit_style(P))
+        date_row.addWidget(self.date_from, 1)
+
+        arrow = QLabel("\u2192")
+        arrow.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        arrow.setStyleSheet(f"color: {P.arrow}; font-size: 13px;")
+        arrow.setFixedWidth(16)
+        date_row.addWidget(arrow)
+
+        self.date_to = ClickableDateEdit()
+        self.date_to.setDate(date.today())
+        self.date_to.setDisplayFormat("yyyy-MM-dd")
+        self.date_to.setFixedHeight(28)
+        self.date_to.setStyleSheet(styles.date_edit_style(P))
+        date_row.addWidget(self.date_to, 1)
+
+        layout.addLayout(date_row)
+        layout.addSpacing(3)
+
+        presets_layout = QHBoxLayout()
+        presets_layout.setContentsMargins(0, 0, 0, 0)
+        presets_layout.setSpacing(3)
+        # Checkable so the active range stays visibly selected; _sync_date_presets
+        # clears it again when the dates are edited by hand.
+        # Each preset maps today's date to a (from, to) range.
+        self._preset_buttons: list[tuple[QPushButton, _DateRangeFn]] = []
+        presets: list[tuple[str, str, _DateRangeFn]] = [
+            (label, f"Last {label}", lambda t, d=days: (t.addDays(-d), t))
+            for label, days in _DATE_PRESETS
+        ]
+        last = date.today().year - 1
+        presets += [
+            (
+                str(last),
+                f"Calendar year {last}",
+                lambda _t, y=last: (QDate(y, 1, 1), QDate(y, 12, 31)),
+            ),
+            ("All", "Any date", lambda t: (_ANYTIME_START, t)),
+        ]
+        for label, tooltip, range_fn in presets:
+            btn = QPushButton(label)
+            btn.setFixedHeight(22)
+            btn.setFixedWidth(32)
+            btn.setCheckable(True)
+            btn.setAutoExclusive(False)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setToolTip(tooltip)
+            btn.setStyleSheet(styles.preset_btn_style(P))
+            btn.clicked.connect(self._make_preset_handler(range_fn))
+            presets_layout.addWidget(btn)
+            self._preset_buttons.append((btn, range_fn))
+        presets_layout.addStretch()
+        layout.addLayout(presets_layout)
+
+    def _build_cloud_slider(self, layout: QVBoxLayout) -> None:
+        """Build the cloud cover slider row."""
+        cloud_row = QHBoxLayout()
+        cloud_row.setContentsMargins(0, 0, 0, 0)
+        cloud_row.setSpacing(4)
+
+        self.cloud_icon = QLabel("\u2601")
+        self.cloud_icon.setStyleSheet(f"color: {P.cloud_icon}; font-size: 16px;")
+        # Pinned to the slider's height: the glyph's line box would otherwise
+        # make this row taller than the others.
+        self.cloud_icon.setFixedSize(20, 16)
+        self.cloud_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        cloud_row.addWidget(self.cloud_icon)
+
+        self.cloud_label = QLabel("Cloud")
+        self.cloud_label.setStyleSheet(f"color: {P.text}; font-size: 10px;")
+        self.cloud_label.setFixedWidth(32)
+        cloud_row.addWidget(self.cloud_label)
+
+        self.cloud_slider = QSlider(Qt.Orientation.Horizontal)
+        self.cloud_slider.setRange(0, 100)
+        _default_cc = settings.default_cloud_cover()
+        self.cloud_slider.setValue(_default_cc)
+        self.cloud_slider.setFixedHeight(16)
+        self.cloud_slider.setStyleSheet(
+            "QSlider::groove:horizontal {"
+            f" background: {P.surface}; height: 4px; border-radius: 2px; }}"
+            "QSlider::handle:horizontal {"
+            f" background: {P.accent}; width: 14px; height: 14px;"
+            " margin: -5px 0; border-radius: 7px; }"
+            "QSlider::sub-page:horizontal {"
+            f" background: {P.btn_primary}; border-radius: 1px; }}"
+        )
+        cloud_row.addWidget(self.cloud_slider, 1)
+
+        self.cloud_value_label = QLabel(f"{_default_cc}%")
+        self.cloud_value_label.setStyleSheet(
+            f"color: {P.text}; font-size: 10px; font-weight: bold;"
+        )
+        # Wide enough for a bold "100%" — 28px clipped the trailing glyph.
+        self.cloud_value_label.setFixedWidth(38)
+        self.cloud_value_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        cloud_row.addWidget(self.cloud_value_label)
+
+        layout.addLayout(cloud_row)
+
+    def _build_search_button(self, layout: QVBoxLayout) -> None:
+        """Build the search button."""
+        self.btn_search = QPushButton("Search")
+        self.btn_search.setFixedHeight(34)
+        self.btn_search.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_search.setToolTip("Search the map view (Ctrl+Return)")
+        self.btn_search.setStyleSheet(styles.search_btn_style(P))
+        layout.addWidget(self.btn_search)
+
+    def _build_results_list(self, layout: QVBoxLayout) -> None:
+        """Build the status row (count + sort) and results list."""
+        status_row = QHBoxLayout()
+        status_row.setContentsMargins(0, 0, 0, 0)
+
+        # Elided: a long message ("Saved <file>.") must not widen the dock.
+        self.label_status = ElidedLabel("")
+        self.label_status.setStyleSheet(f"color: {P.text_dim}; font-size: 10px;")
+        status_row.addWidget(self.label_status, 1)
+
+        # The result count is the status line's resting state; loading progress
+        # only borrows it temporarily (see _flash_status).
+        self._status_persist = ""
+        self._status_flash_token = 0
+
+        self._sort_modes = [
+            ("Date \u2193", "date_desc"),
+            ("Date \u2191", "date_asc"),
+            ("Clouds \u2191", "cloud_asc"),
+            ("Clouds \u2193", "cloud_desc"),
+        ]
+        self._sort_index = 0
+        link_style = styles.link_btn_style(P)
+        # Post-search refine by item properties (orbit, tile...); shown only
+        # when the results differ on at least one of them.
+        self.btn_filter = QPushButton("Filter")
+        self.btn_filter.setFixedHeight(16)
+        self.btn_filter.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_filter.setStyleSheet(link_style)
+        self.btn_filter.setVisible(False)
+        self.btn_filter.clicked.connect(self._show_filter_menu)
+        status_row.addWidget(self.btn_filter)
+
+        self.btn_sort = QPushButton(self._sort_modes[0][0])
+        self.btn_sort.setFixedHeight(16)
+        self.btn_sort.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_sort.setStyleSheet(link_style)
+        self.btn_sort.setVisible(False)
+        self.btn_sort.clicked.connect(self._cycle_sort)
+        status_row.addWidget(self.btn_sort)
+
+        layout.addLayout(status_row)
+        layout.addSpacing(2)
+
+        self.list_results = QListWidget()
+        self.list_results.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self.list_results.setStyleSheet(styles.results_list_style(P))
+        self.list_results.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.list_results.setSpacing(0)
+        self.list_results.setMouseTracking(True)
+        self.list_results.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list_results.installEventFilter(self)
+        # Room for a card and a half: once results show, a short dock grows to
+        # fit the first one, and the half card below says there are more.
+        self.list_results.setMinimumHeight(
+            (_CARD_H + 4) * 3 // 2 + 2 * self.list_results.frameWidth()
+        )
+        layout.addWidget(self.list_results, 1)
+
+        # Empty state: an untouched dock is otherwise a featureless panel.
+        self.label_empty = QLabel(
+            "Pan and zoom the map to the area you want, "
+            "then launch a search to list matching scenes.\n\n"
+            "Double-click a result to load it. Right-click "
+            "for band combinations and spectral indices."
+        )
+        self.label_empty.setAlignment(
+            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop
+        )
+        self.label_empty.setWordWrap(True)
+        # Ignored height: a hint must never set the dock's minimum height, so a
+        # short dock clips the text instead of growing to fit it.
+        self.label_empty.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Ignored
+        )
+        self.label_empty.setStyleSheet(f"color: {P.text_dim}; padding: 12px 8px;")
+        layout.addWidget(self.label_empty, 1)
+        self.list_results.setVisible(False)
+
+        self._load_more_item: QListWidgetItem | None = None
+
+    def _notify(self, text: str, level: Qgis.MessageLevel, duration: int) -> None:
+        """Push *text* to the QGIS message bar."""
+        self.iface.messageBar().pushMessage("QStac", text, level, duration)
+
+    def _set_results_visible(self, visible: bool) -> None:
+        """Swap between the empty-state hint and the results list."""
+        self.label_empty.setVisible(not visible)
+        self.list_results.setVisible(visible)
+
+    def _set_status(self, text: str) -> None:
+        """Set the resting status line (result count, errors, cancellation)."""
+        self._status_persist = text
+        self._status_flash_token += 1  # invalidate any pending restore
+        self.label_status.setText(text)
+
+    def _flash_status(self, text: str, ms: int = 4000) -> None:
+        """Show a transient message without losing the resting status line.
+
+        ``ms=0`` means "show until something else replaces it" — used for
+        in-flight progress ticks that are always followed by another update.
+        """
+        self._status_flash_token += 1
+        self.label_status.setText(text)
+        if ms <= 0:
+            return
+        token = self._status_flash_token
+
+        def restore() -> None:
+            if token != self._status_flash_token or sip.isdeleted(self.label_status):
+                return
+            self.label_status.setText(self._status_persist)
+
+        QTimer.singleShot(ms, restore)
+
+    def _make_preset_handler(self, range_fn: _DateRangeFn) -> Callable[[], None]:
+        def handler() -> None:
+            start, end = range_fn(QDate.currentDate())
+            self.date_from.blockSignals(True)
+            self.date_from.setDate(start)
+            self.date_from.blockSignals(False)
+            self.date_to.setDate(end)
+            self._sync_date_presets()
+
+        return handler
+
+    def _sync_date_presets(self) -> None:
+        """Check the preset button matching the current range, uncheck the rest.
+
+        Keeps the chips honest when the range is set by hand, restored from
+        settings, or changed by a different preset.
+        """
+        current = (self.date_from.date(), self.date_to.date())
+        today = QDate.currentDate()
+        for btn, range_fn in self._preset_buttons:
+            btn.setChecked(range_fn(today) == current)
+
+    def _connect_signals(self) -> None:
+        self.combo_collection.currentIndexChanged.connect(self._update_cloud_visibility)
+        self.combo_catalog.currentIndexChanged.connect(self._on_catalog_changed)
+        self.cloud_slider.valueChanged.connect(self._update_cloud_label)
+        self.btn_search.clicked.connect(self._on_search_button)
+        self.list_results.itemDoubleClicked.connect(self._on_item_double_clicked)
+        self.list_results.customContextMenuRequested.connect(self._on_context_menu)
+        self.list_results.itemEntered.connect(self._on_item_hovered)
+        self.list_results.viewportEntered.connect(self._clear_footprint)
+        self.date_from.dateChanged.connect(self._on_date_from_changed)
+        self.date_from.dateChanged.connect(self._sync_date_presets)
+        self.date_to.dateChanged.connect(self._sync_date_presets)
+
+    # --- Keyboard shortcuts ---
+
+    def _setup_shortcuts(self) -> None:
+        """Install keyboard shortcuts.
+
+        The single keys act on the result list only (it must have focus), so
+        Space on a date chip or Return in a combo keeps its own meaning.
+        """
+        on_list = Qt.ShortcutContext.WidgetShortcut
+        for key, slot in (
+            (Qt.Key.Key_Return, self._shortcut_load),  # load selected scenes
+            (Qt.Key.Key_Space, self._shortcut_load),
+            (Qt.Key.Key_Z, self._shortcut_zoom),  # zoom to the selected tile
+        ):
+            sc = QShortcut(QKeySequence(key), self.list_results)
+            sc.setContext(on_list)
+            sc.activated.connect(slot)
+
+        in_dock = Qt.ShortcutContext.WidgetWithChildrenShortcut
+        # Ctrl+Return → Search
+        sc_search = QShortcut(QKeySequence("Ctrl+Return"), self)
+        sc_search.setContext(in_dock)
+        sc_search.activated.connect(self._shortcut_search)
+
+        # Escape → Clear footprint overlay
+        sc_esc = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
+        sc_esc.setContext(in_dock)
+        sc_esc.activated.connect(self._clear_footprint)
+
+    def _selected_item(self) -> StacItemResult | None:
+        """Get the StacItemResult from the currently selected list row."""
+        current = self.list_results.currentItem()
+        if current is None:
+            return None
+        return current.data(Qt.ItemDataRole.UserRole)
+
+    def _selected_items(self) -> list[StacItemResult]:
+        """Every selected scene, in list order.
+
+        The list is in ExtendedSelection mode, so a range or ctrl-click
+        selection is expected to load as a batch rather than silently
+        collapsing to the current row. Skips the trailing "Load more results" row,
+        which carries no item.
+        """
+        items = [
+            it
+            for row in self.list_results.selectedItems()
+            if (it := row.data(Qt.ItemDataRole.UserRole)) is not None
+        ]
+        if items:
+            return items
+        current = self._selected_item()
+        return [current] if current else []
+
+    def _start_progress(self) -> None:
+        self._search_start_time = time.monotonic()
+        self._progress_dots = 0
+        self._progress_timer.start()
+
+    def _stop_progress(self) -> None:
+        self._progress_timer.stop()
+
+    def _on_progress_tick(self) -> None:
+        self._progress_dots = (self._progress_dots % 3) + 1
+        elapsed = time.monotonic() - self._search_start_time
+        dots = "." * self._progress_dots
+        self._flash_status(f"Searching{dots} ({elapsed:.0f}s)", ms=0)
+
+    def _search_in_flight(self) -> bool:
+        return self._run is not None and self._run.task is not None
+
+    def _shortcut_search(self) -> None:
+        if not self._search_in_flight():
+            self._on_search()
+
+    def _shortcut_load(self) -> None:
+        items = self._selected_items()
+        if items:
+            self._add_items(items)
+
+    def _shortcut_zoom(self) -> None:
+        item = self._selected_item()
+        if item and item.bbox and len(item.bbox) == 4:
+            self._zoom_to_bbox(item.bbox)
+
+    # --- UI helpers ---
+
+    def _current_collection(self) -> CollectionInfo | None:
+        coll_id = self.combo_collection.currentData()
+        if coll_id is None:
+            return None
+        return self._collection_by_id.get(coll_id)
+
+    def _update_cloud_visibility(self) -> None:
+        coll = self._current_collection()
+        visible = coll is not None and coll.has_cloud_cover
+        self.cloud_slider.setVisible(visible)
+        self.cloud_label.setVisible(visible)
+        self.cloud_icon.setVisible(visible)
+        self.cloud_value_label.setVisible(visible)
+
+    def _update_cloud_label(self, value: int) -> None:
+        self.cloud_value_label.setText(f"{value}%")
+
+    def _on_date_from_changed(self, new_date: QDate) -> None:
+        if self.date_to.date() < new_date:
+            self.date_to.setDate(new_date)
+        QTimer.singleShot(_DATE_CALENDAR_DELAY_MS, self._open_date_to_calendar)
+
+    def _open_date_to_calendar(self) -> None:
+        self.date_to.show_calendar()
+
+    def _prompt_auth(self, detail: str, catalog: CatalogProvider) -> None:
+        """*catalog* refused our credentials: say so, offer to edit its login."""
+        user = catalog.id not in CATALOG_BY_ID
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("QStac")
+        box.setText(f"{catalog.label} refused the request (authentication).")
+        if not user:
+            box.setInformativeText("This catalog needs no login. Try again shortly.")
+        elif catalog.authcfg:
+            box.setInformativeText(
+                "Edit this STAC API to check its QGIS authentication config."
+            )
+        else:
+            box.setInformativeText(
+                "This API needs a login. Edit it and pick or create "
+                "a QGIS authentication config."
+            )
+        if detail:
+            box.setDetailedText(detail)
+        edit_btn = (
+            box.addButton("Edit STAC API…", QMessageBox.ButtonRole.AcceptRole)
+            if user
+            else None
+        )
+        box.addButton(QMessageBox.StandardButton.Close)
+        box.exec()
+        if edit_btn is not None and box.clickedButton() is edit_btn:
+            self._edit_user_catalog(catalog.id)
+
+    def _add_user_catalog(self) -> None:
+        """Catalog editor for a new STAC API; on OK, save it and switch to it."""
+        from .settings_dialog import CatalogEditor
+
+        current = settings.user_catalogs()
+        dlg = CatalogEditor(self, taken={str(e["name"]) for e in current})
+        if not dlg.exec():
+            return
+        entry = dlg.entry()
+        settings.save_user_catalogs([*current, entry])
+        settings.save_all({"catalog": entry["id"]})
+        self._switch_catalog()
+
+    def _edit_user_catalog(self, cat_id: str | None = None) -> None:
+        """Catalog editor on a user catalog (default: the one in use); on OK,
+        save it and switch to it."""
+        from .settings_dialog import CatalogEditor
+
+        cat_id = cat_id or self._catalog.id
+        current = settings.user_catalogs()
+        idx = next((i for i, e in enumerate(current) if e["id"] == cat_id), None)
+        if idx is None:
+            return  # a built-in: nothing to edit
+        dlg = CatalogEditor(self, current[idx], taken={str(e["name"]) for e in current})
+        if not dlg.exec():
+            return
+        current[idx] = dlg.entry()
+        settings.save_user_catalogs(current)
+        # A rename changes the id (it is the connection name): follow it.
+        settings.save_all({"catalog": current[idx]["id"]})
+        self._switch_catalog()
+
+    def _refresh_collections(self) -> None:
+        """Drop the cached listing and fetch this catalog's collections again."""
+        _DISCOVERY_CACHE.pop(self._catalog.id, None)
+        current = self.combo_collection.currentData()
+        curated = CATALOG_BY_ID.get(self._catalog.id)
+        if curated is None:
+            # A user catalog's listing is fetched on resolve; re-resolving also
+            # picks up edits made to its connection in the QGIS Browser.
+            self._switch_catalog(keep=current)
+            return
+        # Back to the curated registry and re-merge: results stay, and a
+        # discovered collection that is selected is re-selected when it lands.
+        self._pending_collection_id = current
+        self._catalog = curated
+        self._collection_by_id = {c.id: c for c in curated.collections}
+        self._populate_collections(self._pending_collection_id)
+        self._discover_collections()
+
+    def _show_info(self) -> None:
+        """What is in use: the catalog, its login, and the selected collection."""
+        cat = self._catalog
+        esc = html.escape
+        if cat.authcfg:
+            login = "QGIS auth config"
+        elif any(k.lower() == "authorization" for k, _ in cat.headers):
+            login = "Authorization header"  # a connection's Basic user/password
+        else:
+            login = "none"
+        # A user catalog's description is its URL, already on the API line.
+        about = "" if cat.root_url in cat.description else cat.description
+        about = f"{esc(about)}<br>" if about else ""
+        text = (
+            f"<b>{esc(cat.label)}</b><br>{about}<br>"
+            f'API: <a href="{esc(cat.root_url)}">{esc(cat.root_url)}</a><br>'
+            f"Login: {login}<br>Collections: {len(cat.collections)}"
+        )
+        coll = self._current_collection()
+        if coll is not None:
+            text += f"<hr><b>{esc(coll.label)}</b><br><code>{esc(coll.id)}</code>"
+            if coll.description != coll.id:  # discovered ones fall back to the id
+                text += f"<br><br>{esc(coll.description)}"
+        box = QMessageBox(self)
+        box.setWindowTitle("QStac")
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        box.setText(text)
+        box.exec()
+
+    def open_settings_dialog(self) -> None:
+        """Open the settings dialog and apply changes to this dock.
+
+        Also called from the plugin's "Settings…" menu action so a catalog
+        switch refreshes the collection combo regardless of entry point.
+        """
+        from .settings_dialog import SettingsDialog
+
+        dlg = SettingsDialog(self)
+        if dlg.exec():
+            changed = settings.apply_dialog(dlg)
+            if changed & {"catalog", "user_catalogs"}:
+                self._switch_catalog()
+
+    # --- Footprint highlight on hover ---
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802
+        """Clear footprint when the mouse leaves the result list."""
+        if obj is self.list_results and event.type() == QEvent.Type.Leave:
+            self._clear_footprint()
+        return super().eventFilter(obj, event)
+
+    def _on_item_hovered(self, list_item: QListWidgetItem) -> None:
+        item: StacItemResult | None = list_item.data(Qt.ItemDataRole.UserRole)
+        if item and item.geometry:
+            self._show_footprint(item.geometry)
+        else:
+            self._clear_footprint()
+
+    def _show_footprint(self, geojson: dict) -> None:
+        """Draw a temporary footprint polygon on the map canvas."""
+        wkt = _geojson_to_wkt(geojson)
+        geom = QgsGeometry.fromWkt(wkt) if wkt else None
+        if geom is None or geom.isNull():
+            self._clear_footprint()
+            return
+        if self._rubber_band is None:
+            # One band, reused for every hover: a new one each time would
+            # pile up on the canvas scene.
+            rb = QgsRubberBand(self.iface.mapCanvas(), QgsWkbTypes.GeometryType.Polygon)
+            rb.setColor(QColor(*P.accent_rgba_stroke))
+            rb.setFillColor(QColor(*P.accent_rgba_fill))
+            rb.setWidth(2)
+            self._rubber_band = rb
+        self._rubber_band.setToGeometry(geom, QgsCoordinateReferenceSystem(_WGS84))
+
+    def _clear_footprint(self) -> None:
+        """Remove the footprint highlight from the canvas."""
+        if self._rubber_band is not None:
+            self._rubber_band.reset(QgsWkbTypes.GeometryType.Polygon)
+
+    def _ensure_viewport(self) -> bool:
+        """If project is empty, add a world basemap and ask user to zoom in."""
+        if QgsProject.instance().count() > 0:
+            return True
+
+        # Resolved at runtime — the QGIS data path differs per platform.
+        world_map = QgsApplication.pkgDataPath() + "/resources/data/world_map.gpkg"
+        if Path(world_map).exists():
+            layer = QgsVectorLayer(world_map, "World", "ogr")
+            if layer.isValid():
+                QgsProject.instance().addMapLayer(layer)
+                self.iface.mapCanvas().setExtent(layer.extent())
+                self.iface.mapCanvas().refresh()
+
+        self._notify(
+            "Zoom to your area of interest, then launch search.",
+            Qgis.MessageLevel.Info,
+            5,
+        )
+        # Also say it in the dock: the message bar lives at the top of the QGIS
+        # window, so on its own this reads as the search button doing nothing.
+        self._set_status("Zoom in, then launch search.")
+        self.label_empty.setText(
+            "The whole world is in view.\n\n"
+            "Zoom to the area you want, then launch "
+            "a search to list matching scenes."
+        )
+        self._set_results_visible(False)
+        return False
+
+    def _on_search_button(self) -> None:
+        """Search button dispatcher — launches a search or cancels the running one."""
+        if self._search_in_flight():
+            self._cancel_search()
+        else:
+            self._on_search()
+
+    def _enter_search_state(self) -> None:
+        """Switch the search button to its in-flight 'Cancel' appearance."""
+        self.btn_search.setEnabled(True)
+        self.btn_search.setText("Cancel search")
+        self.btn_search.setStyleSheet(styles.cancel_btn_style(P))
+
+    def _restore_search_button(self) -> None:
+        """Return the search button to its idle 'Search' appearance."""
+        self.btn_search.setEnabled(True)
+        self.btn_search.setText("Search")
+        self.btn_search.setStyleSheet(styles.search_btn_style(P))
+
+    def _cancel_search(self) -> None:
+        """Cancel the in-flight search task, if any, and reset the UI."""
+        task = self._run.task if self._run else None
+        if task is None:
+            return
+        self._run.task = None  # its late callbacks are ignored from here on
+        with contextlib.suppress(RuntimeError):
+            task.cancel()
+        self._stop_progress()
+        self._restore_search_button()
+        self._set_status("Search canceled.")
+        if self._next_page is not None:
+            self._add_load_more_item()  # a canceled "Load more results" can retry
+
+    def _on_search(self) -> None:
+        coll = self._current_collection()
+        if coll is None:
+            self._flash_status("No collection to search yet.")
+            return
+        if not self._ensure_viewport():
+            return
+
+        self._clear_footprint()
+        self._clear_results()
+        self._loader.forget_added()
+        self._loader.cancel_warming()  # the previous results' header warms
+        self._sort_index = 0
+        self.btn_sort.setText(self._sort_modes[0][0])
+        self.btn_sort.setVisible(False)
+
+        date_from = self.date_from.date().toString("yyyy-MM-dd")
+        date_to = self.date_to.date().toString("yyyy-MM-dd")
+        # Persist these params so the dock reopens here.
+        settings.save_last_search(coll.id, date_from, date_to)
+        self._run = _SearchRun(
+            catalog=self._catalog,
+            collection=coll,
+            bbox=viewport_bbox_4326(self.iface.mapCanvas()),
+            date_from=date_from,
+            date_to=date_to,
+            cloud=self.cloud_slider.value() if coll.has_cloud_cover else None,
+        )
+        self._flash_status("Searching…", ms=0)
+        self._launch_search(self._run)
+
+    def _on_load_more(self) -> None:
+        run = self._run
+        if self._next_page is None or run is None or run.task is not None:
+            return
+
+        self._remove_load_more_item()
+        self._flash_status("Searching for more…", ms=0)
+        self._launch_search(run, page_token=self._next_page)
+
+    def _launch_search(
+        self, run: _SearchRun, page_token: PageToken | None = None
+    ) -> None:
+        """Submit a StacSearchTask for a page of *run*."""
+        catalog, coll = run.catalog, run.collection
+        task = StacSearchTask(
+            catalog,
+            collection=coll.id,
+            bbox=run.bbox,
+            datetime_range=f"{run.date_from}T00:00:00Z/{run.date_to}T23:59:59Z",
+            max_items=settings.page_size(),
+            cloud_cover_max=run.cloud,
+            catalog_url=catalog.search_url,
+            page_limit=catalog.page_limit,
+            http_timeout=settings.http_timeout(),
+            page_token=page_token,
+            server_side_cloud_filter=catalog.supports_query,
+            server_side_sort=catalog.supports_sortby,
+        )
+        run.task = task
+        # Bound to this task: a canceled one can still finish after the next
+        # search started, and must not touch that one's UI.
+        task.taskCompleted.connect(lambda t=task: self._on_search_completed(t))
+        task.taskTerminated.connect(lambda t=task: self._on_search_failed(t))
+        self._enter_search_state()
+        self._start_progress()
+        self._loader.run_task(task)
+
+    def _add_load_more_item(self) -> None:
+        self._remove_load_more_item()
+
+        btn = QPushButton("Load more results")
+        btn.setFixedHeight(32)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setStyleSheet(styles.load_more_btn_style(P))
+        btn.clicked.connect(self._on_load_more)
+
+        item = QListWidgetItem(self.list_results)
+        item.setSizeHint(QSize(0, 40))
+        item.setFlags(Qt.ItemFlag.NoItemFlags)
+        self.list_results.addItem(item)
+        self.list_results.setItemWidget(item, btn)
+        self._load_more_item = item
+
+    def _remove_load_more_item(self) -> None:
+        if self._load_more_item is not None:
+            row = self.list_results.row(self._load_more_item)
+            if row >= 0:
+                self.list_results.takeItem(row)
+            self._load_more_item = None
+
+    def _finish_search_task(self, task: StacSearchTask) -> _SearchRun | None:
+        """The run *task* belongs to, if it is still the one in flight."""
+        run = self._run
+        if self._closed or run is None or task is not run.task:
+            return None  # canceled, superseded, or the dock is unloading
+        run.task = None
+        self._stop_progress()
+        self._restore_search_button()
+        return run
+
+    def _on_search_completed(self, task: StacSearchTask) -> None:
+        run = self._finish_search_task(task)
+        if run is None:
+            return
+
+        # Skip overlap filter when viewport is very large (e.g. worldwide search)
+        bbox = run.bbox
+        wide = (bbox[2] - bbox[0]) > 20 or (bbox[3] - bbox[1]) > 20
+        if wide:
+            new_items = list(task.results)
+        else:
+            new_items = _filter_by_overlap(
+                task.results, bbox, settings.min_overlap_pct()
+            )
+        self._next_page = task.next_page
+
+        if not new_items and not self._results:
+            self._set_status("No scenes found.")
+            self.label_empty.setText(
+                "No scenes matched.\n\n"
+                "Try widening the date range, raising the cloud\n"
+                "cover limit, or zooming out."
+            )
+            self._set_results_visible(False)
+            return
+
+        self._results.extend(new_items)
+        self._update_filter_button()
+        self.btn_sort.setVisible(True)
+        self._set_results_visible(True)
+
+        # Cards are created by _populate_list; fetch thumbnails once they exist.
+        self._populate_list()
+        self._thumbs.fetch(new_items, run.catalog)
+        # Warm the COG headers of the new results (64 KB each) so a click's
+        # first clip skips that round trip. Cheap enough to run for every page.
+        self._loader.warm(new_items, run.collection, run.catalog)
+
+    def _cycle_sort(self) -> None:
+        self._sort_index = (self._sort_index + 1) % len(self._sort_modes)
+        label, _ = self._sort_modes[self._sort_index]
+        self.btn_sort.setText(label)
+        self._populate_list()
+
+    _SORT_TABLE: ClassVar[
+        dict[str, tuple[Callable[[StacItemResult], object], bool]]
+    ] = {
+        "date_desc": (lambda r: r.datetime_str, True),
+        "date_asc": (lambda r: r.datetime_str, False),
+        "cloud_asc": (
+            lambda r: r.cloud_cover if r.cloud_cover is not None else 999,
+            False,
+        ),
+        "cloud_desc": (
+            lambda r: r.cloud_cover if r.cloud_cover is not None else -1,
+            True,
+        ),
+    }
+
+    def _sorted_results(self) -> list[StacItemResult]:
+        chosen = self._facet_filter.items()
+        shown = [
+            r for r in self._results if all(r.facets.get(k) == v for k, v in chosen)
+        ]
+        _, mode = self._sort_modes[self._sort_index]
+        entry = self._SORT_TABLE.get(mode)
+        if entry is None:
+            return shown
+        key_func, reverse = entry
+        return sorted(shown, key=key_func, reverse=reverse)
+
+    def _show_filter_menu(self) -> None:
+        """One submenu per facet; picking the active value again clears it."""
+        menu = QMenu(self)
+        if self._facet_filter:
+            menu.addAction("Clear filters").triggered.connect(
+                lambda: self._set_facet(None, None)
+            )
+            menu.addSeparator()
+        for key, counts in facet_counts(self._results).items():
+            chosen = self._facet_filter.get(key)
+            label = facet_label(key)
+            sub = menu.addMenu(f"{label}: {chosen}" if chosen else label)
+            for value, n in counts.most_common():
+                action = sub.addAction(f"{value} ({n})")
+                action.setCheckable(True)
+                action.setChecked(value == chosen)
+                action.triggered.connect(
+                    lambda _=False, k=key, v=value: self._set_facet(k, v)
+                )
+        menu.exec(self.btn_filter.mapToGlobal(self.btn_filter.rect().bottomLeft()))
+
+    def _set_facet(self, key: str | None, value: str | None) -> None:
+        if key is None:
+            self._facet_filter.clear()
+        elif self._facet_filter.get(key) == value:
+            del self._facet_filter[key]
+        else:
+            self._facet_filter[key] = value
+        self._update_filter_button()
+        self._populate_list()
+
+    def _update_filter_button(self) -> None:
+        """Sync the Filter button and the result count with the active filter."""
+        n = len(self._facet_filter)
+        self.btn_filter.setText(f"Filter ({n})" if n else "Filter")
+        self.btn_filter.setVisible(bool(n or facet_counts(self._results)))
+        total = len(self._results)
+        if n:
+            shown = len(self._sorted_results())
+            self._set_status(f"{shown} of {total} scenes shown.")
+        else:
+            self._set_status(f"{_scenes(total)} found.")
+
+    def _populate_list(self) -> None:
+        """Rebuild the result rows, in the current sort order.
+
+        Cards are recreated rather than reused: removing a row makes Qt
+        ``deleteLater()`` the widget set on it (``setItemWidget`` transfers
+        ownership to the view), so re-inserting the same widget leaves the view
+        holding a pointer that dies on the next event-loop turn — a segfault on
+        the following paint. Called after search completion and sort changes.
+        """
+        self._remove_load_more_item()
+        self._thumbs.forget_cards()  # deleted with their rows
+        while self.list_results.count():
+            self.list_results.takeItem(0)
+
+        bbox = self._run.bbox if self._run else None
+        for item in self._sorted_results():
+            card = self._thumbs.make_card(item, bbox)
+            list_item = QListWidgetItem(self.list_results)
+            list_item.setSizeHint(QSize(0, _CARD_H + 4))
+            list_item.setData(Qt.ItemDataRole.UserRole, item)
+            self.list_results.addItem(list_item)
+            self.list_results.setItemWidget(list_item, card)
+
+        if self._next_page is not None and not self._search_in_flight():
+            self._add_load_more_item()
+
+    def _on_search_failed(self, task: StacSearchTask) -> None:
+        # taskTerminated also fires on user cancel — _cancel_search already
+        # reset the UI, so don't show an error dialog for a deliberate stop.
+        run = self._finish_search_task(task)
+        if run is None:
+            return
+
+        self._set_status("Search failed.")
+        if self._next_page is not None:
+            self._add_load_more_item()  # a failed "Load more results" can retry
+
+        kind = task.error_kind
+        raw = task.error or "Unknown error"
+
+        # Missing/invalid credentials → point at the catalog's auth config.
+        if kind == "auth":
+            self._prompt_auth(str(raw), run.catalog)
+            return
+
+        title, suggestion = _ERROR_MESSAGES.get(
+            kind or "unknown", _ERROR_MESSAGES["unknown"]
+        )
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("QStac")
+        box.setText(title)
+        box.setInformativeText(suggestion)
+        box.setDetailedText(str(raw))
+        box.exec()
+
+    # --- Add layers ---
+
+    def _item_collection(self, item: StacItemResult) -> CollectionInfo | None:
+        """The collection *item* was searched in, whatever the combo shows now."""
+        run = self._run
+        if run is None:
+            return None
+        if item.collection == run.collection.id:
+            return run.collection
+        return self._collection_by_id.get(item.collection, run.collection)
+
+    def _add_items(
+        self,
+        items: list[StacItemResult],
+        band_override: list[str] | None = None,
+        stretch_override: tuple[float, float] | None = None,
+        key_suffix: str | None = None,
+        index_preset: IndexPreset | None = None,
+    ) -> None:
+        coll = self._item_collection(items[0]) if items else None
+        if coll is None or self._run is None:
+            return
+        self._zoom_on_open(items)
+        self._loader.load(
+            items,
+            coll,
+            self._run.catalog,
+            band_override=band_override,
+            stretch_override=stretch_override,
+            key_suffix=key_suffix,
+            index_preset=index_preset,
+        )
+
+    def _zoom_on_open(self, items: list[StacItemResult]) -> None:
+        """Zoom to the scenes being opened, as the user chose the first time.
+
+        Before the load: it clips what the map shows, so it then covers them.
+        """
+        mode = settings.zoom_to_scene()
+        if mode == "ask":
+            box = QMessageBox(
+                QMessageBox.Icon.Question,
+                "QStac",
+                "Do you want to auto zoom to the layer?",
+                QMessageBox.StandardButton.NoButton,
+                self,
+            )
+            box.setInformativeText("You can change this in Settings > Display.")
+            yes = box.addButton("Yes, always", QMessageBox.ButtonRole.YesRole)
+            box.addButton("No", QMessageBox.ButtonRole.NoRole)
+            box.exec()
+            mode = "always" if box.clickedButton() is yes else "never"
+            settings.save_all({"zoom_to_scene": mode})
+        boxes = [it.bbox for it in items if it.bbox and len(it.bbox) == 4]
+        if mode == "always" and boxes:
+            self._zoom_to_bbox(_union(boxes))
+
+    def _load_mosaic(
+        self,
+        items: list[StacItemResult],
+        coll: CollectionInfo,
+        catalog: CatalogProvider,
+    ) -> None:
+        self._zoom_on_open(items)
+        self._loader.load_mosaic(items, coll, catalog)
+
+    def _on_item_double_clicked(self, list_item: QListWidgetItem) -> None:
+        item = list_item.data(Qt.ItemDataRole.UserRole)
+        if item:
+            self._add_items([item])
+
+    def _on_context_menu(self, pos) -> None:
+        list_item = self.list_results.itemAt(pos)
+        if not list_item:
+            return
+
+        item: StacItemResult = list_item.data(Qt.ItemDataRole.UserRole)
+        if not item:
+            return
+
+        coll = self._item_collection(item)
+        if not coll or self._run is None:
+            return
+        catalog = self._run.catalog
+
+        # Right-clicking inside a multi-row selection acts on the whole
+        # selection; right-clicking outside it acts on the row under the cursor.
+        selected = self._selected_items()
+        targets = selected if any(s.id == item.id for s in selected) else [item]
+        many = len(targets) > 1
+        suffix = f" ({len(targets)} scenes)" if many else ""
+
+        menu = QMenu(self)
+
+        # Zoom first: the one action that is not a load.
+        boxes = [t.bbox for t in targets if t.bbox and len(t.bbox) == 4]
+        if boxes:
+            zoom_action = menu.addAction(
+                f"Zoom to {len(boxes)} scenes" if len(boxes) > 1 else "Zoom to scene"
+            )
+            zoom_action.triggered.connect(lambda: self._zoom_to_bbox(_union(boxes)))
+            menu.addSeparator()
+
+        rgb_action = menu.addAction(coll.default_action_label + suffix)
+        rgb_action.triggered.connect(lambda: self._add_items(list(targets)))
+
+        if many:
+            mosaic_action = menu.addAction(f"Load as mosaic ({len(targets)} scenes)")
+            mosaic_action.triggered.connect(
+                lambda: self._load_mosaic(list(targets), coll, catalog)
+            )
+            stack_action = menu.addAction(f"Load as time stack ({len(targets)} scenes)")
+            stack_action.triggered.connect(lambda: self._add_time_stack(list(targets)))
+
+        if coll.band_presets:
+            for preset in coll.band_presets:
+                action = menu.addAction(preset.label + suffix)
+                action.triggered.connect(self._make_preset_add_handler(targets, preset))
+
+        # Indices: the curated ones, then templates and the user's saved
+        # ones whose variables this scene's assets resolve, then a new one.
+        menu.addSeparator()
+        curated = list(coll.index_presets)
+        extra = custom_index_presets(item, {p.label for p in curated})
+        for index_preset in curated + extra:
+            action = menu.addAction(index_preset.label + suffix)
+            action.triggered.connect(
+                self._make_index_add_handler(targets, index_preset)
+            )
+        custom_action = menu.addAction("Custom index…")
+        custom_action.triggered.connect(lambda: self._custom_index(item, targets))
+
+        menu.addSeparator()
+        self._add_load_asset_menu(menu, item, targets, suffix)
+
+        menu.addSeparator()
+
+        # One scene only: say which one when several are selected.
+        export_action = menu.addAction(
+            f"Save clipped GeoTIFF of {_shorten_id(item.id)}…"
+            if many
+            else "Save clipped GeoTIFF…"
+        )
+        export_action.triggered.connect(lambda: self._export_clip(item, coll, catalog))
+
+        copy_action = menu.addAction("Copy item ID")
+        copy_action.triggered.connect(
+            lambda: QgsApplication.clipboard().setText(item.id)
+        )
+
+        self._add_copy_asset_menu(menu, item, catalog)
+
+        menu.exec(self.list_results.viewport().mapToGlobal(pos))
+
+    def _add_load_asset_menu(
+        self,
+        menu: QMenu,
+        item: StacItemResult,
+        targets: list[StacItemResult],
+        suffix: str,
+    ) -> None:
+        """Any raster of the scene, loaded alone: the way out when the default
+        guess is the wrong one.
+
+        Named with their titles, in natural order (B2 before B10); the data
+        and visual assets first, the rest (masks, angles, previews) below.
+        """
+        rasters = _raster_assets(item)
+        if not rasters:
+            return
+        main = {
+            n
+            for n in rasters
+            if {"data", "visual"} & set(item.asset_meta.get(n, _NO_META).roles)
+        }
+        asset_menu = menu.addMenu("Load asset")
+        for group in (
+            [n for n in rasters if n in main],
+            [n for n in rasters if n not in main],
+        ):
+            if group and not asset_menu.isEmpty():
+                asset_menu.addSeparator()
+            for name in sorted(group, key=_natural_key):
+                action = asset_menu.addAction(_asset_label(item, name) + suffix)
+                action.triggered.connect(
+                    lambda _=False, n=name: self._add_items(
+                        list(targets), band_override=[n], key_suffix=n
+                    )
+                )
+
+    def _add_copy_asset_menu(
+        self, menu: QMenu, item: StacItemResult, catalog: CatalogProvider
+    ) -> None:
+        """Add a submenu copying any of the item's asset URLs to the clipboard.
+
+        Signed at click time so the copied URL works straight away in a browser
+        or GDAL — stored hrefs are unsigned.
+        """
+        if not item.assets:
+            return
+        asset_menu = menu.addMenu("Copy asset URL")
+        for asset_name in sorted(item.assets):
+            action = asset_menu.addAction(asset_name)
+            action.triggered.connect(
+                self._make_copy_asset_handler(item, asset_name, catalog)
+            )
+
+    def _make_copy_asset_handler(
+        self, item: StacItemResult, asset_name: str, catalog: CatalogProvider
+    ) -> Callable[[], None]:
+        def handler() -> None:
+            href = signed_assets(item, catalog).get(asset_name, "")
+            QgsApplication.clipboard().setText(href)
+            self._flash_status(f"{asset_name} URL copied.")
+
+        return handler
+
+    def _export_band_names(
+        self, coll: CollectionInfo, item: StacItemResult
+    ) -> list[str]:
+        """Assets a default load of *item* would use — what the export writes."""
+        names = _default_assets(coll)
+        if names and not all(n in item.assets for n in names):
+            # Scene is missing the preferred asset (e.g. no TCI) — fall back to
+            # the collection's RGB bands, as a default load would.
+            names = list(coll.rgb_assets)
+        return names or _guess_item_asset(item)
+
+    def _export_clip(
+        self, item: StacItemResult, coll: CollectionInfo, catalog: CatalogProvider
+    ) -> None:
+        """Save the map viewport clip of one scene as a full-resolution GeoTIFF."""
+        viewport = viewport_bbox_4326(self.iface.mapCanvas())
+        if not _bbox_intersects(viewport, item.bbox):
+            self._notify(
+                "The map viewport does not overlap this scene: nothing to export.",
+                Qgis.MessageLevel.Warning,
+                5,
+            )
+            return
+
+        band_names = self._export_band_names(coll, item)
+        if not band_names:
+            self._notify(
+                "This scene has no exportable asset.", Qgis.MessageLevel.Warning, 5
+            )
+            return
+        if self._loader._refuse_unstreamable([item], band_names, catalog):
+            return
+        if not self._loader.ensure_s3_login(catalog):
+            return
+
+        start_dir = settings.last_export_dir() or QDir.homePath()
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save clipped GeoTIFF",
+            str(Path(start_dir) / f"{item.id}.tif"),
+            "GeoTIFF (*.tif)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith((".tif", ".tiff")):
+            path += ".tif"
+        settings.save_last_export_dir(str(Path(path).parent))
+
+        self._flash_status(f"Exporting {Path(path).name}…", ms=0)
+        task = ExportClipTask(signed_assets(item, catalog), band_names, viewport, path)
+        task.taskCompleted.connect(lambda: self._on_export_finished(task, True))
+        task.taskTerminated.connect(lambda: self._on_export_finished(task, False))
+        self._loader.run_task(task)
+
+    def _on_export_finished(self, task: ExportClipTask, ok: bool) -> None:
+        if self._closed:
+            return
+        if ok:
+            self._flash_status(f"Saved {Path(task.out_path).name}.")
+            self._notify(f"Saved {task.out_path}", Qgis.MessageLevel.Success, 6)
+        else:
+            self._flash_status("Export failed.")
+            if not task.isCanceled():
+                self._notify(
+                    f"Export failed: {task.error or 'unknown error'}",
+                    Qgis.MessageLevel.Warning,
+                    8,
+                )
+
+    def _add_time_stack(self, items: list[StacItemResult]) -> None:
+        """Load the scenes as one dated layer per item and animate them.
+
+        The layers land in the collection's group newest-first; the Temporal
+        Controller is set to step one day per frame across their span.
+        """
+        self._add_items(items)
+        enable_time_stack(self.iface.mapCanvas(), [it.datetime_str for it in items])
+        for dw in self.iface.mainWindow().findChildren(QDockWidget):
+            if dw.objectName() == "Temporal Controller":
+                dw.show()
+                break
+
+    def _make_preset_add_handler(
+        self,
+        items: list[StacItemResult],
+        preset: BandPreset,
+    ) -> Callable[[], None]:
+        def handler():
+            self._add_items(
+                list(items),
+                band_override=preset.assets,
+                stretch_override=preset.stretch,
+                key_suffix=preset.label,
+            )
+
+        return handler
+
+    def _custom_index(
+        self, item: StacItemResult, targets: list[StacItemResult]
+    ) -> None:
+        """Ask for an index over *item*'s assets, then load it for *targets*."""
+        dlg = IndexDialog(item, self)
+        if dlg.exec() == IndexDialog.DialogCode.Accepted and dlg.preset is not None:
+            self._add_items(
+                list(targets), key_suffix=index_key(dlg.preset), index_preset=dlg.preset
+            )
+
+    def _make_index_add_handler(
+        self, items: list[StacItemResult], index_preset: IndexPreset
+    ) -> Callable[[], None]:
+        def handler():
+            self._add_items(
+                list(items),
+                key_suffix=index_key(index_preset),
+                index_preset=index_preset,
+            )
+
+        return handler
+
+    def _zoom_to_bbox(self, bbox: list[float]) -> None:
+        west, south, east, north = bbox
+        extent = QgsRectangle(west, south, east, north)
+        canvas = self.iface.mapCanvas()
+        extent = _transform_from_wgs84(extent, canvas.mapSettings().destinationCrs())
+        canvas.setExtent(extent)
+        canvas.refresh()

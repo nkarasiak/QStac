@@ -1,0 +1,55 @@
+[general]
+name=QStac
+qgisMinimumVersion=3.40
+qgisMaximumVersion=4.99
+description=Search STAC catalogs and open satellite images in QGIS. No account needed to start.
+about=Search STAC catalogs, preview scenes and open satellite images in QGIS
+    without downloading files first. Pick a collection (Sentinel-2, Landsat,
+    Sentinel-1, elevation, land cover and more), a date range and a cloud
+    cover limit, and QStac searches the area shown on your map.
+
+    Microsoft Planetary Computer is the default catalog and needs no account.
+    Earth Search (ESA Copernicus open data on AWS) is also built in, and so
+    is Copernicus Data Space (Copernicus Land Monitoring products and more;
+    images need S3 keys from a free account). You can add any other STAC
+    API from the dock.
+
+    Features:
+    - Planetary Computer, Earth Search and Copernicus Data Space built in,
+      plus any STAC API you add
+    - Filter by collection, date range and cloud cover
+    - Search the current map view, with thumbnail previews
+    - True color images made from the separate bands for you
+    - NDVI and NDWI index layers
+    - Searches run in the background, so you can keep working in QGIS
+    - Log in with any QGIS authentication method (OAuth2, Basic, API key and
+      others)
+
+version=0.1.0
+author=Nicolas Karasiak
+email=nicart@gmail.com
+tags=stac,satellite,sentinel,landsat,remote-sensing,cog,copernicus,planetary computer
+homepage=https://github.com/nkarasiak/QStac
+tracker=https://github.com/nkarasiak/QStac/issues
+repository=https://github.com/nkarasiak/QStac
+license=MIT
+category=Web
+icon=icons/icon.png
+experimental=True
+deprecated=False
+supportsQt6=True
+changelog=0.1.0
+    - First release, still in beta
+    - Search Microsoft Planetary Computer and Earth Search with no account,
+      or add any STAC API
+    - Copernicus Data Space built in: the first scene asks for your S3 keys
+    - Log in to your own STAC APIs with any QGIS authentication method
+      (OAuth2, Basic, API key, PKI and others)
+    - Filter by collection, date range and cloud cover, over the area shown
+      on your map
+    - Load one scene, several scenes as a mosaic, or a time stack for the
+      Temporal Controller
+    - NDVI, NDWI and other index layers, radar ones (RVI, DpRVIc), and your
+      own formula over any scene's assets, e.g. (nir - red) / (nir + red)
+    - Load asset lists each band by its title, data bands first
+    - Export the visible area as a GeoTIFF at full resolution

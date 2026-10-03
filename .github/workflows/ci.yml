@@ -1,0 +1,125 @@
+# Lint, scan and package the QGIS plugin; a v<version> tag also releases it.
+#
+# The plugin lives in qstac/, so the zip is that subtree archived under
+# `--prefix=qstac/`: QGIS requires a single top-level folder, and that folder
+# name becomes the Python module name. Nothing outside qstac/ ships except
+# LICENSE and README.md, added explicitly.
+
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # QGIS 3.40 still ships Python 3.10 on some platforms (ruff targets py310)
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+      # Pinned: an unpinned linter turns CI red on untouched code.
+      - run: pip install --quiet ruff==0.15.7 flake8==7.3.0
+      - run: ruff check .
+      - run: ruff format --check .
+      # The plugins.qgis.org code-quality check (W503 on, see .flake8)
+      - run: flake8 qstac
+      # Pure-stdlib self-checks (test_index and test_raster need QGIS, so they stay local).
+      - name: Self-checks
+        run: |
+          for t in collections catalogs detect facets search indices; do
+            python -m "tests.test_$t"
+          done
+
+  # The scans plugins.qgis.org runs on every upload; a Bandit or detect-secrets
+  # hit blocks the version. Bandit: every severity, minus the rules the site
+  # disables.
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet bandit==1.9.4 detect-secrets==1.5.0
+      - run: bandit -r qstac -s B404,B411 -q
+      - name: detect-secrets
+        run: |
+          detect-secrets scan --all-files --disable-plugin IPPublicDetector \
+            --exclude-files 'metadata\.txt' qstac README.md LICENSE > secrets.json
+          python -c "import json,sys; r=json.load(open('secrets.json'))['results']; print(r or 'no secrets'); sys.exit(bool(r))"
+
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      zip: ${{ steps.zip.outputs.zip }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: zip
+        run: |
+          VERSION=$(sed -n 's/^version=[[:space:]]*//p' qstac/metadata.txt | head -1)
+          test -n "$VERSION" || { echo "::error::no version= in qstac/metadata.txt"; exit 1; }
+          # The tag is the release name, so a forgotten bump would ship a zip
+          # whose metadata.txt disagrees with its own release.
+          if [[ "$GITHUB_REF" == refs/tags/v* && "${GITHUB_REF_NAME#v}" != "$VERSION" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME but qstac/metadata.txt is version=$VERSION"
+            exit 1
+          fi
+          ZIP="qstac-${VERSION}.zip"
+          git archive --format=zip --prefix=qstac/ --add-file=LICENSE --add-file=README.md -o "$ZIP" HEAD:qstac
+          python3 scripts/verify_plugin_zip.py "$ZIP" qstac "$VERSION"
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.zip.outputs.zip }}
+          path: ${{ steps.zip.outputs.zip }}
+          retention-days: 30
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [lint, security, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.build.outputs.zip }}
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: ${{ needs.build.outputs.zip }}
+          body: >-
+            QStac ${{ github.ref_name }}. Download the zip below, then install it in QGIS
+            via Plugins > Manage and Install Plugins > Install from ZIP.
+
+      # Publishing to plugins.qgis.org needs a per-plugin token, which exists
+      # only once the plugin does: upload the first zip by hand at
+      # https://plugins.qgis.org/plugins/add/, then create a token at
+      # https://plugins.qgis.org/plugins/qstac/tokens/create/ and store it as
+      # the QGIS_PLUGIN_TOKEN repository secret. Without it this step is
+      # skipped, so the GitHub release still works.
+      - name: Publish to plugins.qgis.org
+        env:
+          QGIS_PLUGIN_TOKEN: ${{ secrets.QGIS_PLUGIN_TOKEN }}
+          ZIP: ${{ needs.build.outputs.zip }}
+        run: |
+          if [ -z "$QGIS_PLUGIN_TOKEN" ]; then
+            echo "QGIS_PLUGIN_TOKEN is not set - skipping the plugins.qgis.org upload."
+            exit 0
+          fi
+          status=$(curl -sS -w '%{http_code}' -o response.txt -X POST \
+            "https://plugins.qgis.org/plugins/api/qstac/version/add/" \
+            -H "Authorization: Bearer $QGIS_PLUGIN_TOKEN" \
+            -F "package=@${ZIP}")
+          echo "HTTP $status"
+          cat response.txt
+          if [ "$status" -ge 300 ]; then
+            echo "::error::plugins.qgis.org upload failed with HTTP $status"
+            exit 1
+          fi
+          echo "Uploaded. The security scan runs asynchronously:"
+          echo "https://plugins.qgis.org/plugins/qstac/version/${GITHUB_REF_NAME#v}/"

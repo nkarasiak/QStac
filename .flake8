@@ -1,0 +1,8 @@
+# Mirrors the code-quality check plugins.qgis.org runs on upload, which turns
+# on W503 (line break before binary operator). ruff format writes exactly that
+# when it splits a long boolean or sum, so keep such expressions on one line
+# (bind sub-expressions to names) instead of letting the formatter break them.
+[flake8]
+extend-select = W503
+# Line length is ruff's job (88)
+extend-ignore = E501

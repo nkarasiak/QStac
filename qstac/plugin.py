@@ -1,0 +1,125 @@
+"""Main QGIS plugin class for QStac."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtGui import QIcon
+from qgis.PyQt.QtWidgets import QAction
+
+if TYPE_CHECKING:
+    from qgis.gui import QgisInterface
+
+    from .ui.dock import QStacDock
+
+_ICON_PATH = str(Path(__file__).parent / "icons" / "icon.png")
+_PLUGIN_NAME = "QStac"
+
+
+class QStacPlugin:
+    """QGIS plugin — search STAC catalogs and land scenes as COG layers."""
+
+    def __init__(self, iface: QgisInterface):
+        self.iface = iface
+        self.dock: QStacDock | None = None
+        self.action: QAction | None = None
+        self.settings_action: QAction | None = None
+
+    def initGui(self) -> None:  # noqa: N802
+        icon = QIcon(_ICON_PATH) if Path(_ICON_PATH).exists() else QIcon()
+        self.action = QAction(icon, _PLUGIN_NAME, self.iface.mainWindow())
+        self.action.setCheckable(True)
+        self.action.triggered.connect(self._toggle_dock)
+
+        self.settings_action = QAction("Settings…", self.iface.mainWindow())
+        self.settings_action.triggered.connect(self._open_settings)
+
+        self.iface.addWebToolBarIcon(self.action)
+        self.iface.addPluginToWebMenu(_PLUGIN_NAME, self.action)
+        self.iface.addPluginToWebMenu(_PLUGIN_NAME, self.settings_action)
+
+        from . import settings
+        from .raster.cog import configure_gdal_for_cog
+
+        # Before any project opens: saved index layers need the trusted
+        # pixel-function config even if the dock is never shown.
+        configure_gdal_for_cog()
+        settings.add_builtin_connections()
+        if settings.auto_open():
+            self._open_dock()
+            self.action.setChecked(True)
+
+    def unload(self) -> None:
+        from .raster.cog import cleanup_vrt_dir, restore_gdal_config
+
+        if self.dock is not None:
+            import contextlib
+
+            from qgis.PyQt import sip
+
+            with contextlib.suppress(TypeError, RuntimeError):
+                self.dock.visibilityChanged.disconnect(self._on_dock_visibility_changed)
+            with contextlib.suppress(RuntimeError):
+                self.dock.shutdown()
+            self.iface.removeDockWidget(self.dock)
+            # Synchronous deletion: deleteLater() defers to the next event
+            # loop tick, but Plugin Reloader recreates the dock in the same
+            # tick — the leftover widget collides on objectName and QGIS
+            # logs "removing duplicated widget(s)".
+            if not sip.isdeleted(self.dock):
+                sip.delete(self.dock)
+            self.dock = None
+        # Only once the dock's tasks are stopped: they write into this dir
+        # and read with these options.
+        cleanup_vrt_dir()
+        restore_gdal_config()
+
+        if self.action is not None:
+            self.iface.removeWebToolBarIcon(self.action)
+            self.iface.removePluginWebMenu(_PLUGIN_NAME, self.action)
+            self.action = None
+
+        if self.settings_action is not None:
+            self.iface.removePluginWebMenu(_PLUGIN_NAME, self.settings_action)
+            self.settings_action = None
+
+    def _toggle_dock(self, checked: bool) -> None:
+        if checked:
+            self._open_dock()
+        else:
+            self._close_dock()
+
+    def _open_dock(self) -> None:
+        if self.dock is None:
+            from .ui.dock import QStacDock
+
+            self.dock = QStacDock(self.iface, self.iface.mainWindow())
+            self.dock.visibilityChanged.connect(self._on_dock_visibility_changed)
+            self.iface.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.dock)
+
+        self.dock.show()
+        self.dock.raise_()
+
+    def _close_dock(self) -> None:
+        if self.dock is not None:
+            self.dock.hide()
+
+    def _open_settings(self) -> None:
+        # Route through the dock when it exists so a catalog switch also
+        # refreshes its collection combo and clears stale results.
+        if self.dock is not None:
+            self.dock.open_settings_dialog()
+            return
+
+        from . import settings
+        from .ui.settings_dialog import SettingsDialog
+
+        dlg = SettingsDialog(self.iface.mainWindow())
+        if dlg.exec():
+            settings.apply_dialog(dlg)
+
+    def _on_dock_visibility_changed(self, visible: bool) -> None:
+        if self.action is not None:
+            self.action.setChecked(visible)
