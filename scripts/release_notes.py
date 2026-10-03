@@ -39,12 +39,6 @@ def notes(text: str, version: str) -> str:
     items = changelog(meta, version)
     if not items:
         sys.exit(f"no changelog for {version} in {METADATA.name}")
-    beta = (
-        " QStac is still experimental: tick *Show also experimental plugins*"
-        " in the Settings tab to see it there."
-        if meta.getboolean("experimental", False)
-        else ""
-    )
     return "\n".join(
         [
             meta["description"],
@@ -59,7 +53,7 @@ def notes(text: str, version: str) -> str:
             " Manage and Install Plugins > Install from ZIP*. Needs QGIS"
             f" {meta['qgisMinimumVersion']} or later.",
             "",
-            "Or install it from the plugin manager: search for **QStac**." + beta,
+            "Or install it from the plugin manager: search for **QStac**.",
             "",
         ]
     )

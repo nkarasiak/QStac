@@ -6,7 +6,7 @@ QGIS can already browse STAC catalogs (Browser > STAC and the Data Source Manage
 
 ## Install
 
-In QGIS, open *Plugins > Manage and Install Plugins*, search for **QStac** and click *Install Plugin*. QStac is still marked experimental, so tick *Show also experimental plugins* in the Settings tab first.
+In QGIS, open *Plugins > Manage and Install Plugins*, search for **QStac** and click *Install Plugin*.
 
 Or download `qstac-<version>.zip` from the [Releases](https://github.com/nkarasiak/QStac/releases) page and use *Install from ZIP* in the same dialog.
 
