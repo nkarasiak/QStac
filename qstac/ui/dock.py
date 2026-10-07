@@ -181,6 +181,10 @@ _DISCOVERY_TIMEOUT_S = 10
 # (Planetary Computer: ~125 entries) but stable, so fetch it once per session.
 _DISCOVERY_CACHE: dict[str, tuple[CollectionInfo, ...]] = {}
 
+# "Load all" stops here: every card is a widget with a thumbnail, and the
+# list is rebuilt on each sort. "Load more results" goes on from there.
+_LOAD_ALL_MAX = 1000
+
 # The idle Search button.
 _SEARCH_TEXT = "Search this map view"
 
@@ -1616,17 +1620,29 @@ class QStacDock(QDockWidget):
         self._flash_status("Searching…", ms=0)
         self._launch_search(self._run)
 
-    def _on_load_more(self) -> None:
+    def _on_load_more(self, load_all: bool = False) -> None:
         run = self._run
-        if self._next_page is None or run is None or run.task is not None:
+        token = self._next_page
+        if token is None or run is None or run.task is not None:
             return
 
         self._remove_load_more_item()
-        self._flash_status("Searching for more…", ms=0)
-        self._launch_search(run, page_token=self._next_page)
+        if not load_all:
+            self._flash_status("Searching for more…", ms=0)
+            self._launch_search(run, page_token=token)
+            return
+        # Whole pages, not the 10 a card list wants: a GET next link carries
+        # its limit in the URL and keeps it.
+        if token.method == "POST":
+            token = replace(token, body={**token.body, "limit": run.catalog.page_limit})
+        self._flash_status("Loading all scenes…", ms=0)
+        self._launch_search(run, page_token=token, max_items=_LOAD_ALL_MAX)
 
     def _launch_search(
-        self, run: _SearchRun, page_token: PageToken | None = None
+        self,
+        run: _SearchRun,
+        page_token: PageToken | None = None,
+        max_items: int | None = None,
     ) -> None:
         """Submit a StacSearchTask for a page of *run*."""
         catalog, coll = run.catalog, run.collection
@@ -1635,7 +1651,7 @@ class QStacDock(QDockWidget):
             collection=coll.id,
             bbox=run.bbox,
             datetime_range=f"{run.date_from}T00:00:00Z/{run.date_to}T23:59:59Z",
-            max_items=settings.page_size(),
+            max_items=max_items or settings.page_size(),
             cloud_cover_max=run.cloud,
             catalog_url=catalog.search_url,
             page_limit=catalog.page_limit,
@@ -1657,17 +1673,31 @@ class QStacDock(QDockWidget):
     def _add_load_more_item(self) -> None:
         self._remove_load_more_item()
 
-        btn = QPushButton("Load more results")
-        btn.setFixedHeight(32)
-        btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.setStyleSheet(styles.load_more_btn_style(P))
-        btn.clicked.connect(self._on_load_more)
+        row = QWidget()
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        for text, load_all, tip in (
+            ("Load more results", False, "The next page of scenes."),
+            (
+                "Load all",
+                True,
+                f"Every remaining scene, up to {_LOAD_ALL_MAX} more.",
+            ),
+        ):
+            btn = QPushButton(text)
+            btn.setFixedHeight(32)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setStyleSheet(styles.load_more_btn_style(P))
+            btn.setToolTip(tip)
+            btn.clicked.connect(lambda _=False, a=load_all: self._on_load_more(a))
+            lay.addWidget(btn, 2 if not load_all else 1)
 
         item = QListWidgetItem(self.list_results)
         item.setSizeHint(QSize(0, 40))
         item.setFlags(Qt.ItemFlag.NoItemFlags)
         self.list_results.addItem(item)
-        self.list_results.setItemWidget(item, btn)
+        self.list_results.setItemWidget(item, row)
         self._load_more_item = item
 
     def _remove_load_more_item(self) -> None:
