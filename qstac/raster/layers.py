@@ -16,7 +16,7 @@ from qgis.core import (
     QgsRasterLayer,
     QgsRasterPipe,
 )
-from qgis.PyQt.QtCore import QDateTime, Qt
+from qgis.PyQt.QtCore import QDateTime, Qt, QTime
 
 from .cog import (
     _prewarm_sources,
@@ -29,6 +29,8 @@ from .vrt import _band_type, _build_vrt, _write_vrt_xml
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
+
+    from qgis.core import QgsMapSettings
 
     from ..stac.catalogs import CatalogProvider
     from ..stac.collections import CollectionInfo
@@ -342,19 +344,49 @@ def set_layer_temporal(layer: QgsRasterLayer, dt_str: str, end_str: str = "") ->
     """Stamp *layer* with a fixed temporal range so it animates in the controller.
 
     A scene is an instant, which the Temporal Controller cannot frame-step
-    through, so the range spans one day past the acquisition (or past
-    *end_str*, for a mosaic covering several dates). Layers whose datetime is
-    unknown are left non-temporal.
+    through, so the range is its whole UTC day (through *end_str*'s, for a
+    mosaic covering several dates), end excluded: scenes of one day share a
+    time-stack frame whatever their hour, and never leak into the next day's.
+    Layers whose datetime is unknown are left non-temporal.
     """
     start = _parse_dt(dt_str)
     if start is None:
         return
-    end = (_parse_dt(end_str) or start).addDays(1)
+    end = _day_range(_parse_dt(end_str) or start).end()
 
     props = layer.temporalProperties()
     props.setMode(Qgis.RasterTemporalMode.FixedTemporalRange)
-    props.setFixedTemporalRange(QgsDateTimeRange(start, end))
+    props.setFixedTemporalRange(
+        QgsDateTimeRange(_day_range(start).begin(), end, True, False)
+    )
     props.setIsActive(True)
+
+
+def _day_range(dt: QDateTime) -> QgsDateTimeRange:
+    """The UTC day holding *dt*: midnight to the next, the end excluded."""
+    begin = QDateTime(dt)
+    begin.setTime(QTime(0, 0))
+    return QgsDateTimeRange(begin, begin.addDays(1), True, False)
+
+
+def hidden_by_time_filter(
+    settings: QgsMapSettings, layers: list[QgsRasterLayer]
+) -> list[QgsRasterLayer]:
+    """The *layers* the map's time filter keeps from drawing.
+
+    Every scene is stamped with its date (:func:`set_layer_temporal`), so a
+    time range left on the canvas by the Temporal Controller hides any scene
+    outside it — silently: the layer is valid and listed, the map stays empty.
+    """
+    if not settings.isTemporal():
+        return []
+    shown = settings.temporalRange()
+
+    def hidden(layer: QgsRasterLayer) -> bool:
+        props = layer.temporalProperties()
+        return props.isActive() and not props.isVisibleInTemporalRange(shown)
+
+    return [layer for layer in layers if hidden(layer)]
 
 
 def stamp_layer(
@@ -411,7 +443,13 @@ def stamp_layer(
 
 
 def enable_time_stack(canvas: object, dt_strs: Iterable[str]) -> None:
-    """Point the Temporal Controller at *dt_strs*, one day per frame, animated."""
+    """Point the Temporal Controller at *dt_strs*: one frame per day with a
+    scene, animated.
+
+    Irregular steps through those days, not one-day steps from the first
+    scene: those left a frame per day without scenes (empty map), and
+    shifted a scene taken later in the day than the first into the next one.
+    """
     starts = [d for d in (_parse_dt(s) for s in dt_strs) if d is not None]
     if not starts:
         return
@@ -422,8 +460,11 @@ def enable_time_stack(canvas: object, dt_strs: Iterable[str]) -> None:
         animated = Qgis.TemporalNavigationMode.Animated
     except AttributeError:  # pragma: no cover — QGIS < 3.36
         animated = ctrl.Animated
-    ctrl.setTemporalExtents(QgsDateTimeRange(min(starts), max(starts).addDays(1)))
-    ctrl.setFrameDuration(QgsInterval(1, Qgis.TemporalUnit.Days))
+    by_day = {d.date().toString(Qt.DateFormat.ISODate): d for d in starts}
+    days = [_day_range(by_day[k]) for k in sorted(by_day)]
+    ctrl.setTemporalExtents(QgsDateTimeRange(days[0].begin(), days[-1].end()))
+    ctrl.setAvailableTemporalRanges(days)
+    ctrl.setFrameDuration(QgsInterval(1, Qgis.TemporalUnit.IrregularStep))
     ctrl.setNavigationMode(animated)
     ctrl.setCurrentFrameNumber(0)
 

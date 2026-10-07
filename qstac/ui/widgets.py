@@ -36,12 +36,14 @@ from qgis.PyQt.QtWidgets import (
 )
 
 from ..geo import _transform_to_wgs84
+from ..stac.items import scene_date, scene_name
 from .constants import (
     _EMOJI_FONT_FAMILY,
     P,
     _cloud_emoji,
     _shorten_id,
 )
+from .styles import fs, pt
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -57,8 +59,8 @@ __all__ = [
     "_WheelGuard",
 ]
 
-_THUMB_W = 128
-_THUMB_H = 84
+_THUMB_W = 112  # leaves the text room in a narrow dock
+_THUMB_H = 74
 _CARD_H = 96
 _THUMB_STYLE = (
     f"background: {P.sunken}; border: 1px solid {P.border}; border-radius: 6px;"
@@ -222,47 +224,71 @@ class _ResultCard(QWidget):
         self.thumb_label.setText("...")
         self.thumb_label.installEventFilter(self)
         layout.addWidget(self.thumb_label)
+        # Badge over the thumbnail's corner while a layer of this scene is in
+        # the project (set_on_map): the card's height is fixed, so no new line.
+        self.on_map_label = QLabel("\u2713 On map", self.thumb_label)
+        self.on_map_label.setToolTip("A layer of this scene is in the project")
+        # Scoped by name: a bare stylesheet also styles the label's tooltip.
+        self.on_map_label.setObjectName("onMap")
+        self.on_map_label.setStyleSheet(
+            f"#onMap {{ background: {P.accent}; color: {P.on_accent};"
+            f" font-size: {fs(0.75)}; border-radius: 3px; padding: 1px 4px; }}"
+        )
+        self.on_map_label.adjustSize()
+        self.on_map_label.move(3, 3)
+        self.on_map_label.setVisible(False)
 
         # Info section
         info_layout = QVBoxLayout()
         info_layout.setContentsMargins(0, 0, 0, 0)
         info_layout.setSpacing(2)
 
-        # Title — shortened item ID
-        title = _shorten_id(item.id)
-        self.title_label = QLabel(title)
+        # Every text line elides rather than claims width: the card is held to
+        # the list's width, so a label that cannot shrink in a narrow dock
+        # spills over the thumbnail instead.
+        # Title: the day it was taken, what a scene is mostly picked by.
+        self.title_label = ElidedLabel(scene_date(item))
         title_font = QFont()
         title_font.setBold(True)
-        title_font.setPointSize(9)
+        title_font.setPointSizeF(pt(1.0))
         self.title_label.setFont(title_font)
-        self.title_label.setToolTip(item.id)
-        self.title_label.setWordWrap(True)
+        # No tooltip of its own: the card's rich one (with the id) shows.
         info_layout.addWidget(self.title_label)
 
-        # Date
-        self.date_label = QLabel(item.datetime_str)
-        date_font = QFont()
-        date_font.setPointSize(8)
-        self.date_label.setFont(date_font)
-        self.date_label.setStyleSheet(f"color: {P.text_muted};")
-        info_layout.addWidget(self.date_label)
+        # Then the satellite and the tile, one line each ("Sentinel-2A",
+        # "tile 32UNU"), else the shortened id.
+        name_font = QFont()
+        name_font.setPointSizeF(pt(0.9))
+        name = scene_name(item) or _shorten_id(item.id)
+        for part in name.split(" \u00b7 ", 1) if scene_name(item) else [name]:
+            line = ElidedLabel(part)
+            line.setFont(name_font)
+            line.setStyleSheet(f"color: {P.text_muted};")
+            info_layout.addWidget(line)
 
         # Cloud cover with colored weather emoji
         if item.cloud_cover is not None:
             emoji = _cloud_emoji(item.cloud_cover)
             cloud_html = (
                 f'<span style="font-family: {_EMOJI_FONT_FAMILY};'
-                f' font-size: 11px;">{emoji}</span>'
-                f' <span style="color: {P.text_muted}; font-size: 9px;">'
+                f' font-size: {fs(0.92)};">{emoji}</span>'
+                f' <span style="color: {P.text_muted}; font-size: {fs(0.8)};">'
                 f"{item.cloud_cover:.0f}% clouds</span>"
             )
             self.cloud_label = QLabel()
+            self.cloud_label.setSizePolicy(
+                QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+            )
             self.cloud_label.setTextFormat(Qt.TextFormat.RichText)
             self.cloud_label.setText(cloud_html)
             info_layout.addWidget(self.cloud_label)
 
         info_layout.addStretch()
         layout.addLayout(info_layout, 1)
+
+    def set_on_map(self, on_map: bool) -> None:
+        """Mark the card while one of its layers is in the project."""
+        self.on_map_label.setVisible(on_map)
 
     def set_thumbnail(self, pixmap: QPixmap) -> None:
         """Set the thumbnail image with viewport extent overlay."""
@@ -333,7 +359,7 @@ class _ResultCard(QWidget):
         painter.drawRoundedRect(bx, by, badge_w, badge_h, 6, 6)
         # Draw text
         font = QFont()
-        font.setPointSize(8)
+        font.setPointSizeF(pt(0.9))
         font.setBold(True)
         painter.setFont(font)
         painter.setPen(QColor(P.accent))
@@ -348,7 +374,7 @@ class _ResultCard(QWidget):
         # Retry hint below the badge (only when a retry callback is wired).
         if self._on_thumb_retry is not None:
             hint_font = QFont()
-            hint_font.setPointSize(7)
+            hint_font.setPointSizeF(pt(0.8))
             painter.setFont(hint_font)
             painter.setPen(QColor(P.text_muted))
             painter.drawText(
@@ -398,7 +424,7 @@ class _ResultCard(QWidget):
             )
 
         rows.append(
-            f'<b style="font-size:10pt;">{html.escape(item.id)}</b><br/>'
+            f'<b style="font-size:{fs(1.1)};">{html.escape(item.id)}</b><br/>'
             f'<span style="color:{P.text_muted};">'
             f"{html.escape(item.collection)}</span>"
         )
@@ -421,8 +447,14 @@ class _ResultCard(QWidget):
         if n_bands:
             rows.append(f"<br/><b>Bands:</b> {n_bands}")
 
+        rows.append(
+            f'<br/><br/><span style="color:{P.text_muted};">'
+            "Double-click to load \u00b7 right-click for bands,"
+            " indices and export</span>"
+        )
+
         body = "".join(rows)
-        style = "padding:8px; font-size:9.5pt; max-width:320px;"
+        style = f"padding:8px; font-size:{fs(1.05)}; max-width:320px;"
         return f'<div style="{style}">{body}</div>'
 
 

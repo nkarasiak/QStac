@@ -17,7 +17,7 @@ from .cog import (
 )
 from .layers import BAKED_INDEX, REMOTE_VRT, _open_raster_layer
 from .pixel_fn import _EXPR_PIXEL_FN_NAME, _PIXEL_FN_NAME, _eval_index, _norm_diff
-from .style import _apply_index_renderer
+from .style import _apply_band_ranges, _apply_index_renderer
 from .vrt import (
     _band_type,
     _build_vrt,
@@ -60,16 +60,39 @@ def _is_formula(index_preset: IndexPreset | None) -> bool:
     return bool(index_preset and index_preset.expression)
 
 
-def _formula_args(index_preset: IndexPreset, projs: list[AssetProj]) -> str:
+def _channels(index_preset: IndexPreset) -> list[tuple[str, float | None]]:
+    """(formula, fill) per output band: one for an index, three for a composite.
+
+    A composite channel's undefined pixels (log of a negative) take the low
+    end of its range, as the provider's render does; an index leaves them
+    nodata.
+    """
+    if not index_preset.rgb_ranges:
+        return [(index_preset.expression, None)]
+    exprs = index_preset.expression.split(";")
+    return [
+        (e.strip(), lo)
+        for e, (lo, _) in zip(exprs, index_preset.rgb_ranges, strict=True)
+    ]
+
+
+def _formula_args(
+    index_preset: IndexPreset,
+    projs: list[AssetProj],
+    expr: str | None = None,
+    fill: float | None = None,
+) -> str:
     """``expr_pixel_fn``'s PixelFunctionArguments, XML-escaped."""
     nodatas = (_band_type(p)[1] for p in projs)
     args = {
-        "expr": index_preset.expression,
+        "expr": index_preset.expression if expr is None else expr,
         "vars": ",".join(index_preset.variables or index_preset.assets),
         "scales": ",".join(str(p.scale) for p in projs),
         "offsets": ",".join(str(p.offset) for p in projs),
         "nodata": ",".join("" if n is None else str(n) for n in nodatas),
     }
+    if fill is not None:
+        args["fill"] = str(fill)
     return " ".join(f'{k}="{escape(v)}"' for k, v in args.items())
 
 
@@ -83,24 +106,30 @@ def _write_index_vrt_xml(
 ) -> str:
     """Write a VRTDerivedRasterBand VRT computing a spectral index.
 
-    Every source feeds one Float32 derived band: :func:`norm_diff_pixel_fn`
+    Every source feeds each Float32 derived band: :func:`norm_diff_pixel_fn`
     on (A, B) for a plain normalized difference, :func:`expr_pixel_fn` for
-    a preset with a formula. Output is resampled to the finest source grid.
+    a preset with a formula — one band per channel for a colour composite.
+    Output is resampled to the finest source grid.
     Returns *vrt_path*, or with ``vrt_path=""`` the XML itself (no file).
     """
     projs = [asset_proj[n] for n in asset_names]
-    if _is_formula(index_preset):
-        fn, args = _EXPR_PIXEL_FN_NAME, _formula_args(index_preset, projs)
-        stats = _stats(*(index_preset.vrange or (-1.0, 1.0)))
+    if index_preset is not None and index_preset.rgb_ranges:
+        bands = [
+            (_EXPR_PIXEL_FN_NAME, _formula_args(index_preset, projs, e, fill), rng)
+            for (e, fill), rng in zip(
+                _channels(index_preset), index_preset.rgb_ranges, strict=True
+            )
+        ]
+    elif _is_formula(index_preset):
+        args = _formula_args(index_preset, projs)
+        bands = [(_EXPR_PIXEL_FN_NAME, args, index_preset.vrange or (-1.0, 1.0))]
     else:
         a, b = projs
-        fn = _PIXEL_FN_NAME
         args = (
             f'scale_a="{a.scale}" offset_a="{a.offset}"'
             f' scale_b="{b.scale}" offset_b="{b.offset}"'
         )
-        stats = _stats(-1, 1)
-    stats_md = "".join(f'      <MDI key="{k}">{v}</MDI>\n' for k, v in stats.items())
+        bands = [(_PIXEL_FN_NAME, args, (-1.0, 1.0))]
     finest = _finest_grid(asset_proj, asset_names)
     sources_xml = "\n".join(
         _source_xml(
@@ -108,21 +137,27 @@ def _write_index_vrt_xml(
         )
         for src, name in zip(sources, asset_names, strict=True)
     )
-    band = (
-        f'  <VRTRasterBand dataType="Float32" band="1"'
-        f' subClass="VRTDerivedRasterBand">\n'
-        # Precomputed stats: without them QgsRasterLayer construction computes
-        # min/max itself, and a derived band has no overviews, so that pass ran
-        # the pixel function over the full 10980² scene (~20-30 s, GUI frozen).
-        # A formula's range is unknown here: its ramp range, else -1..1.
-        f"    <Metadata>\n{stats_md}    </Metadata>\n"
-        f"    <NoDataValue>{_INDEX_NODATA}</NoDataValue>\n"
-        f"    <PixelFunctionType>{fn}</PixelFunctionType>\n"
-        f"    <PixelFunctionLanguage>Python</PixelFunctionLanguage>\n"
-        f"    <PixelFunctionArguments {args} />\n"
-        f"{sources_xml}\n  </VRTRasterBand>"
-    )
-    return _write_vrt_dataset(vrt_path, finest, epsg, [band])
+    xml = []
+    for i, (fn, args, (lo, hi)) in enumerate(bands, start=1):
+        stats_md = "".join(
+            f'      <MDI key="{k}">{v}</MDI>\n' for k, v in _stats(lo, hi).items()
+        )
+        xml.append(
+            f'  <VRTRasterBand dataType="Float32" band="{i}"'
+            f' subClass="VRTDerivedRasterBand">\n'
+            # Precomputed stats: without them QgsRasterLayer construction
+            # computes min/max itself, and a derived band has no overviews, so
+            # that pass ran the pixel function over the full 10980² scene
+            # (~20-30 s, GUI frozen). A formula's range is unknown here: its
+            # ramp (or channel) range, else -1..1.
+            f"    <Metadata>\n{stats_md}    </Metadata>\n"
+            f"    <NoDataValue>{_INDEX_NODATA}</NoDataValue>\n"
+            f"    <PixelFunctionType>{fn}</PixelFunctionType>\n"
+            f"    <PixelFunctionLanguage>Python</PixelFunctionLanguage>\n"
+            f"    <PixelFunctionArguments {args} />\n"
+            f"{sources_xml}\n  </VRTRasterBand>"
+        )
+    return _write_vrt_dataset(vrt_path, finest, epsg, xml)
 
 
 def _index_source(
@@ -186,8 +221,7 @@ def build_index_layer(
     if baked := (local_clips or {}).get(BAKED_INDEX):
         layer = _open_raster_layer(baked, layer_name, epsg=None)
         if layer is not None:
-            vrange = _index_range(index_preset, baked)
-            _apply_index_renderer(layer, index_preset.ramp, vrange)
+            _style_index(layer, index_preset, baked)
         return layer
 
     source = (local_clips or {}).get(REMOTE_VRT)
@@ -201,8 +235,20 @@ def build_index_layer(
     if layer is None:
         return None
 
-    _apply_index_renderer(layer, index_preset.ramp, _index_range(index_preset))
+    _style_index(layer, index_preset)
     return layer
+
+
+def _style_index(
+    layer: QgsRasterLayer, index_preset: IndexPreset, baked: str = ""
+) -> None:
+    """A composite's channels over their ranges, else the index's colour ramp."""
+    if index_preset.rgb_ranges:
+        _apply_band_ranges(layer, index_preset.rgb_ranges)
+    else:
+        _apply_index_renderer(
+            layer, index_preset.ramp, _index_range(index_preset, baked)
+        )
 
 
 def _bake_index(
@@ -211,7 +257,8 @@ def _bake_index(
     projs: list[AssetProj | None],
     index_preset: IndexPreset | None = None,
 ) -> str | None:
-    """Compute a spectral index from local clips (one per asset) → Float32 tif.
+    """Compute a spectral index from local clips (one per asset) → Float32 tif
+    (one band per channel for a colour composite).
 
     Runs in the prefetch worker so the GUI opens a plain local GeoTIFF; the
     remote derived-band VRT is only used once the user pans off the clip.
@@ -225,7 +272,6 @@ def _bake_index(
         src = gdal.Open(stacked)
         bands = [src.GetRasterBand(i + 1) for i in range(len(clips))]
         arrays = [b.ReadAsArray() for b in bands]
-        out = np.empty(arrays[0].shape, dtype="float32")
         scaling = [(p.scale, p.offset) if p else (1.0, 0.0) for p in projs]
         stats = None
         if _is_formula(index_preset):
@@ -233,37 +279,45 @@ def _bake_index(
                 _band_type(p)[1] if p else b.GetNoDataValue()
                 for p, b in zip(projs, bands, strict=True)
             ]
-            _eval_index(
-                index_preset.expression,
-                list(index_preset.variables or index_preset.assets),
-                arrays,
-                [s for s, _ in scaling],
-                [o for _, o in scaling],
-                [None if n is None else float(n) for n in nodatas],
-                out,
-            )
-            valid = out[out != _INDEX_NODATA]
-            if valid.size:
+            outs = []
+            for expr, fill in _channels(index_preset):
+                out = np.empty(arrays[0].shape, dtype="float32")
+                _eval_index(
+                    expr,
+                    list(index_preset.variables or index_preset.assets),
+                    arrays,
+                    [s for s, _ in scaling],
+                    [o for _, o in scaling],
+                    [None if n is None else float(n) for n in nodatas],
+                    out,
+                    fill,
+                )
+                outs.append(out)
+            valid = outs[0][outs[0] != _INDEX_NODATA]
+            if valid.size and not index_preset.rgb_ranges:
                 lo, hi = (float(v) for v in np.percentile(valid, (2, 98)))
                 stats = _stats(lo, hi if hi > lo else lo + 1e-6)
         else:
+            out = np.empty(arrays[0].shape, dtype="float32")
             (sa, oa), (sb, ob) = scaling
             _norm_diff(arrays[0], arrays[1], out, sa, oa, sb, ob)
+            outs = [out]
         dst = gdal.GetDriverByName("GTiff").Create(
             f"{prefix}.tif",
             src.RasterXSize,
             src.RasterYSize,
-            1,
+            len(outs),
             gdal.GDT_Float32,
             CLIP_CREATION_OPTIONS,
         )
         dst.SetGeoTransform(src.GetGeoTransform())
         dst.SetProjection(src.GetProjection())
-        band = dst.GetRasterBand(1)
-        band.SetNoDataValue(_INDEX_NODATA)
-        band.WriteArray(out)
+        for i, out in enumerate(outs, start=1):
+            band = dst.GetRasterBand(i)
+            band.SetNoDataValue(_INDEX_NODATA)
+            band.WriteArray(out)
         for key, value in (stats or {}).items():
-            band.SetMetadataItem(key, str(value))
+            dst.GetRasterBand(1).SetMetadataItem(key, str(value))
         dst = None  # flush + close
         return f"{prefix}.tif"
     except Exception as exc:

@@ -188,12 +188,14 @@ def _eval(node: ast.AST, env: dict, np):
     return funcs[node.func.id](*(_eval(a, env, np) for a in node.args))
 
 
-def _eval_index(expr, names, arrays, scales, offsets, nodatas, out) -> None:
+def _eval_index(expr, names, arrays, scales, offsets, nodatas, out, fill=None) -> None:
     """Fill *out* with *expr* over DN *arrays*, -9999 where it has no value.
 
     ``names[i]`` reads ``arrays[i] * scales[i] + offsets[i]``; a pixel equal
     to ``nodatas[i]`` (None: no nodata) or not finite in any source, or a
-    non-finite result (x / 0, log of a negative), is -9999.
+    non-finite result (x / 0, log of a negative), is -9999 — the latter is
+    *fill* instead when given: a colour composite's channel is dark there
+    (water in Sentinel-1 false colour), not a hole in the scene.
     """
     import numpy as np
 
@@ -212,8 +214,11 @@ def _eval_index(expr, names, arrays, scales, offsets, nodatas, out) -> None:
         env[name] = a * np.float32(scale) + np.float32(offset)
     with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
         result = _eval(tree.body, env, np)
-    valid &= np.isfinite(result)
+    sources_ok = valid
+    valid = valid & np.isfinite(result)
     out[:] = np.where(valid, result, -9999.0)
+    if fill is not None:
+        out[sources_ok & ~valid] = fill
 
 
 def _text(kwargs: dict, key: str) -> str:
@@ -243,10 +248,12 @@ def expr_pixel_fn(
 ) -> None:
     """GDAL VRT pixel function: a custom index formula (see ``_eval_index``).
 
-    ``PixelFunctionArguments``: ``expr``, and comma-separated per source
-    ``vars``, ``scales``, ``offsets`` and ``nodata`` ("" = none).
+    ``PixelFunctionArguments``: ``expr``, comma-separated per source
+    ``vars``, ``scales``, ``offsets`` and ``nodata`` ("" = none), and an
+    optional ``fill`` (a number, read with ``float`` only).
     """
     n = len(in_ar)
+    fill = _text(kwargs, "fill").strip()
     _eval_index(
         _text(kwargs, "expr"),
         _list(kwargs, "vars", "", 0),
@@ -255,6 +262,7 @@ def expr_pixel_fn(
         [float(v) for v in _list(kwargs, "offsets", "0", n)],
         [float(v) if v.strip() else None for v in _list(kwargs, "nodata", "", n)],
         out_ar,
+        float(fill) if fill else None,
     )
 
 

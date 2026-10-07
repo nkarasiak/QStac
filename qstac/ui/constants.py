@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from ..stac.catalogs import CatalogProvider
     from ..stac.items import StacItemResult
 
-_DATE_PRESETS = [("1w", 7), ("1m", 30), ("3m", 90), ("6m", 180), ("1y", 365)]
+_DATE_PRESETS = [("1w", 7), ("1m", 30)]
 
 # ── Color palette ──
 # Derived from the running QGIS theme rather than hardcoded — see ui/theme.py.

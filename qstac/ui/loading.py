@@ -13,13 +13,14 @@ from typing import TYPE_CHECKING
 from qgis.core import (
     Qgis,
     QgsApplication,
+    QgsDateTimeRange,
     QgsProject,
     QgsProviderRegistry,
     QgsProviderSublayerDetails,
     QgsTask,
 )
 from qgis.PyQt import sip
-from qgis.PyQt.QtCore import QDir, QObject
+from qgis.PyQt.QtCore import QDateTime, QDir, QObject, pyqtSignal
 from qgis.PyQt.QtWidgets import QFileDialog, QMessageBox
 
 from .. import settings
@@ -29,6 +30,7 @@ from ..raster.index import build_index_layer
 from ..raster.layers import (
     add_layers_to_project,
     build_layer,
+    hidden_by_time_filter,
     open_mosaic_layer,
     stamp_layer,
     swap_layer_source,
@@ -222,6 +224,27 @@ def _load_names(
     return [] if index_preset else _guess_item_asset(item)
 
 
+def _load_preset(
+    coll: CollectionInfo,
+    items: list[StacItemResult],
+    band_override: list[str] | None,
+    index_preset: IndexPreset | None,
+) -> IndexPreset | None:
+    """The index or composite a load of *items* computes, None for plain bands.
+
+    *index_preset* when one was asked for. A plain load (no bands, no index
+    asked for) of a collection with a default composite shows that
+    (Sentinel-1 false colour, as its thumbnails do) — when every scene has
+    its bands: a single-polarization scene (VV only) loads as is instead.
+    """
+    preset = coll.default_preset
+    if index_preset is not None or band_override is not None or preset is None:
+        return index_preset
+    if all(n in it.assets for it in items for n in preset.assets):
+        return preset
+    return None
+
+
 def _missing_index_assets(item: StacItemResult, index_preset: IndexPreset) -> str:
     """Which of *index_preset*'s variables *item* has no asset for, said plainly."""
     variables = index_preset.variables or index_preset.assets
@@ -343,6 +366,9 @@ class LayerLoader(QObject):
     through :meth:`run_task`, so :meth:`shutdown` can stop them all.
     """
 
+    # A scene's layer was added to or removed from the project (is_on_map).
+    addedChanged = pyqtSignal()  # noqa: N815 (Qt signal naming)
+
     def __init__(
         self,
         iface: QgisInterface,
@@ -357,6 +383,7 @@ class LayerLoader(QObject):
         self._warming: set[CogPrefetchTask] = set()  # post-search header warms
         self._loading: set[str] = set()  # _item_key()s being added
         self._added: dict[str, str] = {}  # qgis_layer_id → _item_key()
+        self._stack: set[str] = set()  # _item_key()s loading as a time stack
         # _item_key() → layers still sourced from local viewport clips;
         # repointed at the pannable remote VRT on first pan.
         self._local: dict[str, _LocalLayer] = {}
@@ -407,9 +434,21 @@ class LayerLoader(QObject):
             with contextlib.suppress(RuntimeError):
                 task.cancel()
 
+    def expect_time_stack(self, items: list[StacItemResult]) -> None:
+        """The next plain load of *items* is a time stack: its layers are
+        meant to hide outside their frame (see :meth:`_add_to_project`)."""
+        self._stack |= {_item_key(it, None) for it in items}
+
     def forget_added(self) -> None:
         """Let a new search load its scenes again, even ones already loaded."""
         self._added.clear()
+        self._stack.clear()
+        self.addedChanged.emit()
+
+    def is_on_map(self, item_id: str) -> bool:
+        """Whether a layer of scene *item_id* (any bands or index) was added."""
+        prefix = item_id + ":"
+        return any(k == item_id or k.startswith(prefix) for k in self._added.values())
 
     def _is_dead(self, ld: _ProgressiveLoad) -> bool:
         """Whether *ld*'s callbacks must do nothing: canceled, or unloaded."""
@@ -496,8 +535,44 @@ class LayerLoader(QObject):
         if not layers:
             self._flash(f"Saved {name}; QGIS cannot open it.")
             return
-        add_layers_to_project(layers, canvas=self._iface.mapCanvas(), group=item.id)
+        self._add_to_project(layers, item.id)
         self._flash(f"Saved and opened {name}.")
+
+    def _add_to_project(
+        self, layers: list[QgsRasterLayer], group: str, stack: bool = False
+    ) -> None:
+        """Add *layers* to the map, and make sure they show.
+
+        A time range left on the map (an earlier time stack still animating,
+        a Temporal Controller range) hides every scene of another date with
+        no error, and a newcomer sees an empty map: it is lifted, and said.
+        Not for a time stack's own layers (*stack*): hiding the other dates
+        is what its animation does.
+        """
+        canvas = self._iface.mapCanvas()
+        add_layers_to_project(layers, canvas=canvas, group=group)
+        if stack or not hidden_by_time_filter(canvas.mapSettings(), layers):
+            return
+        self._show_all_dates(canvas)
+        self._iface.messageBar().pushMessage(
+            "QStac",
+            "The map's time filter (Temporal Controller) hid the new layers,"
+            " so it is now off: every date shows.",
+            Qgis.MessageLevel.Info,
+            8,
+        )
+
+    def _show_all_dates(self, canvas: QgsMapCanvas) -> None:
+        """Lift the map's time filter: every layer draws, whatever its date.
+
+        Setting the controller off is not enough when it already is: QGIS
+        then keeps the canvas range it was left with.
+        """
+        ctrl = canvas.temporalController()
+        if ctrl is not None and hasattr(ctrl, "setNavigationMode"):
+            ctrl.setNavigationMode(Qgis.TemporalNavigationMode.Disabled)
+        canvas.setTemporalRange(QgsDateTimeRange(QDateTime(), QDateTime()))  # none
+        canvas.refresh()
 
     def ensure_s3_login(self, catalog: CatalogProvider, ask: bool = False) -> bool:
         """Whether GDAL can read *catalog*'s assets, asking for S3 keys first.
@@ -568,6 +643,7 @@ class LayerLoader(QObject):
         if not items:
             return
 
+        index_preset = _load_preset(coll, items, band_override, index_preset)
         if index_preset is not None:
             band_override = list(index_preset.assets)
 
@@ -626,7 +702,7 @@ class LayerLoader(QObject):
         layer = QgsProject.instance().mapLayer(lid) if lid else None
         if layer is not None:
             self._iface.setActiveLayer(layer)  # selects it in the layer tree
-            self._flash("Already loaded.")
+            self._flash("Already on the map.")
         else:
             self._flash("Already loading…")
         return []
@@ -749,11 +825,10 @@ class LayerLoader(QObject):
             delete_clips(clips.values())
             return
         stamp_layer(layer, [it], ld.coll, ld.catalog, ld.key_suffix or "")
-        add_layers_to_project(
-            [layer], canvas=self._iface.mapCanvas(), group=ld.coll.label
-        )
+        self._add_to_project([layer], ld.coll.label, key in self._stack)
         self._local[key] = _LocalLayer(layer, it, ld, clips)
         self._added[layer.id()] = key
+        self.addedChanged.emit()
         ld.painted.add(it.id)
         ld.coarse_done += 1
         self._flash(f"Loading {ld.coarse_done}/{len(ld.items)}…", ms=0)
@@ -840,13 +915,11 @@ class LayerLoader(QObject):
                 pairs.append((layer, _item_key(item, ld.key_suffix)))
         if pairs:
             # Deferred-tree-insert avoids QGIS's ~5 s layer-tree paint probe.
-            add_layers_to_project(
-                [p[0] for p in pairs],
-                canvas=self._iface.mapCanvas(),
-                group=ld.coll.label,
-            )
+            stack = any(key in self._stack for _, key in pairs)
+            self._add_to_project([p[0] for p in pairs], ld.coll.label, stack)
             for layer, key in pairs:
                 self._added[layer.id()] = key
+            self.addedChanged.emit()
         return len(pairs)
 
     def _on_extents_changed(self) -> None:
@@ -872,8 +945,10 @@ class LayerLoader(QObject):
     def _on_layers_removed(self, layer_ids: list[str]) -> None:
         """Forget layers about to be removed, and delete the clips they read."""
         gone = set(layer_ids)
-        for lid in gone:
-            self._added.pop(lid, None)
+        removed = {key for lid in gone if (key := self._added.pop(lid, None))}
+        if removed:
+            self._stack -= removed  # loaded again later: a plain load
+            self.addedChanged.emit()
         for key, entry in list(self._local.items()):
             if sip.isdeleted(entry.layer) or entry.layer.id() in gone:
                 del self._local[key]
@@ -962,9 +1037,7 @@ class LayerLoader(QObject):
             return
 
         stamp_layer(layer, items, task.collection_info, catalog, "Mosaic")
-        add_layers_to_project(
-            [layer], canvas=self._iface.mapCanvas(), group=task.collection_info.label
-        )
+        self._add_to_project([layer], task.collection_info.label)
         self._added[layer.id()] = key
         total = len(items)
         if task.dropped:

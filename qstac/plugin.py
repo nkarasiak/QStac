@@ -86,8 +86,15 @@ class QStacPlugin:
             self.settings_action = None
 
     def _toggle_dock(self, checked: bool) -> None:
+        from . import settings
+
+        # QGIS reopens the dock at the next start only if it was left open.
+        settings.save_all({"auto_open": checked})
         if checked:
             self._open_dock()
+            # Here, not in _open_dock: at QGIS start the project is always
+            # empty, and a basemap there would mark every new project dirty.
+            self.dock.ensure_basemap()
         else:
             self._close_dock()
 

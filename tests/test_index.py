@@ -246,6 +246,60 @@ def test_baked_formula_writes_auto_range() -> None:
     assert _index_range(preset) == (-1.0, 1.0)  # remote, nothing baked
 
 
+def test_fill_marks_undefined_results_not_missing_sources() -> None:
+    """A composite channel's undefined pixel takes *fill*; nodata stays -9999."""
+    a = np.array([[np.e, -1.0, -9999.0]], dtype=np.float32)
+    out = np.empty_like(a)
+    _eval_index("log(a)", ["a"], [a], [1], [0], [-9999.0], out, 0.25)
+    assert np.allclose(out, [[1.0, 0.25, -9999.0]]), out  # log(-1) → fill
+
+
+def _composite(tmp: str, preset: IndexPreset, vv, vh, proj: AssetProj):
+    """The (remote VRT, baked clip) arrays of *preset* over vv/vh tifs."""
+    dtype = gdal.GDT_Float32 if vv.dtype == np.float32 else gdal.GDT_UInt16
+    _tif(f"{tmp}/vv.tif", vv, dtype)
+    _tif(f"{tmp}/vh.tif", vh, dtype)
+    srcs = [f"{tmp}/vv.tif", f"{tmp}/vh.tif"]
+    vrt = _write_index_vrt_xml(
+        f"{tmp}/c.vrt", srcs, ["vv", "vh"], 32631, {"vv": proj, "vh": proj}, preset
+    )
+    baked = _bake_index(f"{tmp}/baked", srcs, [proj, proj], preset)
+    assert baked is not None
+    return gdal.Open(vrt).ReadAsArray(), gdal.Open(baked).ReadAsArray()
+
+
+def test_sentinel1_false_colour() -> None:
+    """PC's own S1 renders, three channels, VRT and bake alike, nodata clear."""
+    from qstac.stac.collections import _S1_GRD_FALSE_COLOR, _S1_RTC_FALSE_COLOR
+
+    configure_gdal_for_cog()
+    with tempfile.TemporaryDirectory() as tmp:
+        # GRD: UInt16 DN, nodata 0 (declared by the file only; STAC has no type).
+        vv = np.array([[300, 0]], dtype=np.uint16)
+        vh = np.array([[60, 0]], dtype=np.uint16)
+        p = AssetProj([1, 2], _GRID)
+        remote, baked = _composite(tmp, _S1_GRD_FALSE_COLOR, vv, vh, p)
+    assert np.allclose(remote, baked), (remote, baked)
+    assert remote[:, 0, 0].tolist() == [300.0, 60.0, 5.0], remote
+    assert (remote[:, 0, 1] == -9999).all(), remote  # outside the footprint
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # RTC: Float32 gamma0, nodata -32768. Land (vv 0.2) has no blue (a log
+        # of a negative), water (vv 0.01) no red: both take the range's low
+        # end, 0, as PC's render does; neither is a hole in the scene.
+        vv = np.array([[0.2, 0.01, -32768]], dtype=np.float32)
+        vh = np.array([[0.05, 0.002, -32768]], dtype=np.float32)
+        p = AssetProj([1, 3], _GRID, data_type="float32", nodata=-32768)
+        remote, baked = _composite(tmp, _S1_RTC_FALSE_COLOR, vv, vh, p)
+    assert np.allclose(remote, baked, atol=1e-6), (remote, baked)
+    v, h = 0.2, 0.05
+    red = 0.03 + np.log(10e-4 - np.log(0.05 / (0.02 + 2 * v)))
+    green = 0.05 + np.exp(0.25 * (np.log(0.01 + 2 * v) + np.log(0.02 + 5 * h)))
+    assert np.allclose(remote[:, 0, 0], [red, green, 0.0], atol=1e-5), remote
+    assert remote[0, 0, 1] == 0.0 and remote[2, 0, 1] > 0.5, remote  # water: blue
+    assert (remote[:, 0, 2] == -9999).all(), remote
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

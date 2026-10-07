@@ -7,7 +7,7 @@ This file provides guidance to AI coding agents when working with code in this r
 QStac is a QGIS plugin (3.40+, for `QgsStacConnection`) for browsing STAC catalogs. The plugin id, package dir (`qstac/`), CI archive prefix, release zip and settings group are all `qstac`. Never reference the plugin's earlier names or any vendor that is not a built-in provider, in code, comments, docs or metadata. Not `qgis_stac`: that id belongs to Kartoza's "STAC API Browser" on plugins.qgis.org, and two plugins sharing a folder name overwrite each other. Zero external Python dependencies — uses only QGIS built-ins (Qt, GDAL, qgis.core) and stdlib urllib. Users search by viewport, date range, and cloud cover, then load satellite imagery as COG-backed raster layers.
 
 Three providers are built in (`qstac/stac/catalogs.py`), switched from the
-catalog combo on the dock's top row (or the settings dialog):
+catalog combo on the dock's top row:
 
 - **Planetary Computer** (`planetary_computer`) — **default**, no credentials. Public search, assets signed client-side via `pc_sign_url` (selected by `CatalogProvider.asset_signer == "pc_sas"`).
 - **Earth Search** (`earth_search`) — no credentials. Element 84's stac-server over ESA Copernicus open data on AWS; assets are anonymously readable HTTPS COGs.
@@ -29,7 +29,7 @@ a catalog until it has keys. Keys are set per session: a saved project's CDSE
 layers read again after one load from the dock.
 
 Everything else is a **user catalog**: any STAC API the
-user adds (Settings > Catalog > Your STAC APIs, or the combo's trailing "Add STAC
+user adds (Settings > Catalogs, or the combo's trailing "Add STAC
 API…" entry, which opens `CatalogEditor` and switches on OK). Pasting
 provider details (`NAME=value`, `name: value`, JSON) fills the fields by name
 ending (`detect.parse_pasted()`, never by provider) and runs *Check*:
@@ -102,16 +102,21 @@ URL's origin. The "Find out for me" checks run off the GUI thread; auth configs
 are created and removed on the main thread, and configs the plugin made
 (`QStac: <name>`) are removed once no connection uses them.
 
-The dock's top row (`_build_toolbar()`) is QGIS-Browser-style theme icons,
-then the catalog combo: add STAC API, edit the one in use (user catalogs
-only), refresh collections (`_refresh_collections()` drops `_DISCOVERY_CACHE`
-and re-discovers, keeping the selection; a user catalog is re-resolved, which
-drops its results), info (`_show_info()`: catalog, login, collection), settings
-and help (metadata `homepage`).
+The dock's top row (`_build_toolbar()`) is the catalog combo, then a
+settings icon and a ⋯ menu: edit the one in use (user catalogs only),
+refresh collections (`_refresh_collections()` drops `_DISCOVERY_CACHE` and
+re-discovers, keeping the selection; a user catalog is re-resolved, which
+drops its results), info (`_show_info()`: catalog, login, collection), help
+(metadata `homepage`) and *Report an issue…* (`_report_issue()`: the metadata
+`tracker` + `/new`, its body pre-filled with QStac/QGIS/GDAL/Qt/OS versions, the
+catalog id — never a user catalog's name or URL, which may be private — and the
+collection). Adding a STAC API is the combo's last entry.
+The settings dialog has no catalog picker: the catalog in use is the dock's.
+Its Catalogs tab lists the built-ins (read-only: no Edit/Remove) above the
+user catalogs.
 
-The catalog combo shares the top row with the icons and takes their leftover
-width, so a long user catalog name elides in the closed box but lays out in
-full in the popup.
+The catalog combo takes the row's leftover width, so a long user catalog name
+elides in the closed box but lays out in full in the popup.
 Switching catalogs goes through `QStacDock._switch_catalog()`, which drops
 results/thumbnails/paging (they belong to one provider) and re-syncs the combo
 to the *resolved* catalog — a user API that fails (auth, network, no
@@ -324,13 +329,69 @@ as their values differ; any other key must also repeat a value and stay under
 `_MAX_FACET_VALUES`, so each collection gets just its own. It filters the loaded
 pages, not the server.
 
-Opening a scene (`_add_items()`, mosaic) first runs `_zoom_on_open()`: the
-`zoom_to_scene` setting is `ask` until the first open asks "Yes, always" / "No"
-(then `always`/`never`, changeable in Settings > Display). It zooms *before*
+First opening: the dock opens at QGIS start only if it was left open
+(`auto_open`, saved by `QStacPlugin._toggle_dock()` and `QStacDock.closeEvent()`,
+never from `visibilityChanged`, which also fires as QGIS quits). Opening it from
+the toolbar on an empty project runs `QStacDock.ensure_basemap()` (an OSM XYZ
+layer, `world_map.gpkg` as fallback) — not at QGIS start, where the project is
+always empty and a basemap would mark it dirty. A search on an empty project
+does the same and stops there, the whole world being in view.
+
+Opening a scene (`_add_items()`, mosaic) first runs `_zoom_on_open()`: unless
+the `zoom_to_scene` setting is `never` (Settings > Display; `always` by default,
+as without it a newcomer cannot tell where the layer went). It zooms *before*
 the load, since a load clips what the map shows.
 
-The result list's right-click menu starts with *Zoom to scene* (*Zoom to N
-scenes* for a selection), then the loads. *Load asset* lists every raster
+The form's blocks have captions (*Catalog*, *Collection*, *Dates*,
+`_add_caption()`) whose tooltips explain the STAC terms: two bare dropdowns
+do not say which is which to a newcomer.
+
+Every scene layer carries its date (`set_layer_temporal()`: its whole UTC day,
+end excluded), and a time stack (`enable_time_stack()`) steps through the days
+that have scenes (`setAvailableTemporalRanges` + `IrregularStep`), not
+one-day frames from the first scene's hour: those left empty frames and pushed
+a scene taken later in the day into the next frame. So a time range left on
+the canvas (a time stack still animating, a Temporal Controller range kept
+after it was switched off) hides every scene of another date with no error.
+Every add goes through `LayerLoader._add_to_project()`: when
+`raster.layers.hidden_by_time_filter()` says the new layers are hidden, it
+lifts the filter (`_show_all_dates()`: navigation off *and* an explicit null
+canvas range, as `QgsDateTimeRange()` without arguments is refused by some
+PyQt builds) and says so. Except a time stack's own layers: the dock marks
+those scenes first (`LayerLoader.expect_time_stack()`), as hiding the other
+dates is what their animation does.
+
+Font sizes are relative to the QGIS application font (`styles.fs()` for
+stylesheets, `styles.pt()` for `QFont`), never px, so the dock follows the
+QGIS font size setting.
+
+The search area is the map view, so the button says *Search this map view*
+and `_show_search_area()` tints the searched box on the map until the search
+ends (`_stop_progress()`). A result card leads with the day it was taken
+(`stac.items.scene_date()`, "29 Jul 2025"), then the satellite and tile
+(`scene_name()`, "Sentinel-2A · tile 32UNU", from `platform` / `s2:mgrs_tile` /
+`grid:code` / WRS path/row properties or the id's tokens; else `_shorten_id()`).
+While another page exists the status reads "First N scenes · more below",
+not "N scenes found". Card text lines are `ElidedLabel`s (date, satellite,
+tile, one line each): the card is held to the list's width, so a label that
+cannot shrink overlaps the thumbnail in a narrow dock.
+
+Loading several selected scenes from the load bar or Return/Space
+(`_shortcut_load()`) asks every time how: separate layers, mosaic or time
+stack (`_ask_load_many()`, one `QCommandLinkButton` per choice with its
+meaning under it, not a message box; Time stack is disabled when every scene
+is from one day). One scene loads at once.
+
+Selecting results shows the load bar under the list (*Load N scenes*, and ▾
+for the same menu as a right-click: `QStacDock._item_menu()`). Cards whose scene
+has a layer in the project get an *On map* badge (`LayerLoader.addedChanged`,
+`is_on_map()`); the sort button opens a menu.
+
+The result menu starts with *Add & zoom to scene* (*… to N scenes* for a
+selection: zooms, then loads, whatever `zoom_to_scene` says; zoom alone is
+the list's Z key), then the default load, mosaic and time stack, then submenus:
+*Band combinations*, *Spectral indices* (with *Custom index…*), *Load asset*,
+then export and *Copy* (item ID, asset URL). *Load asset* lists every raster
 as "name — title", in natural order (B2 before B10), `data`/`visual` assets
 first; a JPEG 2000 twin of a COG (`nir-jp2` beside `nir`) is hidden. Items
 keep each asset's title, roles, media type and single-band common name
@@ -357,6 +418,19 @@ floats, + - * / **, declared variables, `pi`/`e`, sqrt/log/log10/exp/abs/
 min/max) and refuses everything else, and the dialog validates with it.
 A preset with no `expression` stays the legacy `norm_diff_pixel_fn` VRT,
 byte for byte, so saved projects keep opening.
+
+**Colour composites** are `IndexPreset`s with `rgb_ranges`: `expression` holds
+one formula per channel, `;`-separated (titiler's syntax, so a provider's
+published render can be copied as is), each a derived VRT band (and baked
+band) stretched over its own range by `style._apply_band_ranges()`. A
+channel's undefined pixels (log of a negative) take its range's low end via
+`expr_pixel_fn`'s `fill`, as the provider's render does; missing sources stay
+-9999 (transparent). `CollectionInfo.default_preset` makes one the plain
+load (`ui.loading._load_preset()`), used only when every scene has its bands.
+Sentinel-1 RTC and GRD default to Planetary Computer's own "VV, VH
+False-color composite" (its thumbnails; different formulas per collection,
+copied from PC's `mosaic/info` renderOptions); *Band combinations* keeps VV
+and VH as they are. Mosaics and *Save clipped GeoTIFF* still use VV.
 
 ## Adding a new collection
 

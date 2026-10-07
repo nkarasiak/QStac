@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import urllib.parse
-from pathlib import Path
 
 from qgis.core import QgsApplication
 from qgis.gui import QgsAuthConfigSelect, QgsCollapsibleGroupBox
 from qgis.PyQt import sip
 from qgis.PyQt.QtCore import QEventLoop, Qt, QThread, QTimer, pyqtSignal
-from qgis.PyQt.QtGui import QPixmap
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -40,7 +38,6 @@ from ..stac.auth import (
     request_headers,
 )
 from ..stac.catalogs import (
-    CATALOG_BY_ID,
     CATALOGS,
     USER_CATALOG_PREFIX,
     CatalogProvider,
@@ -57,18 +54,18 @@ from ..stac.detect import (
     resolve_token_url,
 )
 from ..stac.net import StacError
+from .styles import fs
 
 __all__ = ["CatalogEditor", "SettingsDialog", "ask_s3_keys"]
 
-_ICONS_DIR = Path(__file__).resolve().parent.parent / "icons"
 
-_HINT_CSS = "color: #888; font-size: 10px;"
+_HINT_CSS = f"color: #888; font-size: {fs(0.85)};"
 
 # Stretch method choices: (display label, settings value)
 _STRETCH_METHODS = [
-    ("Fixed values", "fixed"),
-    ("Cumulative cut (2%-98%)", "cumulative_cut"),
-    ("Min / Max", "min_max"),
+    ("Fixed (fast)", "fixed"),
+    ("2\u201398 % of the values", "cumulative_cut"),
+    ("Min\u2013max", "min_max"),
 ]
 
 
@@ -204,20 +201,10 @@ class SettingsDialog(QDialog):
         )
 
         self._created: set[str] = set()  # auth configs stored this session
+        # The catalog in use is picked in the dock; kept here only so a rename
+        # or removal in this dialog moves it along.
+        self._catalog = settings.catalog()
         layout = QVBoxLayout(self)
-
-        # Logo header
-        logo_path = _ICONS_DIR / "icon.png"
-        if logo_path.exists():
-            logo_label = QLabel()
-            pixmap = QPixmap(str(logo_path))
-            scaled = pixmap.scaledToHeight(
-                48, Qt.TransformationMode.SmoothTransformation
-            )
-            logo_label.setPixmap(scaled)
-            logo_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            logo_label.setStyleSheet("padding: 6px 0 10px 0;")
-            layout.addWidget(logo_label)
 
         self._tabs = QTabWidget()
         # Never collapse tabs into scroll arrows — shrink labels instead.
@@ -231,7 +218,7 @@ class SettingsDialog(QDialog):
 
         # Buttons
         btn_layout = QHBoxLayout()
-        restore_btn = QPushButton("Restore Defaults")
+        restore_btn = QPushButton("Restore defaults")
         restore_btn.clicked.connect(self._restore_defaults)
         btn_layout.addWidget(restore_btn)
         btn_layout.addStretch()
@@ -257,30 +244,19 @@ class SettingsDialog(QDialog):
         return form
 
     def _build_catalog_tab(self) -> None:
+        # Every STAC catalog QStac can search: the built-ins (read-only), then
+        # the user's own STAC APIs, any QGIS auth method. The catalog in use
+        # is picked in the dock's combo.
         tab = QWidget()
         outer = QVBoxLayout(tab)
-
-        picker = QWidget()
-        form = self._form(picker)
-        self.combo_catalog = QComboBox()
-        form.addRow("Catalog:", self.combo_catalog)
-        outer.addWidget(picker)
-
-        # Replaces the old combo tooltip: the description of the *selected*
-        # provider, always visible instead of waiting on a hover.
-        self.lbl_catalog_hint = QLabel()
-        self.lbl_catalog_hint.setWordWrap(True)
-        self.lbl_catalog_hint.setStyleSheet(_HINT_CSS)
-        self.lbl_catalog_hint.setMinimumHeight(30)
-        outer.addWidget(self.lbl_catalog_hint)
-
-        # ── User catalogs: any STAC API, any QGIS auth method ──
-        grp = QGroupBox("Your STAC APIs")
+        grp = QGroupBox("STAC catalogs")
         glay = QVBoxLayout(grp)
         self.list_user_catalogs = QListWidget()
         self.list_user_catalogs.itemDoubleClicked.connect(self._edit_user_catalog)
+        self.list_user_catalogs.currentItemChanged.connect(self._sync_catalog_buttons)
         glay.addWidget(self.list_user_catalogs)
         row = QHBoxLayout()
+        self._catalog_buttons: list[QPushButton] = []
         for text, slot in (
             ("Add…", self._add_user_catalog),
             ("Edit…", self._edit_user_catalog),
@@ -289,21 +265,21 @@ class SettingsDialog(QDialog):
             btn = QPushButton(text)
             btn.clicked.connect(slot)
             row.addWidget(btn)
+            self._catalog_buttons.append(btn)
         row.addStretch()
         glay.addLayout(row)
         hint = QLabel(
-            "Any STAC API. Authentication (OAuth2, Basic, API key header...) "
+            "Add any STAC API. Authentication (OAuth2, Basic, API key header...) "
             "uses QGIS authentication configs, stored encrypted. This list is "
             "QGIS's own STAC connections (Browser > STAC): a catalog added on "
-            "either side shows up on the other."
+            "either side shows up on the other. Built-in catalogs cannot be "
+            "edited or removed."
         )
         hint.setStyleSheet(_HINT_CSS)
         hint.setWordWrap(True)
         glay.addWidget(hint)
         outer.addWidget(grp)
-
-        self.combo_catalog.currentIndexChanged.connect(self._sync_catalog_tab)
-        self._tabs.addTab(tab, "Catalog")
+        self._tabs.addTab(tab, "Catalogs")
 
     def _build_search_tab(self) -> None:
         tab = QWidget()
@@ -326,12 +302,11 @@ class SettingsDialog(QDialog):
 
         self.spin_overlap = QSpinBox()
         self.spin_overlap.setRange(0, 100)
-        self.spin_overlap.setSuffix(" %")
+        self.spin_overlap.setSuffix(" % of the map view")
         self.spin_overlap.setToolTip(
-            "Minimum percentage of the viewport that an item\n"
-            "must cover to appear in results."
+            "Scenes that barely touch the map view are left out of the results."
         )
-        form.addRow("Min viewport overlap:", self.spin_overlap)
+        form.addRow("Hide scenes covering under:", self.spin_overlap)
 
         self._tabs.addTab(tab, "Search")
 
@@ -351,15 +326,17 @@ class SettingsDialog(QDialog):
         )
         form.addRow("", self.chk_visual_asset)
 
-        self.combo_zoom = QComboBox()
-        for label, value in (("Ask", "ask"), ("Always", "always"), ("Never", "never")):
-            self.combo_zoom.addItem(label, value)
-        form.addRow("Zoom to scene on open:", self.combo_zoom)
+        self.chk_zoom = QCheckBox("Zoom the map to each scene you open")
+        form.addRow("", self.chk_zoom)
 
         self.combo_stretch_method = QComboBox()
         for label, value in _STRETCH_METHODS:
             self.combo_stretch_method.addItem(label, value)
-        form.addRow("Stretch method:", self.combo_stretch_method)
+        self.combo_stretch_method.setToolTip(
+            "How the image values are spread over the colors. Fixed is fastest;\n"
+            "the others read the image statistics first."
+        )
+        form.addRow("Contrast:", self.combo_stretch_method)
         outer.addWidget(top)
 
         outer.addStretch()
@@ -372,7 +349,10 @@ class SettingsDialog(QDialog):
 
         startup = QWidget()
         sform = self._form(startup)
-        self.chk_auto_open = QCheckBox("Open panel when plugin loads")
+        self.chk_auto_open = QCheckBox("Open QStac when QGIS starts")
+        self.chk_auto_open.setToolTip(
+            "Follows whether you left the panel open or closed it."
+        )
         sform.addRow("Startup:", self.chk_auto_open)
         outer.addWidget(startup)
 
@@ -384,10 +364,10 @@ class SettingsDialog(QDialog):
         self.spin_vsi_cache.setSuffix(" MB")
         self.spin_vsi_cache.setSingleStep(64)
         self.spin_vsi_cache.setToolTip(
-            "GDAL virtual filesystem cache for COG streaming.\n"
-            "Larger values improve pan/zoom on remote imagery."
+            "Memory kept for streamed image data (GDAL /vsicurl/ cache).\n"
+            "Larger values make panning and zooming remote imagery smoother."
         )
-        form.addRow("VSI cache size:", self.spin_vsi_cache)
+        form.addRow("Image cache size:", self.spin_vsi_cache)
 
         self.spin_http_conn = QSpinBox()
         self.spin_http_conn.setRange(1, 64)
@@ -414,33 +394,27 @@ class SettingsDialog(QDialog):
     # Reactive state
     # -----------------------------------------------------------------
 
-    def _sync_catalog_tab(self) -> None:
-        """Show the description of the selected catalog."""
-        cat_id = self.combo_catalog.currentData()
-        provider = CATALOG_BY_ID.get(cat_id)
-        if provider is None:
-            entry = next((e for e in self._user_catalogs if e["id"] == cat_id), None)
-            provider = make_user_catalog(entry) if entry else None
-        self.lbl_catalog_hint.setText(provider.description if provider else "")
-
-    def _populate_catalog_combo(self, select_id: object) -> None:
-        """Built-in providers, then the working copy of user catalogs."""
-        self.combo_catalog.blockSignals(True)
-        self.combo_catalog.clear()
-        for cat in CATALOGS:
-            self.combo_catalog.addItem(cat.label, cat.id)
-        for entry in self._user_catalogs:
-            self.combo_catalog.addItem(make_user_catalog(entry).label, entry["id"])
-        self.combo_catalog.blockSignals(False)
-        self.select_catalog(select_id)
-        self._sync_catalog_tab()
-
+    def _populate_user_list(self) -> None:
+        """The built-in catalogs, then the working copy of user catalogs."""
         self.list_user_catalogs.clear()
+        for cat in CATALOGS:
+            # Its QGIS connection is QStac's to keep (add_builtin_connections).
+            item = QListWidgetItem(f"{cat.label} \u2014 built in")
+            item.setToolTip(cat.description)
+            item.setData(Qt.ItemDataRole.UserRole, cat.id)
+            self.list_user_catalogs.addItem(item)
         for entry in self._user_catalogs:
             cat = make_user_catalog(entry)
             item = QListWidgetItem(f"{cat.label}: {cat.description}")
             item.setData(Qt.ItemDataRole.UserRole, entry["id"])
             self.list_user_catalogs.addItem(item)
+        self._sync_catalog_buttons()
+
+    def _sync_catalog_buttons(self, *_args) -> None:
+        """Edit and Remove only for a user catalog."""
+        user = self._selected_user_index() is not None
+        for btn in self._catalog_buttons[1:]:
+            btn.setEnabled(user)
 
     def _selected_user_index(self) -> int | None:
         item = self.list_user_catalogs.currentItem()
@@ -461,7 +435,8 @@ class SettingsDialog(QDialog):
                 self._created.add(dlg.created)
             self._user_catalogs.append(dlg.entry())
             # A freshly added API is almost always the one to use next.
-            self._populate_catalog_combo(dlg.entry()["id"])
+            self._catalog = dlg.entry()["id"]
+            self._populate_user_list()
 
     def _edit_user_catalog(self, *_args) -> None:
         idx = self._selected_user_index()
@@ -473,32 +448,23 @@ class SettingsDialog(QDialog):
             if dlg.created:
                 self._created.add(dlg.created)
             self._user_catalogs[idx] = dlg.entry()
-            current = self.combo_catalog.currentData()
             # A rename changes the id (it is the connection name): follow it.
-            if current == old["id"]:
-                current = dlg.entry()["id"]
-            self._populate_catalog_combo(current)
+            if self._catalog == old["id"]:
+                self._catalog = dlg.entry()["id"]
+            self._populate_user_list()
 
     def _remove_user_catalog(self) -> None:
         idx = self._selected_user_index()
         if idx is None:
             return
         removed = self._user_catalogs.pop(idx)
-        current = self.combo_catalog.currentData()
-        self._populate_catalog_combo(
-            settings.DEFAULTS["catalog"] if current == removed["id"] else current
-        )
+        if self._catalog == removed["id"]:
+            self._catalog = str(settings.DEFAULTS["catalog"])
+        self._populate_user_list()
 
     # -----------------------------------------------------------------
     # Load / save
     # -----------------------------------------------------------------
-
-    def select_catalog(self, cat_id: object) -> None:
-        """Point the catalog combo at *cat_id* (no-op when it is not listed)."""
-        for i in range(self.combo_catalog.count()):
-            if self.combo_catalog.itemData(i) == cat_id:
-                self.combo_catalog.setCurrentIndex(i)
-                break
 
     def _select_stretch_method(self, method: object) -> None:
         for i, (_, val) in enumerate(_STRETCH_METHODS):
@@ -510,7 +476,7 @@ class SettingsDialog(QDialog):
         """Populate widgets from current QgsSettings values."""
         # Catalog
         self._user_catalogs = settings.user_catalogs()
-        self._populate_catalog_combo(settings.catalog())
+        self._populate_user_list()
 
         # Search
         self.spin_date_range.setValue(settings.default_date_range())
@@ -520,9 +486,7 @@ class SettingsDialog(QDialog):
 
         # Display
         self.chk_visual_asset.setChecked(settings.use_visual_asset())
-        self.combo_zoom.setCurrentIndex(
-            self.combo_zoom.findData(settings.zoom_to_scene())
-        )
+        self.chk_zoom.setChecked(settings.zoom_to_scene() == "always")
         self._select_stretch_method(settings.stretch_method())
 
         # Advanced
@@ -534,9 +498,8 @@ class SettingsDialog(QDialog):
     def _load_defaults(self) -> None:
         """Populate widgets from default values (for Restore Defaults)."""
         d = settings.DEFAULTS
-        # Catalog — the selection only: wiping the user's STAC APIs (and the
-        # auth configs they point at) is not what "defaults" should mean.
-        self.select_catalog(d["catalog"])
+        # Not the user's STAC APIs (nor the auth configs they point at): that
+        # is not what "defaults" should mean.
 
         # Search
         self.spin_date_range.setValue(int(d["default_date_range"]))
@@ -546,7 +509,7 @@ class SettingsDialog(QDialog):
 
         # Display
         self.chk_visual_asset.setChecked(bool(d["use_visual_asset"]))
-        self.combo_zoom.setCurrentIndex(self.combo_zoom.findData(d["zoom_to_scene"]))
+        self.chk_zoom.setChecked(d["zoom_to_scene"] == "always")
         self._select_stretch_method(d["stretch_method"])
 
         # Advanced
@@ -554,8 +517,6 @@ class SettingsDialog(QDialog):
         self.spin_vsi_cache.setValue(int(d["vsi_cache_mb"]))
         self.spin_http_conn.setValue(int(d["http_max_connections"]))
         self.spin_http_timeout.setValue(int(d["http_timeout"]))
-
-        self._sync_catalog_tab()
 
     def _restore_defaults(self) -> None:
         self._load_defaults()
@@ -577,13 +538,13 @@ class SettingsDialog(QDialog):
         """Return all widget values as a dict suitable for settings.save_all()."""
         return {
             "auto_open": self.chk_auto_open.isChecked(),
-            "catalog": self.combo_catalog.currentData(),
+            "catalog": self._catalog,
             "default_date_range": self.spin_date_range.value(),
             "page_size": self.spin_page_size.value(),
             "default_cloud_cover": self.spin_cloud_cover.value(),
             "min_overlap_pct": self.spin_overlap.value(),
             "use_visual_asset": self.chk_visual_asset.isChecked(),
-            "zoom_to_scene": self.combo_zoom.currentData(),
+            "zoom_to_scene": "always" if self.chk_zoom.isChecked() else "never",
             "stretch_method": self.combo_stretch_method.currentData(),
             "vsi_cache_mb": self.spin_vsi_cache.value(),
             "http_max_connections": self.spin_http_conn.value(),

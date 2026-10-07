@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import contextlib
 import html
+import platform
 import time
+import urllib.parse
 from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from pathlib import Path
@@ -16,6 +18,7 @@ from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsGeometry,
     QgsProject,
+    QgsRasterLayer,
     QgsRectangle,
     QgsTask,
     QgsVectorLayer,
@@ -24,6 +27,7 @@ from qgis.core import (
 from qgis.gui import QgsRubberBand
 from qgis.PyQt import sip
 from qgis.PyQt.QtCore import (
+    QT_VERSION_STR,
     QDate,
     QDir,
     QEvent,
@@ -36,6 +40,9 @@ from qgis.PyQt.QtCore import (
 from qgis.PyQt.QtGui import QColor, QDesktopServices, QKeySequence
 from qgis.PyQt.QtWidgets import (
     QComboBox,
+    QCommandLinkButton,
+    QDialog,
+    QDialogButtonBox,
     QDockWidget,
     QFileDialog,
     QHBoxLayout,
@@ -49,6 +56,7 @@ from qgis.PyQt.QtWidgets import (
     QSizePolicy,
     QSlider,
     QToolBar,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -101,6 +109,7 @@ from .loading import (
     signed_assets,
     viewport_bbox_4326,
 )
+from .styles import fs
 from .thumbnails import ThumbnailLoader
 from .widgets import (
     _CARD_H,
@@ -123,8 +132,20 @@ if TYPE_CHECKING:
 __all__ = ["QStacDock"]
 
 
+# The dock before any search: what to do, and what a result does.
+_EMPTY_HINT = (
+    "Pan and zoom the map to the area you want, then click Search to list"
+    " matching scenes.\n\nDouble-click a result to load it, or right-click it"
+    " for band combinations, spectral indices and export."
+)
+
 # Start of the "All" date preset — older than any imagery a STAC API serves.
 _ANYTIME_START = QDate(1900, 1, 1)
+
+
+def _metadata(key: str) -> str:
+    """A ``metadata.txt`` value of this plugin (homepage, tracker, version)."""
+    return str(pluginMetadata(__package__.partition(".")[0], key))
 
 
 def _bbox_intersects(
@@ -160,6 +181,15 @@ _DISCOVERY_TIMEOUT_S = 10
 # (Planetary Computer: ~125 entries) but stable, so fetch it once per session.
 _DISCOVERY_CACHE: dict[str, tuple[CollectionInfo, ...]] = {}
 
+# The idle Search button.
+_SEARCH_TEXT = "Search this map view"
+
+# Basemap added to an empty project, so there is something to zoom on.
+_OSM_URI = (
+    "type=xyz&url=https://tile.openstreetmap.org/%7Bz%7D/%7Bx%7D/%7By%7D.png"
+    "&zmax=19&zmin=0"
+)
+
 # Combo data of the catalog combo's trailing "Add STAC API…" entry.
 _ADD_CATALOG = "__add__"
 
@@ -185,7 +215,8 @@ _ERROR_MESSAGES: dict[str, tuple[str, str]] = {
     ),
     "client": (
         "Search rejected",
-        "The search request was invalid for this collection.",
+        "The server rejected this search. Try a shorter date range or"
+        " another collection.",
     ),
     "unknown": (
         "Search failed",
@@ -237,7 +268,8 @@ class QStacDock(QDockWidget):
         self._results: list[StacItemResult] = []
         self._facet_filter: dict[str, str] = {}  # FACETS key → chosen value
         self._next_page: PageToken | None = None
-        self._rubber_band: QgsRubberBand | None = None
+        self._rubber_band: QgsRubberBand | None = None  # hovered footprint
+        self._search_band: QgsRubberBand | None = None  # area being searched
 
         # Animated search progress
         self._progress_timer = QTimer(self)
@@ -418,6 +450,7 @@ class QStacDock(QDockWidget):
         self._thumbs.clear()
         self._next_page = None
         self._run = None
+        self._sync_load_bar()
 
     def _discover_collections(self) -> None:
         """Extend the curated registry with everything the provider serves.
@@ -483,6 +516,8 @@ class QStacDock(QDockWidget):
         # project/canvas signals stay connected; shutdown() drops them.
         with contextlib.suppress(RuntimeError):
             settings.save_dock_geometry(self.saveGeometry())
+        # Closed by its own X: QGIS does not reopen it at the next start.
+        settings.save_all({"auto_open": False})
         super().closeEvent(event)
 
     def _restore_state(self) -> None:
@@ -524,10 +559,11 @@ class QStacDock(QDockWidget):
         self._closed = True
         self._loader.shutdown()
         self._thumbs.clear()
-        if self._rubber_band is not None:
-            with contextlib.suppress(RuntimeError):
-                self.iface.mapCanvas().scene().removeItem(self._rubber_band)
-            self._rubber_band = None
+        for band in (self._rubber_band, self._search_band):
+            if band is not None:
+                with contextlib.suppress(RuntimeError):
+                    self.iface.mapCanvas().scene().removeItem(band)
+        self._rubber_band = self._search_band = None
         with contextlib.suppress(RuntimeError):
             self._progress_timer.stop()
 
@@ -545,9 +581,24 @@ class QStacDock(QDockWidget):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(0)
 
+        # Captions name each block: "catalog" and "collection" are STAC words
+        # a newcomer cannot guess from two bare dropdowns.
+        self._add_caption(
+            layout,
+            "Catalog",
+            "Where to search: the server that lists the imagery.\n"
+            "Planetary Computer needs no account.",
+        )
         self._build_toolbar(layout)
+        self._add_caption(
+            layout,
+            "Collection",
+            "What to search: one kind of imagery in that catalog,\n"
+            "such as Sentinel-2 or Landsat. Type in the open list to filter it.",
+        )
         self._build_collection_combo(layout)
         layout.addSpacing(8)
+        self._add_caption(layout, "Dates", "When the images were taken.")
         self._build_date_range(layout)
         layout.addSpacing(4)
         self._build_cloud_slider(layout)
@@ -559,8 +610,18 @@ class QStacDock(QDockWidget):
         self.setWidget(container)
         self._update_cloud_visibility()
 
+    def _add_caption(self, layout: QVBoxLayout, text: str, tooltip: str) -> None:
+        """A small label above a block of the form, explained on hover."""
+        caption = QLabel(text)
+        caption.setToolTip(tooltip)
+        caption.setStyleSheet(
+            f"color: {P.text_dim}; font-size: {fs(0.85)}; font-weight: bold;"
+        )
+        layout.addWidget(caption)
+        layout.addSpacing(2)
+
     def _build_toolbar(self, layout: QVBoxLayout) -> None:
-        """Top row: QGIS-Browser-style icons, then the catalog combo."""
+        """Top row: the catalog combo, then settings and a ⋯ menu."""
         bar = QToolBar()
         bar.setIconSize(QSize(16, 16))
         bar.setStyleSheet("QToolBar { border: none; padding: 0; }")
@@ -585,30 +646,39 @@ class QStacDock(QDockWidget):
         self.combo_catalog.installEventFilter(self._catalog_wheel_guard)
 
         icon = QgsApplication.getThemeIcon
-        bar.addAction(icon("mActionAdd.svg"), "Add STAC API…").triggered.connect(
-            self._add_user_catalog
-        )
-        # Enabled on user catalogs only, by _sync_catalog_combo.
-        self.action_edit = bar.addAction(
-            icon("mActionToggleEditing.svg"), "Edit this STAC API…"
-        )
-        self.action_edit.triggered.connect(lambda: self._edit_user_catalog())
-        bar.addAction(
-            icon("mActionRefresh.svg"), "Reload this catalog's collections"
-        ).triggered.connect(self._refresh_collections)
-        bar.addAction(
-            icon("mActionPropertiesWidget.svg"), "Catalog and collection info"
-        ).triggered.connect(self._show_info)
+        # The catalog is the first choice made, so it comes first. Adding a
+        # STAC API is the combo's last entry; the rarely used rest is in ⋯.
+        bar.addWidget(self.combo_catalog)
         bar.addAction(icon("mActionOptions.svg"), "Settings…").triggered.connect(
             self.open_settings_dialog
         )
-        bar.addAction(icon("mActionHelpContents.svg"), "Help").triggered.connect(
-            lambda: QDesktopServices.openUrl(
-                QUrl(pluginMetadata(__package__.partition(".")[0], "homepage"))
-            )
+        more = QMenu(self)
+        # Enabled on user catalogs only, by _sync_catalog_combo.
+        self.action_edit = more.addAction(
+            icon("mActionToggleEditing.svg"), "Edit this STAC API…"
         )
-        bar.addWidget(self.combo_catalog)
-        # After the actions: _sync_catalog_combo enables action_edit.
+        self.action_edit.triggered.connect(lambda: self._edit_user_catalog())
+        more.addAction(
+            icon("mActionRefresh.svg"), "Reload this catalog's collections"
+        ).triggered.connect(self._refresh_collections)
+        more.addAction(
+            icon("mActionPropertiesWidget.svg"), "Catalog and collection info"
+        ).triggered.connect(self._show_info)
+        more.addSeparator()
+        more.addAction(icon("mActionHelpContents.svg"), "Help").triggered.connect(
+            lambda: QDesktopServices.openUrl(QUrl(_metadata("homepage")))
+        )
+        more.addAction(icon("mIconWarning.svg"), "Report an issue…").triggered.connect(
+            self._report_issue
+        )
+        btn_more = QToolButton()
+        btn_more.setText("\u22ef")
+        btn_more.setToolTip("More")
+        btn_more.setMenu(more)
+        btn_more.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        btn_more.setStyleSheet("QToolButton::menu-indicator { image: none; }")
+        bar.addWidget(btn_more)
+        # After action_edit exists: _sync_catalog_combo enables it.
         self._populate_catalogs()
         layout.addWidget(bar)
         layout.addSpacing(6)
@@ -765,7 +835,7 @@ class QStacDock(QDockWidget):
 
         arrow = QLabel("\u2192")
         arrow.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        arrow.setStyleSheet(f"color: {P.arrow}; font-size: 13px;")
+        arrow.setStyleSheet(f"color: {P.arrow}; font-size: {fs(1.05)};")
         arrow.setFixedWidth(16)
         date_row.addWidget(arrow)
 
@@ -790,19 +860,24 @@ class QStacDock(QDockWidget):
             (label, f"Last {label}", lambda t, d=days: (t.addDays(-d), t))
             for label, days in _DATE_PRESETS
         ]
-        last = date.today().year - 1
+        this = date.today().year
         presets += [
             (
-                str(last),
-                f"Calendar year {last}",
-                lambda _t, y=last: (QDate(y, 1, 1), QDate(y, 12, 31)),
+                str(this),
+                f"This year so far: 1 January {this} to today",
+                lambda t, y=this: (QDate(y, 1, 1), t),
+            ),
+            (
+                str(this - 1),
+                f"All of {this - 1}",
+                lambda _t, y=this - 1: (QDate(y, 1, 1), QDate(y, 12, 31)),
             ),
             ("All", "Any date", lambda t: (_ANYTIME_START, t)),
         ]
         for label, tooltip, range_fn in presets:
             btn = QPushButton(label)
             btn.setFixedHeight(22)
-            btn.setFixedWidth(32)
+            btn.setMinimumWidth(32)  # sized to its text past that ("2025")
             btn.setCheckable(True)
             btn.setAutoExclusive(False)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -821,16 +896,16 @@ class QStacDock(QDockWidget):
         cloud_row.setSpacing(4)
 
         self.cloud_icon = QLabel("\u2601")
-        self.cloud_icon.setStyleSheet(f"color: {P.cloud_icon}; font-size: 16px;")
+        self.cloud_icon.setStyleSheet(f"color: {P.cloud_icon}; font-size: {fs(1.3)};")
         # Pinned to the slider's height: the glyph's line box would otherwise
         # make this row taller than the others.
         self.cloud_icon.setFixedSize(20, 16)
         self.cloud_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         cloud_row.addWidget(self.cloud_icon)
 
-        self.cloud_label = QLabel("Cloud")
-        self.cloud_label.setStyleSheet(f"color: {P.text}; font-size: 10px;")
-        self.cloud_label.setFixedWidth(32)
+        # "Max": the slider is an upper limit, not a value to match.
+        self.cloud_label = QLabel("Max cloud")
+        self.cloud_label.setStyleSheet(f"color: {P.text}; font-size: {fs(0.85)};")
         cloud_row.addWidget(self.cloud_label)
 
         self.cloud_slider = QSlider(Qt.Orientation.Horizontal)
@@ -851,10 +926,12 @@ class QStacDock(QDockWidget):
 
         self.cloud_value_label = QLabel(f"{_default_cc}%")
         self.cloud_value_label.setStyleSheet(
-            f"color: {P.text}; font-size: 10px; font-weight: bold;"
+            f"color: {P.text}; font-size: {fs(0.85)}; font-weight: bold;"
         )
-        # Wide enough for a bold "100%" — 28px clipped the trailing glyph.
-        self.cloud_value_label.setFixedWidth(38)
+        # Wide enough for a bold "100%" at any font size.
+        self.cloud_value_label.setMinimumWidth(
+            self.cloud_value_label.fontMetrics().horizontalAdvance("100%") + 8
+        )
         self.cloud_value_label.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
@@ -864,10 +941,15 @@ class QStacDock(QDockWidget):
 
     def _build_search_button(self, layout: QVBoxLayout) -> None:
         """Build the search button."""
-        self.btn_search = QPushButton("Search")
+        # "This map view": the search area is the map extent, which nothing
+        # else on the dock says.
+        self.btn_search = QPushButton(_SEARCH_TEXT)
         self.btn_search.setFixedHeight(34)
         self.btn_search.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_search.setToolTip("Search the map view (Ctrl+Return)")
+        self.btn_search.setToolTip(
+            "Search the area shown on the map, with the collection, dates and"
+            " cloud limit above (Ctrl+Return)"
+        )
         self.btn_search.setStyleSheet(styles.search_btn_style(P))
         layout.addWidget(self.btn_search)
 
@@ -878,7 +960,7 @@ class QStacDock(QDockWidget):
 
         # Elided: a long message ("Saved <file>.") must not widen the dock.
         self.label_status = ElidedLabel("")
-        self.label_status.setStyleSheet(f"color: {P.text_dim}; font-size: 10px;")
+        self.label_status.setStyleSheet(f"color: {P.text_dim}; font-size: {fs(0.85)};")
         status_row.addWidget(self.label_status, 1)
 
         # The result count is the status line's resting state; loading progress
@@ -897,19 +979,18 @@ class QStacDock(QDockWidget):
         # Post-search refine by item properties (orbit, tile...); shown only
         # when the results differ on at least one of them.
         self.btn_filter = QPushButton("Filter")
-        self.btn_filter.setFixedHeight(16)
         self.btn_filter.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_filter.setStyleSheet(link_style)
         self.btn_filter.setVisible(False)
         self.btn_filter.clicked.connect(self._show_filter_menu)
         status_row.addWidget(self.btn_filter)
 
-        self.btn_sort = QPushButton(self._sort_modes[0][0])
-        self.btn_sort.setFixedHeight(16)
+        self.btn_sort = QPushButton(self._sort_text())
+        self.btn_sort.setToolTip("Sort the results")
         self.btn_sort.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_sort.setStyleSheet(link_style)
         self.btn_sort.setVisible(False)
-        self.btn_sort.clicked.connect(self._cycle_sort)
+        self.btn_sort.clicked.connect(self._show_sort_menu)
         status_row.addWidget(self.btn_sort)
 
         layout.addLayout(status_row)
@@ -933,12 +1014,7 @@ class QStacDock(QDockWidget):
         layout.addWidget(self.list_results, 1)
 
         # Empty state: an untouched dock is otherwise a featureless panel.
-        self.label_empty = QLabel(
-            "Pan and zoom the map to the area you want, "
-            "then launch a search to list matching scenes.\n\n"
-            "Double-click a result to load it. Right-click "
-            "for band combinations and spectral indices."
-        )
+        self.label_empty = QLabel(_EMPTY_HINT)
         self.label_empty.setAlignment(
             Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop
         )
@@ -952,6 +1028,30 @@ class QStacDock(QDockWidget):
         layout.addWidget(self.label_empty, 1)
         self.list_results.setVisible(False)
 
+        # Load bar: shown while scenes are selected, so loading does not hang
+        # on knowing to double-click. ▾ opens the same menu as a right-click.
+        self.load_bar = QWidget()
+        bar = QHBoxLayout(self.load_bar)
+        bar.setContentsMargins(0, 4, 0, 0)
+        bar.setSpacing(4)
+        outline = styles.outline_btn_style(P)
+        self.btn_load = QPushButton("Load scene")
+        self.btn_load.setFixedHeight(30)
+        self.btn_load.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_load.setToolTip("Load the selected scenes (Return)")
+        self.btn_load.setStyleSheet(outline)
+        self.btn_load.clicked.connect(self._shortcut_load)
+        bar.addWidget(self.btn_load, 1)
+        self.btn_load_menu = QPushButton("\u25be")
+        self.btn_load_menu.setFixedSize(30, 30)
+        self.btn_load_menu.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_load_menu.setToolTip("Bands, indices, mosaic, export…")
+        self.btn_load_menu.setStyleSheet(outline)
+        self.btn_load_menu.clicked.connect(self._show_load_menu)
+        bar.addWidget(self.btn_load_menu)
+        self.load_bar.setVisible(False)
+        layout.addWidget(self.load_bar)
+
         self._load_more_item: QListWidgetItem | None = None
 
     def _notify(self, text: str, level: Qgis.MessageLevel, duration: int) -> None:
@@ -962,6 +1062,20 @@ class QStacDock(QDockWidget):
         """Swap between the empty-state hint and the results list."""
         self.label_empty.setVisible(not visible)
         self.list_results.setVisible(visible)
+        self._sync_load_bar()
+
+    def _sync_load_bar(self) -> None:
+        """Show the load bar while scenes are selected, counting them."""
+        # isHidden, not isVisible: the latter is False while the dock is closed.
+        n = 0 if self.list_results.isHidden() else len(self._selected_items())
+        self.load_bar.setVisible(n > 0)
+        self.btn_load.setText(f"Load {_scenes(n)}" if n > 1 else "Load scene")
+
+    def _sync_on_map(self) -> None:
+        """Mark the result cards whose scene has a layer in the project."""
+        for item_id, card in self._thumbs._cards.items():
+            if not sip.isdeleted(card):
+                card.set_on_map(self._loader.is_on_map(item_id))
 
     def _set_status(self, text: str) -> None:
         """Set the resting status line (result count, errors, cancellation)."""
@@ -1019,7 +1133,16 @@ class QStacDock(QDockWidget):
         self.list_results.customContextMenuRequested.connect(self._on_context_menu)
         self.list_results.itemEntered.connect(self._on_item_hovered)
         self.list_results.viewportEntered.connect(self._clear_footprint)
+        self.list_results.itemSelectionChanged.connect(self._sync_load_bar)
+        self._loader.addedChanged.connect(self._sync_on_map)
         self.date_from.dateChanged.connect(self._on_date_from_changed)
+        # Only a date picked in the calendar moves on to the end date: not
+        # one restored, set by a preset, or typed.
+        self.date_from.calendarWidget().clicked.connect(
+            lambda _d: QTimer.singleShot(
+                _DATE_CALENDAR_DELAY_MS, self._open_date_to_calendar
+            )
+        )
         self.date_from.dateChanged.connect(self._sync_date_presets)
         self.date_to.dateChanged.connect(self._sync_date_presets)
 
@@ -1083,7 +1206,29 @@ class QStacDock(QDockWidget):
         self._progress_timer.start()
 
     def _stop_progress(self) -> None:
+        """The search ended (done, failed or canceled)."""
         self._progress_timer.stop()
+        if self._search_band is not None:
+            self._search_band.reset(QgsWkbTypes.GeometryType.Polygon)
+
+    def _show_search_area(self, bbox: tuple[float, float, float, float]) -> None:
+        """Tint the searched area on the map while the search runs.
+
+        It is the map view itself, so this says "this is what is searched"
+        (and still shows where, if the map is panned meanwhile).
+        """
+        if self._search_band is None:
+            band = QgsRubberBand(
+                self.iface.mapCanvas(), QgsWkbTypes.GeometryType.Polygon
+            )
+            band.setColor(QColor(*P.accent_rgba_stroke))
+            band.setFillColor(QColor(*P.accent_rgba_fill))
+            band.setWidth(2)
+            self._search_band = band
+        self._search_band.setToGeometry(
+            QgsGeometry.fromRect(QgsRectangle(*bbox)),
+            QgsCoordinateReferenceSystem(_WGS84),
+        )
 
     def _on_progress_tick(self) -> None:
         self._progress_dots = (self._progress_dots % 3) + 1
@@ -1099,9 +1244,66 @@ class QStacDock(QDockWidget):
             self._on_search()
 
     def _shortcut_load(self) -> None:
+        """Load the selection: one scene at once, several as the user says.
+
+        Several scenes load in three quite different ways, so the load bar
+        (and Return/Space) asks every time rather than guess.
+        """
         items = self._selected_items()
-        if items:
+        if len(items) == 1:
             self._add_items(items)
+        elif items:
+            self._ask_load_many(items)
+
+    def _ask_load_many(self, items: list[StacItemResult]) -> None:
+        """Ask how to load several scenes: separate layers, mosaic, time stack.
+
+        One big button per choice with its meaning under it (Qt's command
+        links), not a message box: there the explanations sat apart from
+        buttons the platform reordered.
+        """
+        coll = self._item_collection(items[0])
+        if coll is None or self._run is None:
+            return
+        days = len({it.datetime_str[:10] for it in items})
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Load {_scenes(len(items))}")
+        layout = QVBoxLayout(dlg)
+        when = "all from one day" if days == 1 else f"from {days} different days"
+        layout.addWidget(QLabel(f"{_scenes(len(items))}, {when}. Load them as:"))
+        icon = QgsApplication.getThemeIcon
+        choices = (
+            ("mIconRasterGroup.svg", "Separate layers", "One layer per scene.", True),
+            ("mIconRaster.svg", "Mosaic", "One image joining them all.", True),
+            (
+                "mTemporalNavigationAnimated.svg",
+                "Time stack",
+                "Play the days one after another (Temporal Controller)."
+                if days > 1
+                else "Needs scenes from at least two days.",
+                days > 1,
+            ),
+        )
+        picked: list[str] = []
+        for icon_name, title, text, enabled in choices:
+            button = QCommandLinkButton(title, text)
+            button.setIcon(icon(icon_name))
+            button.setEnabled(enabled)
+            button.clicked.connect(
+                lambda _=False, t=title: (picked.append(t), dlg.accept())
+            )
+            layout.addWidget(button)
+        cancel = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        cancel.rejected.connect(dlg.reject)
+        layout.addWidget(cancel)
+        if not dlg.exec() or not picked:
+            return
+        if picked[0] == "Separate layers":
+            self._add_items(items)
+        elif picked[0] == "Mosaic":
+            self._load_mosaic(items, coll, self._run.catalog)
+        else:
+            self._add_time_stack(items)
 
     def _shortcut_zoom(self) -> None:
         item = self._selected_item()
@@ -1130,7 +1332,6 @@ class QStacDock(QDockWidget):
     def _on_date_from_changed(self, new_date: QDate) -> None:
         if self.date_to.date() < new_date:
             self.date_to.setDate(new_date)
-        QTimer.singleShot(_DATE_CALENDAR_DELAY_MS, self._open_date_to_calendar)
 
     def _open_date_to_calendar(self) -> None:
         self.date_to.show_calendar()
@@ -1141,9 +1342,12 @@ class QStacDock(QDockWidget):
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
         box.setWindowTitle("QStac")
-        box.setText(f"{catalog.label} refused the request (authentication).")
+        box.setText(f"{catalog.label} refused the request.")
         if not user:
-            box.setInformativeText("This catalog needs no login. Try again shortly.")
+            box.setInformativeText(
+                "It needs no login, so this is usually temporary."
+                " Try again in a minute."
+            )
         elif catalog.authcfg:
             box.setInformativeText(
                 "Edit this STAC API to check its QGIS authentication config."
@@ -1245,6 +1449,31 @@ class QStacDock(QDockWidget):
         box.setText(text)
         box.exec()
 
+    def _report_issue(self) -> None:
+        """Open a new GitHub issue, its body filled with what a report needs.
+
+        Versions and what is selected, never a user catalog's name or URL
+        (it may be private): those stay "a user STAC API".
+        """
+        from osgeo import gdal
+
+        cat = self._catalog
+        catalog = cat.id if cat.id in CATALOG_BY_ID else "a user STAC API"
+        coll = self._current_collection()
+        body = (
+            "**What happened**\n\n\n"
+            "**What you expected**\n\n\n"
+            "**Steps to reproduce**\n1. \n\n"
+            "---\n"
+            f"QStac {_metadata('version')} \u00b7 QGIS {Qgis.version()}"
+            f" \u00b7 GDAL {gdal.__version__} \u00b7 Qt {QT_VERSION_STR}"
+            f" \u00b7 {platform.platform()}\n"
+            f"Catalog: {catalog} \u00b7 Collection: {coll.id if coll else '-'}\n"
+        )
+        query = urllib.parse.urlencode({"body": body})
+        url = _metadata("tracker").rstrip("/") + "/new?" + query
+        QDesktopServices.openUrl(QUrl(url))
+
     def open_settings_dialog(self) -> None:
         """Open the settings dialog and apply changes to this dock.
 
@@ -1296,35 +1525,32 @@ class QStacDock(QDockWidget):
         if self._rubber_band is not None:
             self._rubber_band.reset(QgsWkbTypes.GeometryType.Polygon)
 
-    def _ensure_viewport(self) -> bool:
-        """If project is empty, add a world basemap and ask user to zoom in."""
-        if QgsProject.instance().count() > 0:
-            return True
+    def ensure_basemap(self) -> bool:
+        """Give an empty project an OpenStreetMap basemap; whether it did.
 
-        # Resolved at runtime — the QGIS data path differs per platform.
-        world_map = QgsApplication.pkgDataPath() + "/resources/data/world_map.gpkg"
-        if Path(world_map).exists():
-            layer = QgsVectorLayer(world_map, "World", "ogr")
-            if layer.isValid():
-                QgsProject.instance().addMapLayer(layer)
-                self.iface.mapCanvas().setExtent(layer.extent())
-                self.iface.mapCanvas().refresh()
-
-        self._notify(
-            "Zoom to your area of interest, then launch search.",
-            Qgis.MessageLevel.Info,
-            5,
-        )
-        # Also say it in the dock: the message bar lives at the top of the QGIS
-        # window, so on its own this reads as the search button doing nothing.
-        self._set_status("Zoom in, then launch search.")
+        A search runs on the map view, and an empty project has nothing to
+        zoom on. Called when the user opens the dock, and by a search.
+        """
+        project = QgsProject.instance()
+        if project.count() > 0:
+            return False
+        layer = QgsRasterLayer(_OSM_URI, "OpenStreetMap", "wms")
+        if layer.isValid():
+            project.addMapLayer(layer)
+        else:
+            # Resolved at runtime — the QGIS data path differs per platform.
+            world = QgsApplication.pkgDataPath() + "/resources/data/world_map.gpkg"
+            if Path(world).exists():
+                project.addMapLayer(QgsVectorLayer(world, "World", "ogr"))
+        self.iface.mapCanvas().zoomToFullExtent()
+        self._set_status("Zoom to your area, then click Search.")
         self.label_empty.setText(
-            "The whole world is in view.\n\n"
-            "Zoom to the area you want, then launch "
-            "a search to list matching scenes."
+            "Zoom the map to the area you want, then click Search"
+            " to list matching scenes."
         )
-        self._set_results_visible(False)
-        return False
+        if not self._results:
+            self._set_results_visible(False)
+        return True
 
     def _on_search_button(self) -> None:
         """Search button dispatcher — launches a search or cancels the running one."""
@@ -1337,12 +1563,12 @@ class QStacDock(QDockWidget):
         """Switch the search button to its in-flight 'Cancel' appearance."""
         self.btn_search.setEnabled(True)
         self.btn_search.setText("Cancel search")
-        self.btn_search.setStyleSheet(styles.cancel_btn_style(P))
+        self.btn_search.setStyleSheet(styles.outline_btn_style(P))
 
     def _restore_search_button(self) -> None:
         """Return the search button to its idle 'Search' appearance."""
         self.btn_search.setEnabled(True)
-        self.btn_search.setText("Search")
+        self.btn_search.setText(_SEARCH_TEXT)
         self.btn_search.setStyleSheet(styles.search_btn_style(P))
 
     def _cancel_search(self) -> None:
@@ -1364,15 +1590,15 @@ class QStacDock(QDockWidget):
         if coll is None:
             self._flash_status("No collection to search yet.")
             return
-        if not self._ensure_viewport():
-            return
+        if self.ensure_basemap():
+            return  # the whole world is in view: zoom in first
 
         self._clear_footprint()
         self._clear_results()
         self._loader.forget_added()
         self._loader.cancel_warming()  # the previous results' header warms
         self._sort_index = 0
-        self.btn_sort.setText(self._sort_modes[0][0])
+        self.btn_sort.setText(self._sort_text())
         self.btn_sort.setVisible(False)
 
         date_from = self.date_from.date().toString("yyyy-MM-dd")
@@ -1425,6 +1651,7 @@ class QStacDock(QDockWidget):
         task.taskTerminated.connect(lambda t=task: self._on_search_failed(t))
         self._enter_search_state()
         self._start_progress()
+        self._show_search_area(run.bbox)
         self._loader.run_task(task)
 
     def _add_load_more_item(self) -> None:
@@ -1478,10 +1705,10 @@ class QStacDock(QDockWidget):
 
         if not new_items and not self._results:
             self._set_status("No scenes found.")
+            cloud = " raising the cloud limit," if run.cloud is not None else ""
             self.label_empty.setText(
                 "No scenes matched.\n\n"
-                "Try widening the date range, raising the cloud\n"
-                "cover limit, or zooming out."
+                f"Try widening the date range,{cloud} or zooming out."
             )
             self._set_results_visible(False)
             return
@@ -1498,10 +1725,22 @@ class QStacDock(QDockWidget):
         # first clip skips that round trip. Cheap enough to run for every page.
         self._loader.warm(new_items, run.collection, run.catalog)
 
-    def _cycle_sort(self) -> None:
-        self._sort_index = (self._sort_index + 1) % len(self._sort_modes)
-        label, _ = self._sort_modes[self._sort_index]
-        self.btn_sort.setText(label)
+    def _sort_text(self) -> str:
+        return self._sort_modes[self._sort_index][0] + " \u25be"
+
+    def _show_sort_menu(self) -> None:
+        """Pick the sort order from a menu, the current one checked."""
+        menu = QMenu(self)
+        for i, (label, _mode) in enumerate(self._sort_modes):
+            action = menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(i == self._sort_index)
+            action.triggered.connect(lambda _=False, i=i: self._set_sort(i))
+        menu.exec(self.btn_sort.mapToGlobal(self.btn_sort.rect().bottomLeft()))
+
+    def _set_sort(self, index: int) -> None:
+        self._sort_index = index
+        self.btn_sort.setText(self._sort_text())
         self._populate_list()
 
     _SORT_TABLE: ClassVar[
@@ -1568,9 +1807,13 @@ class QStacDock(QDockWidget):
         self.btn_filter.setText(f"Filter ({n})" if n else "Filter")
         self.btn_filter.setVisible(bool(n or facet_counts(self._results)))
         total = len(self._results)
+        # A full page is not the whole answer: say there is more, and where.
+        more = " \u00b7 more below" if self._next_page is not None else ""
         if n:
             shown = len(self._sorted_results())
-            self._set_status(f"{shown} of {total} scenes shown.")
+            self._set_status(f"{shown} of {total} scenes shown{more}")
+        elif more:
+            self._set_status(f"First {_scenes(total)}{more}")
         else:
             self._set_status(f"{_scenes(total)} found.")
 
@@ -1599,6 +1842,8 @@ class QStacDock(QDockWidget):
 
         if self._next_page is not None and not self._search_in_flight():
             self._add_load_more_item()
+        self._sync_on_map()
+        self._sync_load_bar()
 
     def _on_search_failed(self, task: StacSearchTask) -> None:
         # taskTerminated also fires on user cancel — _cancel_search already
@@ -1664,27 +1909,12 @@ class QStacDock(QDockWidget):
         )
 
     def _zoom_on_open(self, items: list[StacItemResult]) -> None:
-        """Zoom to the scenes being opened, as the user chose the first time.
+        """Zoom to the scenes being opened, when Settings > Display says so.
 
         Before the load: it clips what the map shows, so it then covers them.
         """
-        mode = settings.zoom_to_scene()
-        if mode == "ask":
-            box = QMessageBox(
-                QMessageBox.Icon.Question,
-                "QStac",
-                "Do you want to auto zoom to the layer?",
-                QMessageBox.StandardButton.NoButton,
-                self,
-            )
-            box.setInformativeText("You can change this in Settings > Display.")
-            yes = box.addButton("Yes, always", QMessageBox.ButtonRole.YesRole)
-            box.addButton("No", QMessageBox.ButtonRole.NoRole)
-            box.exec()
-            mode = "always" if box.clickedButton() is yes else "never"
-            settings.save_all({"zoom_to_scene": mode})
         boxes = [it.bbox for it in items if it.bbox and len(it.bbox) == 4]
-        if mode == "always" and boxes:
+        if settings.zoom_to_scene() == "always" and boxes:
             self._zoom_to_bbox(_union(boxes))
 
     def _load_mosaic(
@@ -1703,34 +1933,60 @@ class QStacDock(QDockWidget):
 
     def _on_context_menu(self, pos) -> None:
         list_item = self.list_results.itemAt(pos)
-        if not list_item:
-            return
-
-        item: StacItemResult = list_item.data(Qt.ItemDataRole.UserRole)
+        item = list_item.data(Qt.ItemDataRole.UserRole) if list_item else None
         if not item:
             return
-
-        coll = self._item_collection(item)
-        if not coll or self._run is None:
-            return
-        catalog = self._run.catalog
-
         # Right-clicking inside a multi-row selection acts on the whole
         # selection; right-clicking outside it acts on the row under the cursor.
         selected = self._selected_items()
         targets = selected if any(s.id == item.id for s in selected) else [item]
+        menu = self._item_menu(item, targets)
+        if menu is not None:
+            menu.exec(self.list_results.viewport().mapToGlobal(pos))
+
+    def _show_load_menu(self) -> None:
+        """The load bar's ▾: the right-click menu of the selection."""
+        targets = self._selected_items()
+        item = self._selected_item() or (targets[0] if targets else None)
+        if item is None:
+            return
+        if not any(t.id == item.id for t in targets):
+            item = targets[0]
+        menu = self._item_menu(item, targets)
+        if menu is not None:
+            btn = self.btn_load_menu
+            menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
+
+    def _item_menu(
+        self, item: StacItemResult, targets: list[StacItemResult]
+    ) -> QMenu | None:
+        """Every action on *targets*; *item* (one of them) picks the assets.
+
+        Zoom, the default load, then one submenu each for band combinations,
+        indices and single assets, then export and copy.
+        """
+        coll = self._item_collection(item)
+        if not coll or self._run is None:
+            return None
+        catalog = self._run.catalog
         many = len(targets) > 1
         suffix = f" ({len(targets)} scenes)" if many else ""
 
         menu = QMenu(self)
 
-        # Zoom first: the one action that is not a load.
+        # First: load and go there, whatever the zoom setting says. Zooming
+        # first, as _zoom_on_open does: a load clips what the map shows.
+        # (Zoom alone is the list's Z key.) "&&": a single & is a mnemonic.
         boxes = [t.bbox for t in targets if t.bbox and len(t.bbox) == 4]
         if boxes:
-            zoom_action = menu.addAction(
-                f"Zoom to {len(boxes)} scenes" if len(boxes) > 1 else "Zoom to scene"
-            )
-            zoom_action.triggered.connect(lambda: self._zoom_to_bbox(_union(boxes)))
+            many_boxes = f"{len(boxes)} scenes" if len(boxes) > 1 else "scene"
+            zoom_action = menu.addAction(f"Add && zoom to {many_boxes}")
+
+            def add_and_zoom() -> None:
+                self._zoom_to_bbox(_union(boxes))
+                self._add_items(list(targets))
+
+            zoom_action.triggered.connect(add_and_zoom)
             menu.addSeparator()
 
         rgb_action = menu.addAction(coll.default_action_label + suffix)
@@ -1745,24 +2001,26 @@ class QStacDock(QDockWidget):
             stack_action.triggered.connect(lambda: self._add_time_stack(list(targets)))
 
         if coll.band_presets:
+            bands = menu.addMenu("Band combinations" + suffix)
             for preset in coll.band_presets:
-                action = menu.addAction(preset.label + suffix)
+                action = bands.addAction(preset.label)
                 action.triggered.connect(self._make_preset_add_handler(targets, preset))
 
         # Indices: the curated ones, then templates and the user's saved
         # ones whose variables this scene's assets resolve, then a new one.
-        menu.addSeparator()
+        indices = menu.addMenu("Spectral indices" + suffix)
         curated = list(coll.index_presets)
         extra = custom_index_presets(item, {p.label for p in curated})
         for index_preset in curated + extra:
-            action = menu.addAction(index_preset.label + suffix)
+            action = indices.addAction(index_preset.label)
             action.triggered.connect(
                 self._make_index_add_handler(targets, index_preset)
             )
-        custom_action = menu.addAction("Custom index…")
+        if not indices.isEmpty():
+            indices.addSeparator()
+        custom_action = indices.addAction("Custom index…")
         custom_action.triggered.connect(lambda: self._custom_index(item, targets))
 
-        menu.addSeparator()
         self._add_load_asset_menu(menu, item, targets, suffix)
 
         menu.addSeparator()
@@ -1775,14 +2033,13 @@ class QStacDock(QDockWidget):
         )
         export_action.triggered.connect(lambda: self._export_clip(item, coll, catalog))
 
-        copy_action = menu.addAction("Copy item ID")
+        copy_menu = menu.addMenu("Copy")
+        copy_action = copy_menu.addAction("Item ID")
         copy_action.triggered.connect(
             lambda: QgsApplication.clipboard().setText(item.id)
         )
-
-        self._add_copy_asset_menu(menu, item, catalog)
-
-        menu.exec(self.list_results.viewport().mapToGlobal(pos))
+        self._add_copy_asset_menu(copy_menu, item, catalog)
+        return menu
 
     def _add_load_asset_menu(
         self,
@@ -1805,7 +2062,7 @@ class QStacDock(QDockWidget):
             for n in rasters
             if {"data", "visual"} & set(item.asset_meta.get(n, _NO_META).roles)
         }
-        asset_menu = menu.addMenu("Load asset")
+        asset_menu = menu.addMenu("Load asset" + suffix)
         for group in (
             [n for n in rasters if n in main],
             [n for n in rasters if n not in main],
@@ -1813,7 +2070,7 @@ class QStacDock(QDockWidget):
             if group and not asset_menu.isEmpty():
                 asset_menu.addSeparator()
             for name in sorted(group, key=_natural_key):
-                action = asset_menu.addAction(_asset_label(item, name) + suffix)
+                action = asset_menu.addAction(_asset_label(item, name))
                 action.triggered.connect(
                     lambda _=False, n=name: self._add_items(
                         list(targets), band_override=[n], key_suffix=n
@@ -1830,7 +2087,7 @@ class QStacDock(QDockWidget):
         """
         if not item.assets:
             return
-        asset_menu = menu.addMenu("Copy asset URL")
+        asset_menu = menu.addMenu("Asset URL")
         for asset_name in sorted(item.assets):
             action = asset_menu.addAction(asset_name)
             action.triggered.connect(
@@ -1920,8 +2177,9 @@ class QStacDock(QDockWidget):
         """Load the scenes as one dated layer per item and animate them.
 
         The layers land in the collection's group newest-first; the Temporal
-        Controller is set to step one day per frame across their span.
+        Controller steps through the days that have a scene.
         """
+        self._loader.expect_time_stack(items)
         self._add_items(items)
         enable_time_stack(self.iface.mapCanvas(), [it.datetime_str for it in items])
         for dw in self.iface.mainWindow().findChildren(QDockWidget):

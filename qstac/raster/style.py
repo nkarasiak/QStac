@@ -91,20 +91,40 @@ def _apply_fixed_stretch(
     vmax: float,
 ) -> None:
     """Apply fixed min/max stretch values to an RGB renderer."""
-    setters = {
-        1: renderer.setRedContrastEnhancement,
-        2: renderer.setGreenContrastEnhancement,
-        3: renderer.setBlueContrastEnhancement,
-    }
-    for band in (1, 2, 3):
+    _set_band_ranges(layer, renderer, [(vmin, vmax)] * 3)
+
+
+def _set_band_ranges(
+    layer: QgsRasterLayer,
+    renderer: QgsMultiBandColorRenderer,
+    ranges: list[tuple[float, float]] | tuple[tuple[float, float], ...],
+) -> None:
+    """Stretch bands 1, 2, 3 of *renderer* over their own (min, max)."""
+    setters = (
+        renderer.setRedContrastEnhancement,
+        renderer.setGreenContrastEnhancement,
+        renderer.setBlueContrastEnhancement,
+    )
+    for band, (setter, (vmin, vmax)) in enumerate(
+        zip(setters, ranges, strict=True), start=1
+    ):
         ce = QgsContrastEnhancement(layer.dataProvider().dataType(band))
         ce.setContrastEnhancementAlgorithm(
             QgsContrastEnhancement.ContrastEnhancementAlgorithm.StretchToMinimumMaximum
         )
         ce.setMinimumValue(vmin)
         ce.setMaximumValue(vmax)
-        setters[band](ce)
+        setter(ce)
     layer.setRenderer(renderer)
+
+
+def _apply_band_ranges(
+    layer: QgsRasterLayer, ranges: tuple[tuple[float, float], ...]
+) -> None:
+    """An RGB renderer over bands 1-3, each stretched over its own range
+    (a colour composite's channels, e.g. Sentinel-1 false colour)."""
+    renderer = QgsMultiBandColorRenderer(layer.dataProvider(), 1, 2, 3)
+    _set_band_ranges(layer, renderer, ranges)
 
 
 def _apply_adaptive_stretch(

@@ -12,6 +12,8 @@ __all__ = [
     "StacItemResult",
     "facet_counts",
     "facet_label",
+    "scene_date",
+    "scene_name",
 ]
 
 # Post-search "Filter" choices are built from whatever properties the results
@@ -116,6 +118,63 @@ def facet_counts(items: list[StacItemResult]) -> dict[str, Counter[str]]:
             continue
         counts[key] = c
     return counts
+
+
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")  # fmt: skip
+_ISO_DATE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
+# Tile tokens of an item id: MGRS (S2A_MSIL2A_..._T32UNU_...) and Landsat
+# WRS-2 path/row (LC08_L2SP_199030_...).
+_MGRS_TOKEN = re.compile(r"^T(\d{2}[A-Z]{3})$")
+_WRS_TOKEN = re.compile(r"^(\d{3})(\d{3})$")
+
+
+def scene_date(item: StacItemResult) -> str:
+    """The acquisition day as people write it: "29 Jul 2025"."""
+    m = _ISO_DATE.match(item.datetime_str)
+    if not m or not 1 <= int(m[2]) <= 12:
+        return item.datetime_str  # "unknown", or a format we do not know
+    return f"{int(m[3])} {_MONTHS[int(m[2]) - 1]} {m[1]}"
+
+
+def _platform(name: str) -> str:
+    """ "sentinel-2a" or "SENTINEL-2A" → "Sentinel-2A"; mixed case is kept."""
+    if not (name.islower() or name.isupper()):
+        return name
+    return "-".join(
+        w.capitalize() if w.isalpha() else w.upper() for w in name.split("-")
+    )
+
+
+def _tile(item: StacItemResult) -> str:
+    """The scene's tile, "tile 32UNU" or "path/row 199/030"; "" if unknown."""
+    f = item.facets
+    if mgrs := f.get("s2:mgrs_tile"):
+        return f"tile {mgrs}"
+    if f.get("grid:code", "").startswith("MGRS-"):
+        return f"tile {f['grid:code'][5:]}"
+    if "landsat:wrs_path" in f and "landsat:wrs_row" in f:
+        return f"path/row {f['landsat:wrs_path']}/{f['landsat:wrs_row']}"
+    for token in item.id.split("_")[1:]:
+        if m := _MGRS_TOKEN.match(token):
+            return f"tile {m[1]}"
+        if m := _WRS_TOKEN.match(token):
+            return f"path/row {m[1]}/{m[2]}"
+    return ""
+
+
+def scene_name(item: StacItemResult) -> str | None:
+    """Satellite and tile, "Sentinel-2A · tile 32UNU"; None if neither is known.
+
+    What a result card shows under the date, instead of the raw item id.
+    """
+    tile = _tile(item)
+    platform = item.facets.get("platform")
+    if platform:
+        platform = _platform(platform)
+    elif tile:
+        platform = item.id.split("_")[0]  # "S2A", "LC08"
+    return " \u00b7 ".join(p for p in (platform, tile) if p) or None
 
 
 def facet_label(key: str) -> str:

@@ -20,7 +20,8 @@ _PREFIX = "qstac/"
 # ---------------------------------------------------------------------------
 
 DEFAULTS: dict[str, object] = {
-    # General
+    # General. Open the dock when QGIS starts: follows whether the user left
+    # it open (plugin._toggle_dock, QStacDock.closeEvent).
     "auto_open": True,
     # Active catalog: a built-in id ("planetary_computer", "earth_search",
     # "copernicus_data_space") or the id of a user catalog ("user:…").
@@ -41,9 +42,9 @@ DEFAULTS: dict[str, object] = {
     # Prefer the provider-rendered true-color asset (Sentinel-2 TCI) for
     # default loads: one 8-bit COG instead of a 3-band 16-bit VRT.
     "use_visual_asset": True,
-    # Zoom the map to a scene when opening it: "ask" (the first time),
-    # "always" or "never".
-    "zoom_to_scene": "ask",
+    # Zoom the map to a scene when opening it: "always" or "never". Always by
+    # default: without it a newcomer cannot tell where the layer went.
+    "zoom_to_scene": "always",
     "stretch_method": "fixed",  # "fixed", "cumulative_cut", "min_max"
     # Performance
     "vsi_cache_mb": 512,
@@ -342,7 +343,7 @@ def use_visual_asset() -> bool:
 
 def zoom_to_scene() -> str:
     mode = str(_get("zoom_to_scene", str))
-    return mode if mode in ("ask", "always", "never") else "ask"
+    return "never" if mode == "never" else "always"  # "ask" was dropped
 
 
 def stretch_method() -> str:

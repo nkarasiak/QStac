@@ -31,6 +31,7 @@ from .constants import (
     _SEPARATOR_ROLE,
     P,
 )
+from .styles import fs, pt
 
 __all__ = [
     "_CollectionDelegate",
@@ -75,8 +76,8 @@ class _CollectionDelegate(QStyledItemDelegate):
             emoji = _CATEGORY_EMOJI.get(text, "")
             html = (
                 f'<span style="font-family: {_EMOJI_FONT_FAMILY};'
-                f' font-size: 14px;">{emoji}</span>'
-                f' <span style="color: {P.category_label}; font-size: 9pt;'
+                f' font-size: {fs(1.15)};">{emoji}</span>'
+                f' <span style="color: {P.category_label}; font-size: {fs(1.0)};'
                 f' font-weight: 600;">{text.upper()}</span>'
             )
             doc = QTextDocument()
@@ -92,7 +93,7 @@ class _CollectionDelegate(QStyledItemDelegate):
             label = index.data(Qt.ItemDataRole.DisplayRole) or ""
 
             label_font = painter.font()
-            label_font.setPointSize(9)
+            label_font.setPointSizeF(pt(1.0))
             label_font.setBold(False)
             painter.setFont(label_font)
             painter.setPen(
@@ -119,7 +120,7 @@ class _CollectionDelegate(QStyledItemDelegate):
         # Width is a hint for the popup only; QComboBox never shrinks the popup
         # below the combo, so a narrow dock is unaffected.
         font = QFont(option.font)
-        font.setPointSize(9)
+        font.setPointSizeF(pt(1.0))
         text = index.data(Qt.ItemDataRole.DisplayRole) or ""
         width = QFontMetrics(font).horizontalAdvance(text) + self._TEXT_PAD
         return QSize(min(width, self._MAX_W), self._ITEM_H)

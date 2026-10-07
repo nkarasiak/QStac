@@ -6,20 +6,37 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from qgis.PyQt.QtCore import QDir
+from qgis.PyQt.QtWidgets import QApplication
 
 if TYPE_CHECKING:
     from .theme import Palette
 
 __all__ = [
-    "cancel_btn_style",
     "combo_style",
     "date_edit_style",
+    "fs",
     "link_btn_style",
     "load_more_btn_style",
+    "outline_btn_style",
     "preset_btn_style",
     "results_list_style",
     "search_btn_style",
 ]
+
+
+def fs(scale: float = 1.0) -> str:
+    """A stylesheet font size, *scale* times the QGIS application font.
+
+    Relative rather than in px, so the dock follows the font size set in QGIS
+    (Settings > Options > General) and stays readable on HiDPI screens.
+    """
+    return f"{pt(scale):.1f}pt"
+
+
+def pt(scale: float = 1.0) -> float:
+    """*scale* times the application font's point size."""
+    base = QApplication.font().pointSizeF()
+    return (base if base > 0 else 9.0) * scale
 
 
 def _chevron_path(p: Palette) -> str:
@@ -53,7 +70,7 @@ def combo_style(p: Palette) -> str:
         "  combobox-popup: 0;"
         f"  background: {p.input_bg}; color: {p.input_text};"
         f" border: 1px solid {p.border_strong};"
-        "  border-radius: 5px; padding: 3px 8px; font-size: 12px;"
+        f"  border-radius: 5px; padding: 3px 8px; font-size: {fs(1.0)};"
         "}"
         "QComboBox QLineEdit {"
         "  background: transparent; border: none; padding: 0;"
@@ -80,7 +97,7 @@ def date_edit_style(p: Palette) -> str:
         "QDateEdit {"
         f"  background: {p.input_bg}; color: {p.input_text};"
         f" border: 1px solid {p.border_strong};"
-        "  border-radius: 5px; padding: 3px 8px; font-size: 11px;"
+        f"  border-radius: 5px; padding: 3px 8px; font-size: {fs(0.92)};"
         "}"
         f"QDateEdit:focus {{ border-color: {p.accent}; }}"
         "QDateEdit::drop-down { width: 0px; border: none; }"
@@ -92,7 +109,7 @@ def preset_btn_style(p: Palette) -> str:
     return (
         f"QPushButton {{ background: transparent; color: {p.text};"
         f" border: 1px solid {p.border};"
-        " border-radius: 10px; font-size: 10px; padding: 0; }"
+        f" border-radius: 10px; font-size: {fs(0.85)}; padding: 0 6px; }}"
         f"QPushButton:hover {{ background: {p.border};"
         f" color: {p.text_strong}; border-color: {p.accent}; }}"
         f"QPushButton:pressed {{ background: {p.pressed_alt}; }}"
@@ -107,7 +124,7 @@ def search_btn_style(p: Palette) -> str:
         f"QPushButton {{ background: {p.btn_primary};"
         f" color: {p.on_accent};"
         " border: none;"
-        "  border-radius: 6px; font-size: 12px; font-weight: bold; }"
+        f"  border-radius: 6px; font-size: {fs(0.9)}; }}"
         f"QPushButton:hover {{ background: {p.btn_hover}; }}"
         f"QPushButton:pressed {{ background: {p.btn_pressed}; }}"
         f"QPushButton:disabled {{ background: {p.btn_disabled_bg};"
@@ -115,12 +132,13 @@ def search_btn_style(p: Palette) -> str:
     )
 
 
-def cancel_btn_style(p: Palette) -> str:
-    """Outlined "Cancel search" appearance while a search runs."""
+def outline_btn_style(p: Palette) -> str:
+    """Outlined accent button: "Cancel search" while a search runs, and the
+    load bar under the results."""
     return (
         f"QPushButton {{ background: transparent; color: {p.accent};"
         f" border: 1px solid {p.accent};"
-        "  border-radius: 6px; font-size: 12px; font-weight: bold; }"
+        f"  border-radius: 6px; font-size: {fs(0.9)}; }}"
         f"QPushButton:hover {{ background: {p.accent_bg}; }}"
         f"QPushButton:pressed {{ background: {p.btn_pressed}; }}"
     )
@@ -130,7 +148,7 @@ def link_btn_style(p: Palette) -> str:
     """Flat link-like buttons of the status row (Filter, sort)."""
     return (
         f"QPushButton {{ background: transparent; color: {p.accent};"
-        " border: none; font-size: 10px; padding: 0 4px; }"
+        f" border: none; font-size: {fs(0.85)}; padding: 0 4px; }}"
         f"QPushButton:hover {{ color: {p.accent_hover}; }}"
     )
 
@@ -168,7 +186,7 @@ def load_more_btn_style(p: Palette) -> str:
     return (
         f"QPushButton {{ background: transparent; color: {p.accent};"
         f" border: 1px solid {p.accent}; border-radius: 4px;"
-        " font-size: 11px; margin: 4px 8px; }"
+        f" font-size: {fs(0.92)}; margin: 4px 8px; }}"
         f"QPushButton:hover {{ background: {p.accent_bg}; }}"
         f"QPushButton:pressed {{ background: {p.btn_pressed}; }}"
     )

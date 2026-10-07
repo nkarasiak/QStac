@@ -276,6 +276,66 @@ def test_read_errors_say_why() -> None:
     assert explain_read_error(https, "").endswith("no reason given")
 
 
+def test_time_filter_hides_other_dates() -> None:
+    from qgis.core import QgsDateTimeRange, QgsMapSettings, QgsRasterLayer
+    from qgis.PyQt.QtCore import QDateTime, Qt
+
+    from qstac.raster.layers import hidden_by_time_filter, set_layer_temporal
+
+    def at(text: str) -> QDateTime:
+        return QDateTime.fromString(text, Qt.DateFormat.ISODate)
+
+    scene = QgsRasterLayer()  # its temporal properties are all this needs
+    set_layer_temporal(scene, "2026-10-03 06:14")
+    undated = QgsRasterLayer()
+    ms = QgsMapSettings()
+    assert hidden_by_time_filter(ms, [scene]) == []  # no filter: all draw
+    ms.setIsTemporal(True)
+    # The one-hour frame a Temporal Controller left behind: a day later.
+    ms.setTemporalRange(
+        QgsDateTimeRange(at("2026-10-04T10:44:00Z"), at("2026-10-04T11:44:00Z"))
+    )
+    assert hidden_by_time_filter(ms, [scene, undated]) == [scene]
+    ms.setTemporalRange(
+        QgsDateTimeRange(at("2026-10-03T12:00:00Z"), at("2026-10-03T13:00:00Z"))
+    )
+    assert hidden_by_time_filter(ms, [scene]) == []
+
+
+def test_time_stack_steps_through_acquisition_days() -> None:
+    """One frame per day with scenes, showing exactly that day's scenes.
+
+    The dates of a real stack that showed (almost) nothing: frames were one
+    day long from the first scene's 10:17, so the 10:28 scenes of the next
+    day fell a frame late, and days without scenes were empty frames.
+    """
+    from types import SimpleNamespace
+
+    from qgis.core import QgsRasterLayer, QgsTemporalNavigationObject
+
+    from qstac.raster.layers import enable_time_stack, set_layer_temporal
+
+    dates = ["2026-09-29 10:17"] + ["2026-09-30 10:28"] * 2 + ["2026-10-03 10:39"]
+    layers = []
+    for dt in dates:
+        layer = QgsRasterLayer()
+        set_layer_temporal(layer, dt)
+        layers.append(layer)
+    nav = QgsTemporalNavigationObject()
+    enable_time_stack(SimpleNamespace(temporalController=lambda: nav), dates)
+
+    def shown(frame: int) -> list[int]:
+        rng = nav.dateTimeRangeForFrameNumber(frame)
+        return [
+            i
+            for i, layer in enumerate(layers)
+            if layer.temporalProperties().isVisibleInTemporalRange(rng)
+        ]
+
+    assert nav.totalFrameCount() == 3, nav.totalFrameCount()
+    assert [shown(f) for f in range(3)] == [[0], [1, 2], [3]]
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

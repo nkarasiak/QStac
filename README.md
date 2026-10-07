@@ -41,7 +41,8 @@ The collections below have band presets and a contrast stretch tuned by hand. Ev
 - Right click a result to load other band combinations (infrared, SWIR, vegetation and so on).
 - Right click a result to load an index: NDVI, NDWI, radar RVI and DpRVI, or your own formula such as `(nir - red) / (nir + red)`. Formulas name bands by asset name or common name and are saved for the next scene. *Load asset* lists every band of the scene by its title.
 - A slider filters optical imagery by cloud cover.
-- Date buttons set the range to the last week, month, 3 months, 6 months or year.
+- Date buttons set the range to the last week or month, this year so far, last year, or any date.
+- Select results and click *Load* under the list; its ▾ holds the same menu as a right click. Results already on the map are marked.
 - Searches run in the background (a QgsTask), so QGIS stays responsive.
 - Layers go into one group per collection, newest first, with dates the Temporal Controller reads. Select several results and pick *Load as time stack* to animate them.
 - Layer Properties > Metadata shows the item id, acquisition date, cloud cover and a link to the STAC item.
@@ -51,13 +52,13 @@ The collections below have band presets and a contrast stretch tuned by hand. Ev
 
 ## Usage
 
-1. Click the **QStac** button on the Web toolbar (or *Web > QStac*).
+1. Click the **QStac** button on the Web toolbar (or *Web > QStac*). In an empty project QStac adds an OpenStreetMap basemap; zoom to your area.
 2. Pick a collection, for example Sentinel-2 L2A.
 3. Set a date range, or use one of the date buttons.
 4. Move the cloud cover slider if you need to.
 5. Click **Search**.
 6. Look through the results and their thumbnails.
-7. Double click a scene to load it.
+7. Double click a scene to load it, or select scenes and click **Load**.
 
 GDAL reads the imagery straight from the server through `/vsicurl/`, so nothing is saved to disk.
 

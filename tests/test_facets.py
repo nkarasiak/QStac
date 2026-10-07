@@ -6,7 +6,13 @@ Pure stdlib — ``qstac.stac.items`` imports nothing from QGIS.
 
 from __future__ import annotations
 
-from qstac.stac.items import _feature_to_result, facet_counts, facet_label
+from qstac.stac.items import (
+    _feature_to_result,
+    facet_counts,
+    facet_label,
+    scene_date,
+    scene_name,
+)
 
 
 def _feat(fid: str, **props: object) -> dict:
@@ -64,6 +70,33 @@ def test_any_property_that_groups_is_offered() -> None:
     assert list(counts) == ["s2:datatake_type"], counts
     assert facet_label("s2:datatake_type") == "Datatake type"
     assert facet_label("platform") == "Platform"
+
+
+def test_card_labels() -> None:
+    s2 = _feature_to_result(
+        _feat(
+            "S2A_MSIL2A_20250729T101031_R022_T32UNU_20250729T120000",
+            platform="sentinel-2a",
+            datetime="2025-07-29T10:10:31Z",
+            **{"s2:mgrs_tile": "32UNU"},
+        ),
+        "s2",
+    )
+    assert scene_date(s2) == "29 Jul 2025"
+    assert scene_name(s2) == "Sentinel-2A \u00b7 tile 32UNU"
+    # No properties: the satellite and tile come from the id's tokens.
+    landsat = _feature_to_result(
+        _feat("LC08_L2SP_199030_20250101_02_T1", datetime="2025-01-01T10:00:00Z"),
+        "l",
+    )
+    assert scene_name(landsat) == "LC08 \u00b7 path/row 199/030"
+    es = _feature_to_result(
+        _feat("S2C_T31TCJ_20260729T101803_L2A", platform="SENTINEL-2C"), "s2"
+    )
+    assert scene_name(es) == "Sentinel-2C \u00b7 tile 31TCJ"
+    assert scene_date(es) == "unknown"
+    # Nothing to name it by: the card falls back to the shortened id.
+    assert scene_name(_feature_to_result(_feat("cop-dem_N47_E009"), "dem")) is None
 
 
 if __name__ == "__main__":

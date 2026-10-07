@@ -25,6 +25,10 @@ class IndexPreset:
     evaluator, never by Python itself. ``ramp`` is "ndvi", "ndwi" or "sar".
     ``vrange`` pins the ramp's range; None means -1..1 for a normalized
     difference and the data's own 2-98 % range for a formula.
+
+    With ``rgb_ranges`` it is a colour composite instead: ``expression``
+    holds one formula per channel, ``;``-separated (titiler's syntax, as
+    providers publish their renders), each stretched over its (min, max).
     """
 
     label: str
@@ -33,6 +37,7 @@ class IndexPreset:
     expression: str = ""
     variables: tuple[str, ...] = ()
     vrange: tuple[float, float] | None = None
+    rgb_ranges: tuple[tuple[float, float], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +58,9 @@ class CollectionInfo:
     default_action_label: str = "True Color (RGB)"
     band_presets: tuple[BandPreset, ...] = ()
     index_presets: tuple[IndexPreset, ...] = ()
+    # What a plain load (double-click) shows when it is not the bands as-is:
+    # a colour composite of them (Sentinel-1's false colour).
+    default_preset: IndexPreset | None = None
 
 
 # ── Sentinel-2 band presets (Earth Search: lowercase names) ──
@@ -96,10 +104,32 @@ _HLS_PC_L30_PRESETS = (
     BandPreset("SWIR Composite", ("B07", "B05", "B04"), stretch=(200, 5000)),
 )
 
-# ── Sentinel-1 dual-pol presets (Planetary Computer: vv / vh assets) ──
-# The default action loads VV alone; these reach the co-located VH channel
-# and the usual dual-pol quicklook (VV / VH / VV again as blue).
+# ── Sentinel-1 (Planetary Computer: vv / vh assets) ──
+# The default load is PC's own "VV, VH False-color composite", the render its
+# thumbnails use, so a scene opens as it looked in the results. The recipe
+# differs per collection: RTC is calibrated backscatter (linear gamma0), GRD
+# raw amplitude DN. Copied from PC's mosaic/info renderOptions.
+_S1_RTC_FALSE_COLOR = IndexPreset(
+    "False color (VV, VH)",
+    ("vv", "vh"),
+    "rgb",
+    "0.03 + log(10e-4 - log(0.05 / (0.02 + 2 * vv)));"
+    "0.05 + exp(0.25 * (log(0.01 + 2 * vv) + log(0.02 + 5 * vh)));"
+    "1 - log(0.05 / (0.045 - 0.9 * vv))",
+    ("vv", "vh"),
+    rgb_ranges=((0.0, 0.8), (0.0, 1.0), (0.0, 1.0)),
+)
+_S1_GRD_FALSE_COLOR = IndexPreset(
+    "False color (VV, VH)",
+    ("vv", "vh"),
+    "rgb",
+    "vv;vh;vv / vh",
+    ("vv", "vh"),
+    rgb_ranges=((0.0, 600.0), (0.0, 270.0), (0.0, 9.0)),
+)
+# The bands as they are, one at a time, and the plain dual-pol quicklook.
 _S1_PC_PRESETS = (
+    BandPreset("VV Backscatter", ("vv",)),
     BandPreset("VH Backscatter", ("vh",)),
     BandPreset("Dual-pol (VV, VH, VV)", ("vv", "vh", "vv")),
 )
@@ -258,8 +288,9 @@ PLANETARY_COMPUTER_COLLECTIONS: list[CollectionInfo] = [
         rgb_assets=("vv",),
         category="SAR",
         is_single_asset=True,
-        default_action_label="VV Backscatter",
+        default_action_label=_S1_RTC_FALSE_COLOR.label,
         band_presets=_S1_PC_PRESETS,
+        default_preset=_S1_RTC_FALSE_COLOR,
     ),
     CollectionInfo(
         id="sentinel-1-grd",
@@ -268,8 +299,9 @@ PLANETARY_COMPUTER_COLLECTIONS: list[CollectionInfo] = [
         rgb_assets=("vv",),
         category="SAR",
         is_single_asset=True,
-        default_action_label="VV Backscatter",
+        default_action_label=_S1_GRD_FALSE_COLOR.label,
         band_presets=_S1_PC_PRESETS,
+        default_preset=_S1_GRD_FALSE_COLOR,
     ),
     # ── Elevation ──
     CollectionInfo(
