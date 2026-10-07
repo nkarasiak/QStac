@@ -98,8 +98,12 @@ def test_index_mosaic_computes_each_scene() -> None:
         finally:
             layers_mod._vsicurl = vsicurl
         assert built is not None
-        got = gdal.Open(built[0][0][0]).ReadAsArray()
+        ds = gdal.Open(built[0][0][0])
+        got = ds.ReadAsArray()
+        # The ramp's range, stored: computing them read every scene (slow).
+        stats = ds.GetRasterBand(1).GetStatistics(True, False)
     assert np.allclose(got, [[0.5, 0.0]]), got
+    assert stats[:2] == [-1.0, 1.0], stats
 
 
 def test_item_level_proj_feeds_every_asset() -> None:

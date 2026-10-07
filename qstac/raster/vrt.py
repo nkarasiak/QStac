@@ -94,7 +94,9 @@ def _add_virtual_overviews(path: str) -> None:
     ds = None  # written back on close
 
 
-def _store_statistics(path: str, fixed: tuple[float, float] | None = None) -> bool:
+def _store_statistics(
+    path: str, fixed: tuple[float, float] | None = None, index: bool = False
+) -> bool:
     """Store approximate band statistics in the VRT at *path*; False if unreadable.
 
     ``QgsRasterLayer``'s constructor asks every band for its min/max (the
@@ -104,14 +106,16 @@ def _store_statistics(path: str, fixed: tuple[float, float] | None = None) -> bo
     from reading pixels on it. An RGB layer stretched over a *fixed* range
     never uses them, so that range is stored instead, reading no pixels:
     computing them read every scene's overview (8 s of a 168-scene mosaic).
-    One band still gets real ones: it stretches from them.
+    One band still gets real ones: it stretches from them. Not an *index*:
+    its ramp spans its own range (computing them read every scene through
+    the pixel function, 3 s of a 12-scene NDVI mosaic).
     """
     ds = None
     with contextlib.suppress(RuntimeError):
         ds = gdal.Open(path)
     if ds is None:
         return False
-    if ds.RasterCount < 3:
+    if ds.RasterCount < 3 and not index:
         fixed = None
     with contextlib.suppress(RuntimeError):
         for i in range(1, ds.RasterCount + 1):

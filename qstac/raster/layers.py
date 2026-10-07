@@ -563,13 +563,23 @@ def _build_mosaic_vrt(
         if path is None:
             continue
         _add_virtual_overviews(path)
-        if _store_statistics(path, fixed):
-            _warm_histogram_sample(path)
+        if _ready_to_open(path, fixed, index=index_preset is not None):
             mosaics.append((path, epsg, ids))
     if not mosaics:
         return None
     dropped = len(parts) - sum(len(ids) for _, _, ids in mosaics)
     return mosaics, dropped, bake is not None
+
+
+def _ready_to_open(path: str, fixed: tuple[float, float] | None, index: bool) -> bool:
+    """Store what ``QgsRasterLayer`` reads of the mosaic at *path* on opening
+    (statistics, histogram sample); False if unreadable. An *index* is drawn
+    over its own range: it reads neither."""
+    if not _store_statistics(path, fixed, index=index):
+        return False
+    if not index:
+        _warm_histogram_sample(path)
+    return True
 
 
 def _mosaic_groups(
@@ -635,18 +645,25 @@ def open_mosaic_layer(
     collection_info: CollectionInfo,
     stretch_override: tuple[float, float] | None = None,
     stretch_baked: bool = False,
+    index_preset: IndexPreset | None = None,
 ) -> QgsRasterLayer | None:
     """Open a mosaic VRT written by :class:`MosaicBuildTask` and render it.
 
     Must run on the GUI thread — ``QgsRasterLayer`` construction is not
     thread-safe. The remote COG headers are already warm in the VSI cache by
-    the time the task completes, so this costs ~20 ms.
+    the time the task completes, so this costs ~20 ms. An *index_preset*
+    mosaic goes straight to its ramp: a grey stretch first read a histogram
+    through the pixel function (0.7 s for 12 NDVI scenes) to be replaced.
     """
     layer = _open_raster_layer(mosaic_path, name, epsg)
     if layer is None:
         return None
 
-    if layer.bandCount() >= 3:
+    if index_preset is not None:
+        from .index import _style_index  # lazy: index imports this module
+
+        _style_index(layer, index_preset)
+    elif layer.bandCount() >= 3:
         _apply_rgb_renderer(
             layer,
             collection_info,

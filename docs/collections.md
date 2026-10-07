@@ -77,7 +77,9 @@ default composite, computed per scene (`_write_index_vrt_xml` parts, with
 their overviews) and mosaicked (`_build_mosaic_vrt(index_preset=)`), when every
 scene has its bands. Several selected scenes' *Spectral index mosaic* menu
 mosaics an index the same way (`load_mosaic(index_preset=)`), from scenes
-with projection metadata only (so never MODIS on PC). *Save clipped GeoTIFF* still uses VV. Every mosaic goes
+with projection metadata only (so never MODIS on PC). It is drawn over
+its ramp's range, so neither the build nor the opening reads statistics
+through the pixel function (13.7 s and 1 s of an 18-scene NDVI mosaic). *Save clipped GeoTIFF* still uses VV. Every mosaic goes
 through `QStacDock._load_mosaic()`, which asks *Which orbit?* when its scenes
 mix `sat:orbit_state` (`_one_orbit()`, the `_choose()` dialog of command links
 also used by *Load N scenes*): radar sees a slope from opposite sides

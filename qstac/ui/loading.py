@@ -26,7 +26,7 @@ from qgis.PyQt.QtWidgets import QFileDialog, QMessageBox
 from .. import settings
 from ..geo import _transform_to_wgs84
 from ..raster.cog import delete_clips, has_s3_login, set_asset_headers, set_s3_login
-from ..raster.index import _style_index, build_index_layer
+from ..raster.index import build_index_layer
 from ..raster.layers import (
     add_layers_to_project,
     build_layer,
@@ -1128,10 +1128,9 @@ class LayerLoader(QObject):
                 task.collection_info,
                 stretch_override=task.stretch_override,
                 stretch_baked=task.stretch_baked,
+                index_preset=task.index_preset,
             )
             if layer is not None:
-                if task.index_preset is not None:
-                    _style_index(layer, task.index_preset)
                 scenes = [it for it in items if it.id in ids]
                 stamp_layer(layer, scenes, task.collection_info, catalog, "Mosaic")
                 layers.append(layer)
