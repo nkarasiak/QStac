@@ -583,7 +583,7 @@ class ElidedLabel(QLabel):
         elided = [
             fm.elidedText(t, Qt.TextElideMode.ElideRight, width) for t in self._forms
         ]
-        fits = (e for e, t in zip(elided, self._forms) if e == t)
+        fits = (e for e, t in zip(elided, self._forms, strict=True) if e == t)
         super().setText(next(fits, elided[-1]))
 
 
