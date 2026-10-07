@@ -12,7 +12,7 @@ py=${PYTHON:-python3}
 "$ruff" check .
 "$ruff" format --check .
 "${flake8[@]}" qstac  # the plugins.qgis.org code-quality check (W503 on, see .flake8)
-# Pure-stdlib self-checks (test_index and test_raster need QGIS: run them by hand)
+# Pure-stdlib self-checks (test_index, test_raster and test_settings need QGIS: run them by hand)
 for t in collections catalogs detect facets search indices; do
   "$py" -m "tests.test_$t" >/dev/null
 done

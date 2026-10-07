@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 from osgeo import gdal, osr
 
+from .. import settings
 from ..log import log
 from .vrt import _build_vrt, _stac_nodata
 
@@ -16,9 +17,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from ..stac.items import AssetProj
-
-# Max concurrent range requests per COG in the parallel tile fetch.
-_TILE_MAX_WORKERS = 16
 
 # Tail-latency hedge: a tile fetch still running after this many seconds is
 # duplicated on a fresh connection and the first copy to finish wins. Azure
@@ -108,7 +106,8 @@ def _run_hedged(
     must not touch a QgsTask (use a ``threading.Event``'s ``is_set``).
     """
     pool = concurrent.futures.ThreadPoolExecutor(
-        max_workers=min(2 * n, 2 * _TILE_MAX_WORKERS)
+        # The clip_workers setting: range requests in flight per COG.
+        max_workers=min(2 * n, 2 * settings.clip_workers())
     )
     pending = {pool.submit(fn, i, 0): i for i in range(n)}
     results: dict[int, str | None] = {}

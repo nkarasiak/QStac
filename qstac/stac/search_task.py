@@ -29,7 +29,6 @@ if TYPE_CHECKING:
 
 __all__ = ["StacSearchTask", "TileSearchTask"]
 
-_DEEPEST_DAYS = 365  # how far before the start date a tile mosaic looks
 _WINDOW_DAYS = 2  # a tile mosaic's searches: about a page each over France
 _IN_FLIGHT = 8  # windows searched at once
 # Older scenes under a tile's newest where it is a sliver (TileCover). France
@@ -90,11 +89,6 @@ class StacSearchTask(QgsTask):
             return False
 
 
-# A mosaic "by time" keeps the newest this many scenes of its dates, as
-# "Load all" does its results: a mosaic layer's scenes are read at build.
-_BY_TIME_MAX = 1000
-
-
 class _EveryScene:
     """A mosaic by time: every scene of the dates, the newest painted on top.
 
@@ -103,8 +97,9 @@ class _EveryScene:
 
     goal: dict = {}  # noqa: RUF012 (read only)
 
-    def __init__(self) -> None:
+    def __init__(self, max_scenes: int) -> None:
         self.found: dict[str, StacItemResult] = {}
+        self.max_scenes = max_scenes
 
     def add(self, items: list[StacItemResult]) -> None:
         for item in items:
@@ -114,9 +109,10 @@ class _EveryScene:
         return []
 
     def scenes(self) -> list[StacItemResult]:
-        """The newest _BY_TIME_MAX, oldest first."""
+        """The newest *max_scenes*, oldest first."""
         ordered = sorted(self.found.values(), key=lambda i: i.datetime_str)
-        return ordered[-_BY_TIME_MAX:]
+        start = max(len(ordered) - self.max_scenes, 0)
+        return ordered[start:]
 
 
 class TileSearchTask(QgsTask):
@@ -124,7 +120,8 @@ class TileSearchTask(QgsTask):
 
     The dates are cut into _WINDOW_DAYS windows, searched _IN_FLIGHT at a
     time and read newest first into a :class:`TileCover`, from *date_to*
-    back to _DEEPEST_DAYS before *date_from*, stopping once every tile is
+    back to *lookback_days* before *date_from* (the ``mosaic_lookback_days``
+    setting; 0 stays within the dates), stopping once every tile is
     covered. The last *reach_days* (the collection's revisit and publishing
     delay: ``CollectionInfo.mosaic_reach_days``), searched alongside without
     the cloud limit, say which tiles there are and how far their scenes
@@ -147,6 +144,8 @@ class TileSearchTask(QgsTask):
         reach_days: int = 10,
         by_time: bool = False,
         area: QgsGeometry | None = None,
+        lookback_days: int = 365,
+        max_scenes: int = 1000,
     ) -> None:
         super().__init__(f"Finding a scene for every tile of {collection}")
         self.catalog = catalog
@@ -159,7 +158,11 @@ class TileSearchTask(QgsTask):
         self.http_timeout = http_timeout
         self.reach_days = reach_days
         self.by_time = by_time  # every scene of the dates (_EveryScene)
-        self.capped = False  # by time: more than _BY_TIME_MAX scenes
+        self.lookback_days = lookback_days
+        # By time: the newest this many scenes, as "Load all" does its
+        # results (a mosaic layer's scenes are read at build).
+        self.max_scenes = max_scenes
+        self.capped = False  # by time: more than max_scenes scenes
         self.area = area  # by time: a drawn or selected area (WGS84)
         self.day_cover: dict[str, float] = {}  # by time: geo.day_cover()
         self.scenes: list[StacItemResult] = []
@@ -213,7 +216,7 @@ class TileSearchTask(QgsTask):
         step = datetime.timedelta(days=_WINDOW_DAYS)
         last, deepest = day(self.date_to), day(self.date_from)
         if not self.by_time:
-            deepest -= datetime.timedelta(days=_DEEPEST_DAYS)
+            deepest -= datetime.timedelta(days=self.lookback_days)
         ends = []
         while last >= deepest:
             ends.append(last)
@@ -225,7 +228,7 @@ class TileSearchTask(QgsTask):
             reach = [pool.submit(self._window, e, None, headers) for e in reach_ends]
             window = [pool.submit(self._window, e, self.cloud, headers) for e in ends]
             cover = (
-                _EveryScene()
+                _EveryScene(self.max_scenes)
                 if self.by_time
                 else TileCover([i for f in reach for i in f.result()], _FILL_GAPS)
             )
@@ -240,7 +243,7 @@ class TileSearchTask(QgsTask):
                 self.setProgress(100 * (n + 1) / len(window))
             self.scenes = cover.scenes()
             self.missing = cover.missing()
-            self.capped = self.by_time and len(cover.found) > _BY_TIME_MAX
+            self.capped = self.by_time and len(cover.found) > self.max_scenes
             if self.by_time:  # here: it grows with the scenes
                 self.day_cover = day_cover(self.scenes, self.bbox, self.area)
             return True

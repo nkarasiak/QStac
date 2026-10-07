@@ -14,10 +14,20 @@ as their values differ; any other key must also repeat a value and stay under
 `_MAX_FACET_VALUES`, so each collection gets just its own. It filters the loaded
 pages, not the server.
 
-Every start opens on Planetary Computer › Sentinel-2 L2A
+A start opens on Planetary Computer › Sentinel-2 L2A
 (`DEFAULT_CATALOG`, `_DEFAULT_COLLECTION`; the `catalog` setting is reset to it
-at open): only the last search's dates come back, never its collection — the
-last one searched (a MODIS product, a DEM...) made a poor first view.
+at open): only the last search's dates come back, not its collection — the
+last one searched (a MODIS product, a DEM...) made a poor first view. The
+`start_on` setting (Settings > Catalogs, *Start on*) set to `last` keeps the
+catalog in use and reselects the collection last searched (`last_collection`,
+once listed when it is a discovered one).
+
+The date buttons under the dates are the `date_buttons` setting, in its order
+(Settings > Search, a table: `settings_dialog._DatePresetEditor`): a number of
+days ("last N days", labelled 1w, 1m, 1y, 10d by `settings.preset_label()`),
+`this_year`, `last_year` and `all`, default "7, 30, this_year, last_year,
+all". Any can be dropped or moved; they are rebuilt when the setting changes
+(`_fill_date_presets()`).
 
 First opening: the dock opens at QGIS start only if it was left open
 (`auto_open`, saved by `QStacPlugin._toggle_dock()` and `QStacDock.closeEvent()`,
@@ -92,7 +102,7 @@ click builds, kept in the `mosaic_kind` setting: *Newest scene per tile*
 (`tile`, the default, below) or *One mosaic per date, with the time slider*
 (`time`, to see the area change: `TileSearchTask(by_time=True)` with
 `_EveryScene` in place of `TileCover` takes every scene of the dates, no
-reach, the newest `_BY_TIME_MAX`; `_mosaic_per_date()` builds one mosaic per
+reach, the newest `mosaic_max_scenes` (1000, Settings > Mosaic); `_mosaic_per_date()` builds one mosaic per
 UTC day, `load_mosaic(stack=True)` so the time filter is not lifted, and
 `_show_time_slider()` steps the Temporal Controller through those days;
 over `_DATES_ASKED` (12) dates it asks first, via `_choose()`, whether to build
@@ -112,7 +122,8 @@ path/rows gets a message-bar note instead. The dates are cut into 2-day windows,
 searched 8 at a time (no next-page token chain: one took 30 s for France and
 Iberia) and trimmed by the fields extension (`supports_fields`, from
 `conformsTo`) to the footprint, properties and the assets the mosaic reads.
-Windows are read newest first, from the end date back to a year before the
+Windows are read newest first, from the end date back to `mosaic_lookback_days`
+(365 by default, Settings > Mosaic; 0 keeps to the search dates) before the
 start date, and the search stops once every tile is covered; the last
 `mosaic_reach_days`, searched alongside without the cloud limit, say which
 tiles there are and how far their scenes reach. With none there (Landsat
@@ -132,7 +143,9 @@ meaning under it, not a message box; Time stack is disabled when every scene
 is from one day). One scene loads at once.
 
 Selecting results shows the load bar under the list (*Load N scenes*, and ▾
-for the same menu as a right-click: `QStacDock._item_menu()`). Cards whose scene
+for the same menu as a right-click: `QStacDock._item_menu()`), filled like
+Search as it is the next step; *Load more results* / *Load all* are tinted
+(`load_more_btn_style`), visible on a dark panel without competing with it. Cards whose scene
 has a layer in the project get an *On map* badge (`LayerLoader.addedChanged`,
 `is_on_map()`); the sort button opens a menu.
 

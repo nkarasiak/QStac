@@ -36,11 +36,12 @@ that sentence there; the story of how it got there goes in the commit message.
 scripts/check.sh
 .venv/bin/ruff check --fix . && .venv/bin/ruff format .
 
-# The two self-checks that need qgis + GDAL (spectral-index path; raster:
-# temp names, clip axis order, VRT nodata, bake, tasks)
+# The self-checks that need qgis + GDAL (spectral-index path; raster:
+# temp names, clip axis order, VRT nodata, bake, tasks; settings dialog)
 P=/path/to/conda/envs/qgis
 QT_QPA_PLATFORM=offscreen PYTHONPATH=$P/share/qgis/python $P/bin/python -m tests.test_index
 QT_QPA_PLATFORM=offscreen PYTHONPATH=$P/share/qgis/python $P/bin/python -m tests.test_raster
+QT_QPA_PLATFORM=offscreen PYTHONPATH=$P/share/qgis/python $P/bin/python -m tests.test_settings
 
 # Install for development (symlink into QGIS plugins dir)
 ln -s $(pwd)/qstac ~/.local/share/QGIS/QGIS4/profiles/default/python/plugins/qstac
@@ -86,12 +87,12 @@ qstac/                   The plugin — the zip is exactly this folder (+ LICENS
     ├── loading.py       LayerLoader: progressive loads, live tasks, clips, signed_assets
     ├── thumbnails.py    ThumbnailLoader: result cards, thumbnail replies and caches
     ├── styles.py        Stylesheets, as functions of the palette
-    ├── settings_dialog.py  SettingsDialog (catalogs, search, display, advanced), CatalogEditor, ask_s3_keys
+    ├── settings_dialog.py  SettingsDialog (pages: catalogs, search, display, mosaic, network), CatalogEditor, ask_s3_keys
     ├── collection_combo.py _CollectionDelegate, _ComboFilter
     ├── area_tool.py     AreaTool: the map tool drawing a search rectangle or polygon
     ├── index_dialog.py  IndexDialog (custom index), custom_index_presets
     ├── widgets.py       ClickableDateEdit, _ResultCard, _WheelGuard, MosaicButton
-    ├── constants.py     Palette, date presets, display helpers (ids, emoji)
+    ├── constants.py     Palette, display helpers (ids, emoji)
     └── theme.py         Palette derived from the running QGIS theme
 
 tests/                   Self-checks (python -m tests.<name>), never shipped

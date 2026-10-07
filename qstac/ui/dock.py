@@ -95,7 +95,6 @@ from .area_tool import AreaTool
 from .collection_combo import _CollectionDelegate, _ComboFilter
 from .constants import (
     _DATE_CALENDAR_DELAY_MS,
-    _DATE_PRESETS,
     _SEPARATOR_ROLE,
     P,
     _scenes,
@@ -207,6 +206,16 @@ _MOSAIC_ASKED = 1000
 # What the dock opens on, in DEFAULT_CATALOG.
 _DEFAULT_COLLECTION = "sentinel-2-l2a"
 
+
+def _lookback_text(days: int) -> str:
+    """The tile mosaic's reach back in time, for its menu tooltip."""
+    if days <= 0:
+        return "Only scenes of the search dates: a tile they leave empty stays empty"
+    return (
+        f"Back up to {days} days before the start date for a tile the dates leave empty"
+    )
+
+
 # The map view as the area: the caption above Search reads "Area: this map
 # view" (drawn areas and selections say theirs the same way).
 _SEARCH_TEXT = "Search this map view"
@@ -288,10 +297,11 @@ class QStacDock(QDockWidget):
         self._resolve_task: QgsTask | None = None
         self._pending_collection_id: str | None = None
 
-        # Every start opens on the default catalog and its Sentinel-2 (see
-        # _restore_state): the last collection searched (a MODIS product, a
-        # DEM...) made a poor first view.
-        settings.save_all({"catalog": DEFAULT_CATALOG.id})
+        # A start opens on the default catalog and its Sentinel-2 (see
+        # _restore_state) unless start_on is "last": the last collection
+        # searched (a MODIS product, a DEM...) made a poor first view.
+        if settings.start_on() == "default":
+            settings.save_all({"catalog": DEFAULT_CATALOG.id})
         self._catalog: CatalogProvider = self._resolve_catalog()
         self._collection_by_id: dict[str, CollectionInfo] = {
             c.id: c for c in self._catalog.collections
@@ -567,10 +577,15 @@ class QStacDock(QDockWidget):
                 self.restoreGeometry(geom)
 
         ls = settings.last_search()
-        # The dates come back; the collection is always the default one.
-        idx = self.combo_collection.findData(_DEFAULT_COLLECTION)
+        # The dates come back; the collection only with start_on "last".
+        coll_id = _DEFAULT_COLLECTION
+        if settings.start_on() == "last" and ls["collection"]:
+            coll_id = str(ls["collection"])
+        idx = self.combo_collection.findData(coll_id)
         if idx >= 0:
             self.combo_collection.setCurrentIndex(idx)
+        else:  # a discovered collection: picked once the listing lands
+            self._pending_collection_id = coll_id
         # Block dateChanged so restoring date_from doesn't pop the calendar.
         if ls["date_from"]:
             self.date_from.blockSignals(True)
@@ -885,31 +900,47 @@ class QStacDock(QDockWidget):
         layout.addLayout(date_row)
         layout.addSpacing(3)
 
-        presets_layout = QHBoxLayout()
-        presets_layout.setContentsMargins(0, 0, 0, 0)
-        presets_layout.setSpacing(3)
-        # Checkable so the active range stays visibly selected; _sync_date_presets
-        # clears it again when the dates are edited by hand.
-        # Each preset maps today's date to a (from, to) range.
+        self._presets_layout = QHBoxLayout()
+        self._presets_layout.setContentsMargins(0, 0, 0, 0)
+        self._presets_layout.setSpacing(3)
         self._preset_buttons: list[tuple[QPushButton, _DateRangeFn]] = []
-        presets: list[tuple[str, str, _DateRangeFn]] = [
-            (label, f"Last {label}", lambda t, d=days: (t.addDays(-d), t))
-            for label, days in _DATE_PRESETS
-        ]
+        self._fill_date_presets()
+        layout.addLayout(self._presets_layout)
+
+    def _fill_date_presets(self) -> None:
+        """The date buttons, in the date_buttons setting's order: last N
+        days, this year, last year, any date. Rebuilt when it changes.
+
+        Checkable so the active range stays visibly selected; _sync_date_presets
+        clears it again when the dates are edited by hand. Each preset maps
+        today's date to a (from, to) range.
+        """
+        presets_layout = self._presets_layout
+        while presets_layout.count():
+            widget = presets_layout.takeAt(0).widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._preset_buttons = []
         this = date.today().year
-        presets += [
-            (
-                str(this),
+        named: dict[str, tuple[str, _DateRangeFn]] = {
+            "this_year": (
                 f"This year so far: 1 January {this} to today",
-                lambda t, y=this: (QDate(y, 1, 1), t),
+                lambda t: (QDate(this, 1, 1), t),
             ),
-            (
-                str(this - 1),
+            "last_year": (
                 f"All of {this - 1}",
-                lambda _t, y=this - 1: (QDate(y, 1, 1), QDate(y, 12, 31)),
+                lambda _t: (QDate(this - 1, 1, 1), QDate(this - 1, 12, 31)),
             ),
-            ("All", "Any date", lambda t: (_ANYTIME_START, t)),
-        ]
+            "all": ("Any date", lambda t: (_ANYTIME_START, t)),
+        }
+        presets: list[tuple[str, str, _DateRangeFn]] = []
+        for preset in settings.date_presets():
+            tooltip, range_fn = (
+                (f"Last {preset} days", lambda t, d=preset: (t.addDays(-d), t))
+                if isinstance(preset, int)
+                else named[preset]
+            )
+            presets.append((settings.preset_label(preset, this), tooltip, range_fn))
         for label, tooltip, range_fn in presets:
             btn = QPushButton(label)
             btn.setFixedHeight(22)
@@ -923,7 +954,6 @@ class QStacDock(QDockWidget):
             presets_layout.addWidget(btn)
             self._preset_buttons.append((btn, range_fn))
         presets_layout.addStretch()
-        layout.addLayout(presets_layout)
 
     def _build_cloud_slider(self, layout: QVBoxLayout) -> None:
         """Build the cloud cover slider row."""
@@ -1130,19 +1160,20 @@ class QStacDock(QDockWidget):
         bar = QHBoxLayout(self.load_bar)
         bar.setContentsMargins(0, 4, 0, 0)
         bar.setSpacing(4)
-        outline = styles.outline_btn_style(P)
+        # Filled like Search: with scenes selected, loading is the next step.
+        filled = styles.search_btn_style(P)
         self.btn_load = QPushButton("Load scene")
         self.btn_load.setFixedHeight(30)
         self.btn_load.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_load.setToolTip("Load the selected scenes (Return)")
-        self.btn_load.setStyleSheet(outline)
+        self.btn_load.setStyleSheet(filled)
         self.btn_load.clicked.connect(self._shortcut_load)
         bar.addWidget(self.btn_load, 1)
         self.btn_load_menu = QPushButton("\u25be")
         self.btn_load_menu.setFixedSize(30, 30)
         self.btn_load_menu.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_load_menu.setToolTip("Bands, indices, mosaic, export…")
-        self.btn_load_menu.setStyleSheet(outline)
+        self.btn_load_menu.setStyleSheet(filled)
         self.btn_load_menu.clicked.connect(self._show_load_menu)
         bar.addWidget(self.btn_load_menu)
         self.load_bar.setVisible(False)
@@ -1754,6 +1785,10 @@ class QStacDock(QDockWidget):
             changed = settings.apply_dialog(dlg)
             if changed & {"catalog", "user_catalogs"}:
                 self._switch_catalog()
+            if "date_buttons" in changed:
+                self._fill_date_presets()
+                self._sync_date_presets()
+            self._sync_mosaic_button()  # mosaic_kind
 
     # --- Footprint highlight on hover ---
 
@@ -1891,7 +1926,7 @@ class QStacDock(QDockWidget):
         self.btn_sort.setVisible(False)
 
         # Persist these params so the dock reopens here.
-        settings.save_last_search(run.date_from, run.date_to)
+        settings.save_last_search(run.date_from, run.date_to, run.collection.id)
         self._run = run
         self._flash_status("Searching…", ms=0)
         self._launch_search(self._run)
@@ -2254,8 +2289,7 @@ class QStacDock(QDockWidget):
             (
                 "tile",
                 "Newest scene per tile",
-                "Back up to a year before the start date for a tile the dates"
-                " leave empty",
+                _lookback_text(settings.mosaic_lookback_days()),
             ),
             (
                 "time",
@@ -2316,6 +2350,8 @@ class QStacDock(QDockWidget):
             run.collection.mosaic_reach_days,
             by_time=settings.mosaic_kind() == "time",
             area=run.area,
+            lookback_days=settings.mosaic_lookback_days(),
+            max_scenes=settings.mosaic_max_scenes(),
         )
         self._tile_task = task
         # A bound method: the signal comes from the worker thread.
@@ -2380,7 +2416,7 @@ class QStacDock(QDockWidget):
             names = ", ".join(t.split()[-1] for t in task.missing[:6])
             more = "\u2026" if len(task.missing) > 6 else ""
             limit = f" under {run.cloud}% clouds" if run.cloud is not None else ""
-            notes.append(f"no scene{limit} in a year for {names}{more}")
+            notes.append(f"no scene{limit} for {names}{more}")
         if notes:
             self._notify(
                 "Mosaic: " + "; ".join(notes) + ".", Qgis.MessageLevel.Info, 10

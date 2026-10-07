@@ -138,7 +138,7 @@ def search_btn_style(p: Palette) -> str:
 
 def outline_btn_style(p: Palette) -> str:
     """Outlined accent button: "Cancel search" while a search runs, and the
-    load bar under the results."""
+    mosaic button."""
     return (
         f"QPushButton {{ background: transparent; color: {p.accent};"
         f" border: 1px solid {p.accent};"
@@ -186,11 +186,12 @@ def results_list_style(p: Palette) -> str:
 
 
 def load_more_btn_style(p: Palette) -> str:
-    """The outlined "Load more results" / "Load all" buttons under the list."""
+    """The "Load more results" / "Load all" buttons under the list: tinted,
+    so they show on a dark panel, but not filled like Search and Load."""
     return (
-        f"QPushButton {{ background: transparent; color: {p.accent};"
+        f"QPushButton {{ background: {p.accent_bg}; color: {p.text_strong};"
         f" border: 1px solid {p.accent}; border-radius: 4px;"
         f" font-size: {fs(0.92)}; }}"
-        f"QPushButton:hover {{ background: {p.accent_bg}; }}"
+        f"QPushButton:hover {{ background: {p.pressed_alt}; }}"
         f"QPushButton:pressed {{ background: {p.btn_pressed}; }}"
     )

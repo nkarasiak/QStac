@@ -2,20 +2,23 @@
 
 from __future__ import annotations
 
+import datetime
 import urllib.parse
 
 from qgis.core import QgsApplication
 from qgis.gui import QgsAuthConfigSelect, QgsCollapsibleGroupBox
 from qgis.PyQt import sip
-from qgis.PyQt.QtCore import QEventLoop, Qt, QThread, QTimer, pyqtSignal
+from qgis.PyQt.QtCore import QEventLoop, QSize, Qt, QThread, QTimer, pyqtSignal
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -24,8 +27,10 @@ from qgis.PyQt.QtWidgets import (
     QPlainTextEdit,
     QProgressDialog,
     QPushButton,
+    QScrollArea,
     QSpinBox,
-    QTabWidget,
+    QStackedWidget,
+    QTableWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -39,6 +44,7 @@ from ..stac.auth import (
 )
 from ..stac.catalogs import (
     CATALOGS,
+    DEFAULT_CATALOG,
     USER_CATALOG_PREFIX,
     CatalogProvider,
     make_user_catalog,
@@ -60,6 +66,15 @@ __all__ = ["CatalogEditor", "SettingsDialog", "ask_s3_keys"]
 
 
 _HINT_CSS = f"color: #888; font-size: {fs(0.85)};"
+
+
+def _hint(text: str) -> QLabel:
+    """Grey help text, shown rather than hidden in a tooltip."""
+    label = QLabel(text)
+    label.setWordWrap(True)
+    label.setStyleSheet(_HINT_CSS)
+    return label
+
 
 # Stretch method choices: (display label, settings value)
 _STRETCH_METHODS = [
@@ -180,22 +195,146 @@ def _drop_auth_configs(authcfgs) -> None:
         manager.removeAuthenticationConfig(authcfg)
 
 
-class SettingsDialog(QDialog):
-    """Plugin settings dialog with tabbed sections.
+# Date button kinds: (label in the editor, preset); "last" takes its days.
+_DATE_KIND_CHOICES = [
+    ("Last N days", "last"),
+    ("This year", "this_year"),
+    ("Last year", "last_year"),
+    ("Any date", "all"),
+]
 
-    Tab order follows the order a user actually decides things: pick a
-    catalog first, and only then does anything else become relevant. User
-    catalogs are edited on a working copy that is saved only on OK; logins
-    the catalog editor stored meanwhile are removed on Cancel, or on OK when
-    no catalog kept them.
+
+class _DatePresetEditor(QWidget):
+    """The dock's date buttons as a table: one row each, in order.
+
+    Every change but a day count rebuilds the table from ``_presets`` (a
+    handful of rows): cell widgets do not move with their rows.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._presets: list[int | str] = []
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        row = QHBoxLayout()
+        self._table = QTableWidget(0, 2)
+        self._table.setHorizontalHeaderLabels(["Button", "Days"])
+        self._table.verticalHeader().setVisible(False)
+        self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        header = self._table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self._table.setFixedHeight(200)
+        row.addWidget(self._table, 1)
+        side = QVBoxLayout()
+        for text, tip, slot in (
+            ("Add", "Add a button at the end.", self._add),
+            ("Remove", "Remove the selected button.", self._remove),
+            (
+                "▲",
+                "Move the selected button up: left in the dock.",
+                lambda: self._move(-1),
+            ),
+            (
+                "▼",
+                "Move the selected button down: right in the dock.",
+                lambda: self._move(1),
+            ),
+        ):
+            btn = QPushButton(text)
+            btn.setToolTip(tip)
+            btn.clicked.connect(slot)
+            side.addWidget(btn)
+        side.addStretch()
+        row.addLayout(side)
+        lay.addLayout(row)
+        self._preview = _hint("")
+        lay.addWidget(self._preview)
+
+    def presets(self) -> list[int | str]:
+        return list(self._presets)
+
+    def set_presets(self, presets: list[int | str], select: int = -1) -> None:
+        self._presets = list(presets)
+        table = self._table
+        table.setRowCount(0)  # drops the old cell widgets
+        table.setRowCount(len(presets))
+        for i, preset in enumerate(presets):
+            kind = QComboBox()
+            for label, value in _DATE_KIND_CHOICES:
+                kind.addItem(label, value)
+            is_last = isinstance(preset, int)
+            kind.setCurrentIndex(kind.findData("last" if is_last else preset))
+            kind.currentIndexChanged.connect(lambda _i, r=i: self._kind_changed(r))
+            table.setCellWidget(i, 0, kind)
+            if is_last:  # the other kinds leave the cell empty
+                days = QSpinBox()
+                days.setRange(1, 3650)
+                days.setSuffix(" days")
+                days.setValue(int(preset))
+                days.valueChanged.connect(lambda v, r=i: self._days_changed(r, v))
+                table.setCellWidget(i, 1, days)
+        if 0 <= select < len(presets):
+            table.selectRow(select)
+        self._show_preview()
+
+    def _show_preview(self) -> None:
+        year = datetime.date.today().year
+        labels = [settings.preset_label(p, year) for p in self._presets]
+        self._preview.setText(
+            "Shows: " + " · ".join(labels) if labels else "No date buttons."
+        )
+
+    def _kind_changed(self, row: int) -> None:
+        kind = self._table.cellWidget(row, 0).currentData()
+        self._presets[row] = 30 if kind == "last" else kind
+        # Rebuilt once this signal is over: the rebuild deletes its combo.
+        QTimer.singleShot(0, lambda: self.set_presets(self._presets, row))
+
+    def _days_changed(self, row: int, days: int) -> None:
+        self._presets[row] = days
+        self._show_preview()
+
+    def _selected(self) -> int:
+        rows = self._table.selectionModel().selectedRows()
+        return rows[0].row() if rows else -1
+
+    def _add(self) -> None:
+        self.set_presets([*self._presets, 90], len(self._presets))
+
+    def _remove(self) -> None:
+        row = self._selected()
+        if row >= 0:
+            presets = self.presets()
+            del presets[row]
+            self.set_presets(presets, min(row, len(presets) - 1))
+
+    def _move(self, step: int) -> None:
+        row, presets = self._selected(), self.presets()
+        to = row + step
+        if row >= 0 and 0 <= to < len(presets):
+            presets[row], presets[to] = presets[to], presets[row]
+            self.set_presets(presets, to)
+
+
+class SettingsDialog(QDialog):
+    """Plugin settings: a page list on the left, as QGIS's own Options.
+
+    Page order follows the order a user actually decides things: pick a
+    catalog first, and only then does anything else become relevant. Every
+    plain setting is one row of ``_fields`` (key → widget, page), which
+    loading, *Reset page*, *Restore all* and saving all walk. User catalogs
+    are edited on a working copy that is saved only on OK; logins the catalog
+    editor stored meanwhile are removed on Cancel, or on OK when no catalog
+    kept them.
     """
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setWindowTitle("QStac Settings")
-        # Wide enough for every tab label — narrower widths collapse the tab
-        # bar into scroll arrows.
-        self.setMinimumWidth(540)
+        self.setMinimumSize(560, 400)
+        self.resize(720, 560)
         self.setWindowFlags(
             self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint
         )
@@ -204,25 +343,38 @@ class SettingsDialog(QDialog):
         # The catalog in use is picked in the dock; kept here only so a rename
         # or removal in this dialog moves it along.
         self._catalog = settings.catalog()
+        self._fields: dict[str, tuple[QWidget, int]] = {}  # key → (widget, page)
         layout = QVBoxLayout(self)
 
-        self._tabs = QTabWidget()
-        # Never collapse tabs into scroll arrows — shrink labels instead.
-        self._tabs.setUsesScrollButtons(False)
-        layout.addWidget(self._tabs)
+        body = QHBoxLayout()
+        self._nav = QListWidget()
+        self._nav.setIconSize(QSize(20, 20))
+        self._nav.setFixedWidth(170)
+        self._nav.setSpacing(2)
+        self._pages = QStackedWidget()
+        self._nav.currentRowChanged.connect(self._pages.setCurrentIndex)
+        body.addWidget(self._nav)
+        body.addWidget(self._pages, 1)
+        layout.addLayout(body, 1)
 
-        self._build_catalog_tab()
-        self._build_search_tab()
-        self._build_display_tab()
-        self._build_advanced_tab()
+        self._build_catalog_page()
+        self._build_search_page()
+        self._build_display_page()
+        self._build_mosaic_page()
+        self._build_network_page()
 
-        # Buttons
         btn_layout = QHBoxLayout()
-        restore_btn = QPushButton("Restore defaults")
-        restore_btn.clicked.connect(self._restore_defaults)
-        btn_layout.addWidget(restore_btn)
+        for text, tip, slot in (
+            ("Reset page", "Put this page's settings back to their defaults.",
+             self._reset_page),
+            ("Restore all", "Put every setting back to its default. Your STAC "
+             "APIs are kept.", self._restore_defaults),
+        ):  # fmt: skip
+            btn = QPushButton(text)
+            btn.setToolTip(tip)
+            btn.clicked.connect(slot)
+            btn_layout.addWidget(btn)
         btn_layout.addStretch()
-
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -232,23 +384,67 @@ class SettingsDialog(QDialog):
         layout.addLayout(btn_layout)
 
         self._load_current()
+        self._nav.setCurrentRow(min(settings.settings_page(), self._nav.count() - 1))
 
     # -----------------------------------------------------------------
-    # Tab builders
+    # Page builders
     # -----------------------------------------------------------------
+
+    def _page(self, title: str, icon: str) -> QVBoxLayout:
+        """A new page, listed under *title* with QGIS theme icon *icon*."""
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(8, 0, 4, 0)
+        head = QLabel(title)
+        head.setStyleSheet(f"font-weight: bold; font-size: {fs(1.25)};")
+        lay.addWidget(head)
+        # Scrolls rather than squeezes on a small screen or a large font.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(page)
+        self._pages.addWidget(scroll)
+        self._nav.addItem(QListWidgetItem(QgsApplication.getThemeIcon(icon), title))
+        return lay
 
     @staticmethod
-    def _form(parent: QWidget) -> QFormLayout:
-        form = QFormLayout(parent)
+    def _group(page: QVBoxLayout, title: str) -> QFormLayout:
+        grp = QGroupBox(title)
+        form = QFormLayout(grp)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        page.addWidget(grp)
         return form
 
-    def _build_catalog_tab(self) -> None:
+    def _row(
+        self, form: QFormLayout, label: str, key: str, widget: QWidget, hint: str = ""
+    ) -> None:
+        """Add setting *key*'s *widget*, with its *hint* shown under the row."""
+        self._fields[key] = (widget, self._pages.count() - 1)
+        form.addRow(label, widget)
+        if hint:
+            form.addRow(_hint(hint))
+
+    @staticmethod
+    def _spin(lo: int, hi: int, suffix: str = "", step: int = 1) -> QSpinBox:
+        spin = QSpinBox()
+        spin.setRange(lo, hi)
+        spin.setSuffix(suffix)
+        spin.setSingleStep(step)
+        return spin
+
+    @staticmethod
+    def _combo(choices: list[tuple[str, str]]) -> QComboBox:
+        combo = QComboBox()
+        for label, value in choices:
+            combo.addItem(label, value)
+        return combo
+
+    def _build_catalog_page(self) -> None:
         # Every STAC catalog QStac can search: the built-ins (read-only), then
         # the user's own STAC APIs, any QGIS auth method. The catalog in use
         # is picked in the dock's combo.
-        tab = QWidget()
-        outer = QVBoxLayout(tab)
+        page = self._page("Catalogs", "mIconStac.svg")
         grp = QGroupBox("STAC catalogs")
         glay = QVBoxLayout(grp)
         self.list_user_catalogs = QListWidget()
@@ -268,129 +464,190 @@ class SettingsDialog(QDialog):
             self._catalog_buttons.append(btn)
         row.addStretch()
         glay.addLayout(row)
-        hint = QLabel(
-            "Add any STAC API. Authentication (OAuth2, Basic, API key header...) "
-            "uses QGIS authentication configs, stored encrypted. This list is "
-            "QGIS's own STAC connections (Browser > STAC): a catalog added on "
-            "either side shows up on the other. Built-in catalogs cannot be "
-            "edited or removed."
+        glay.addWidget(
+            _hint(
+                "Add any STAC API. Logins (OAuth2, Basic, API key header...) are "
+                "QGIS authentication configs, stored encrypted. This list is "
+                "QGIS's own STAC connections (Browser > STAC): a catalog added "
+                "on either side shows up on the other. Built-in catalogs cannot "
+                "be edited or removed."
+            )
         )
-        hint.setStyleSheet(_HINT_CSS)
-        hint.setWordWrap(True)
-        glay.addWidget(hint)
-        outer.addWidget(grp)
-        self._tabs.addTab(tab, "Catalogs")
+        page.addWidget(grp, 1)
 
-    def _build_search_tab(self) -> None:
-        tab = QWidget()
-        form = self._form(tab)
-
-        self.spin_date_range = QSpinBox()
-        self.spin_date_range.setRange(1, 730)
-        self.spin_date_range.setSuffix(" days")
-        form.addRow("Default date range:", self.spin_date_range)
-
-        self.spin_page_size = QSpinBox()
-        self.spin_page_size.setRange(5, 100)
-        self.spin_page_size.setSingleStep(5)
-        form.addRow("Results per page:", self.spin_page_size)
-
-        self.spin_cloud_cover = QSpinBox()
-        self.spin_cloud_cover.setRange(0, 100)
-        self.spin_cloud_cover.setSuffix(" %")
-        form.addRow("Default cloud cover:", self.spin_cloud_cover)
-
-        self.spin_overlap = QSpinBox()
-        self.spin_overlap.setRange(0, 100)
-        self.spin_overlap.setSuffix(" % overlap")
-        self.spin_overlap.setToolTip(
-            "Scenes that barely touch the map view are left out of the results:"
-            " the share of the scene, or of the map view when it is the smaller,"
-            " that the two have in common."
+        form = self._group(page, "When QStac opens")
+        self._row(
+            form,
+            "",
+            "auto_open",
+            QCheckBox("Open QStac when QGIS starts"),
+            "Follows whether you left the panel open or closed it.",
         )
-        form.addRow("Hide scenes overlapping under:", self.spin_overlap)
-
-        self._tabs.addTab(tab, "Search")
-
-    def _build_display_tab(self) -> None:
-        tab = QWidget()
-        outer = QVBoxLayout(tab)
-
-        top = QWidget()
-        form = self._form(top)
-
-        self.chk_visual_asset = QCheckBox("Use provider true-color asset (TCI)")
-        self.chk_visual_asset.setToolTip(
-            "When the collection ships a pre-rendered true-color COG\n"
-            "(e.g. Sentinel-2 TCI), load it instead of building an R/G/B\n"
-            "VRT: faster display, but contrast is fixed by the provider.\n"
-            "Uncheck to always compose R/G/B with the stretch below."
+        self._row(
+            form,
+            "Start on:",
+            "start_on",
+            self._combo(
+                [
+                    (
+                        f"{DEFAULT_CATALOG.short_label or DEFAULT_CATALOG.label}"
+                        ", Sentinel-2 L2A",
+                        "default",
+                    ),
+                    ("The catalog and collection last searched", "last"),
+                ]
+            ),
         )
-        form.addRow("", self.chk_visual_asset)
 
-        self.chk_zoom = QCheckBox("Zoom the map to each scene you open")
-        form.addRow("", self.chk_zoom)
-
-        self.combo_stretch_method = QComboBox()
-        for label, value in _STRETCH_METHODS:
-            self.combo_stretch_method.addItem(label, value)
-        self.combo_stretch_method.setToolTip(
-            "How the image values are spread over the colors. Fixed is fastest;\n"
-            "the others read the image statistics first."
+    def _build_search_page(self) -> None:
+        page = self._page("Search", "mActionFilter2.svg")
+        form = self._group(page, "New searches")
+        self._row(
+            form, "Date range:", "default_date_range", self._spin(1, 730, " days")
         )
-        form.addRow("Contrast:", self.combo_stretch_method)
-        outer.addWidget(top)
-
-        outer.addStretch()
-
-        self._tabs.addTab(tab, "Display")
-
-    def _build_advanced_tab(self) -> None:
-        tab = QWidget()
-        outer = QVBoxLayout(tab)
-
-        startup = QWidget()
-        sform = self._form(startup)
-        self.chk_auto_open = QCheckBox("Open QStac when QGIS starts")
-        self.chk_auto_open.setToolTip(
-            "Follows whether you left the panel open or closed it."
+        self._row(
+            form,
+            "Cloud cover:",
+            "default_cloud_cover",
+            self._spin(0, 100, " %"),
+            "Where the cloud slider starts.",
         )
-        sform.addRow("Startup:", self.chk_auto_open)
-        outer.addWidget(startup)
-
-        grp_net = QGroupBox("Network && cache")
-        form = self._form(grp_net)
-
-        self.spin_vsi_cache = QSpinBox()
-        self.spin_vsi_cache.setRange(32, 2048)
-        self.spin_vsi_cache.setSuffix(" MB")
-        self.spin_vsi_cache.setSingleStep(64)
-        self.spin_vsi_cache.setToolTip(
-            "Memory kept for streamed image data (GDAL /vsicurl/ cache).\n"
-            "Larger values make panning and zooming remote imagery smoother."
+        self._row(form, "Results per page:", "page_size", self._spin(5, 100, "", 5))
+        self._row(
+            form,
+            "Hide scenes overlapping under:",
+            "min_overlap_pct",
+            self._spin(0, 100, " %"),
+            "Leaves out scenes that barely touch the search area: the share of "
+            "the scene, or of the area when it is the smaller, the two have in "
+            "common.",
         )
-        form.addRow("Image cache size:", self.spin_vsi_cache)
 
-        self.spin_http_conn = QSpinBox()
-        self.spin_http_conn.setRange(1, 64)
-        self.spin_http_conn.setToolTip(
-            "Maximum parallel HTTP connections for COG access.\n"
-            "Higher values help on fast connections."
+        form = self._group(page, "Date buttons")
+        self._row(
+            form,
+            "",
+            "date_buttons",
+            _DatePresetEditor(),
+            "The buttons under the dates, left to right. Last N days shows as "
+            "1w, 1m, 1y or 10d.",
         )
-        form.addRow("Max HTTP connections:", self.spin_http_conn)
+        page.addStretch()
 
-        self.spin_http_timeout = QSpinBox()
-        self.spin_http_timeout.setRange(5, 120)
-        self.spin_http_timeout.setSuffix(" s")
-        self.spin_http_timeout.setToolTip(
-            "HTTP timeout for STAC search and COG access.\n"
-            "Increase for slow or satellite connections."
+    def _build_display_page(self) -> None:
+        page = self._page("Display", "propertyicons/symbology.svg")
+        form = self._group(page, "Opening a scene")
+        self._row(
+            form,
+            "",
+            "use_visual_asset",
+            QCheckBox("Use the provider's true-color image (TCI)"),
+            "When the collection has one: a ready-made 8-bit image instead of "
+            "three bands, faster, but the "
+            "provider fixes the contrast. Off, R/G/B are composed with the "
+            "contrast below.",
         )
-        form.addRow("HTTP timeout:", self.spin_http_timeout)
-        outer.addWidget(grp_net)
+        self._row(
+            form,
+            "Map:",
+            "zoom_to_scene",
+            self._combo(
+                [
+                    ("Zoom to each scene opened", "always"),
+                    ("Leave the map where it is", "never"),
+                ]
+            ),
+        )
+        self._row(
+            form,
+            "Contrast:",
+            "stretch_method",
+            self._combo(_STRETCH_METHODS),
+            "How image values are spread over the colors. Fixed is fastest; the "
+            "others read the image statistics first.",
+        )
+        page.addStretch()
 
-        outer.addStretch()
-        self._tabs.addTab(tab, "Advanced")
+    def _build_mosaic_page(self) -> None:
+        page = self._page("Mosaic", "mIconRaster.svg")
+        form = self._group(page, "The 9-square button")
+        self._row(
+            form,
+            "A click builds:",
+            "mosaic_kind",
+            self._combo(
+                [
+                    ("Newest scene per tile", "tile"),
+                    ("One mosaic per date, with the time slider", "time"),
+                ]
+            ),
+            "Also picked from the button's right-click menu.",
+        )
+        lookback = self._spin(0, 1825, " days", 30)
+        lookback.setSpecialValueText("Only the search dates")
+        self._row(
+            form,
+            "Look back before the start date:",
+            "mosaic_lookback_days",
+            lookback,
+            "Newest scene per tile: how far back to look for a tile the dates "
+            "leave empty. Only the search dates leaves it empty (the basemap "
+            "shows).",
+        )
+        self._row(
+            form,
+            "Most scenes per date mosaic:",
+            "mosaic_max_scenes",
+            self._spin(50, 5000, " scenes", 50),
+            "One mosaic per date keeps the newest this many scenes of the dates.",
+        )
+        page.addStretch()
+
+    def _build_network_page(self) -> None:
+        page = self._page("Network", "propertyicons/network_and_proxy.svg")
+        form = self._group(page, "Connections")
+        self._row(
+            form,
+            "Timeout:",
+            "http_timeout",
+            self._spin(5, 120, " s"),
+            "For searches and image reads. Raise it on a slow or satellite link.",
+        )
+        self._row(
+            form,
+            "Max HTTP connections:",
+            "http_max_connections",
+            self._spin(1, 64),
+            "Parallel connections for image reads. More helps on a fast link.",
+        )
+
+        form = self._group(page, "Image streaming")
+        self._row(
+            form,
+            "Image cache:",
+            "vsi_cache_mb",
+            self._spin(32, 2048, " MB", 64),
+            "Memory kept for streamed image data: more makes panning and "
+            "zooming remote imagery smoother.",
+        )
+        prefetch = self._spin(0, 50, " results")
+        prefetch.setSpecialValueText("Off")
+        self._row(
+            form,
+            "Prepare after a search:",
+            "prefetch_top_n",
+            prefetch,
+            "The first results' image headers are fetched right away, so "
+            "opening one of them skips a round trip.",
+        )
+        self._row(
+            form,
+            "Parallel reads per image:",
+            "clip_workers",
+            self._spin(1, 64),
+            "Range requests in flight when a scene is clipped to the map view.",
+        )
+        page.addStretch()
 
     # -----------------------------------------------------------------
     # Reactive state
@@ -468,57 +725,47 @@ class SettingsDialog(QDialog):
     # Load / save
     # -----------------------------------------------------------------
 
-    def _select_stretch_method(self, method: object) -> None:
-        for i, (_, val) in enumerate(_STRETCH_METHODS):
-            if val == method:
-                self.combo_stretch_method.setCurrentIndex(i)
-                break
+    @staticmethod
+    def _set(widget: QWidget, value: object) -> None:
+        if isinstance(widget, QCheckBox):
+            widget.setChecked(bool(value))
+        elif isinstance(widget, QSpinBox):
+            widget.setValue(int(value))
+        elif isinstance(widget, QComboBox):
+            widget.setCurrentIndex(max(widget.findData(value), 0))
+        else:  # _DatePresetEditor
+            widget.set_presets(settings.parse_date_presets(str(value)))
+
+    @staticmethod
+    def _value(widget: QWidget) -> object:
+        if isinstance(widget, QCheckBox):
+            return widget.isChecked()
+        if isinstance(widget, QSpinBox):
+            return widget.value()
+        if isinstance(widget, QComboBox):
+            return widget.currentData()
+        return settings.format_date_presets(widget.presets())
 
     def _load_current(self) -> None:
         """Populate widgets from current QgsSettings values."""
-        # Catalog
         self._user_catalogs = settings.user_catalogs()
         self._populate_user_list()
+        for key, (widget, _page) in self._fields.items():
+            default = settings.DEFAULTS[key]
+            self._set(widget, settings._get(key, type(default)))
 
-        # Search
-        self.spin_date_range.setValue(settings.default_date_range())
-        self.spin_page_size.setValue(settings.page_size())
-        self.spin_cloud_cover.setValue(settings.default_cloud_cover())
-        self.spin_overlap.setValue(settings.min_overlap_pct())
+    def _load_defaults(self, page: int | None = None) -> None:
+        """Default values into the widgets of *page*, or of every page.
 
-        # Display
-        self.chk_visual_asset.setChecked(settings.use_visual_asset())
-        self.chk_zoom.setChecked(settings.zoom_to_scene() == "always")
-        self._select_stretch_method(settings.stretch_method())
+        Never the user's STAC APIs (nor the auth configs they point at): that
+        is not what "defaults" should mean.
+        """
+        for key, (widget, on) in self._fields.items():
+            if page is None or on == page:
+                self._set(widget, settings.DEFAULTS[key])
 
-        # Advanced
-        self.chk_auto_open.setChecked(settings.auto_open())
-        self.spin_vsi_cache.setValue(settings.vsi_cache_mb())
-        self.spin_http_conn.setValue(settings.http_max_connections())
-        self.spin_http_timeout.setValue(settings.http_timeout())
-
-    def _load_defaults(self) -> None:
-        """Populate widgets from default values (for Restore Defaults)."""
-        d = settings.DEFAULTS
-        # Not the user's STAC APIs (nor the auth configs they point at): that
-        # is not what "defaults" should mean.
-
-        # Search
-        self.spin_date_range.setValue(int(d["default_date_range"]))
-        self.spin_page_size.setValue(int(d["page_size"]))
-        self.spin_cloud_cover.setValue(int(d["default_cloud_cover"]))
-        self.spin_overlap.setValue(int(d["min_overlap_pct"]))
-
-        # Display
-        self.chk_visual_asset.setChecked(bool(d["use_visual_asset"]))
-        self.chk_zoom.setChecked(d["zoom_to_scene"] == "always")
-        self._select_stretch_method(d["stretch_method"])
-
-        # Advanced
-        self.chk_auto_open.setChecked(bool(d["auto_open"]))
-        self.spin_vsi_cache.setValue(int(d["vsi_cache_mb"]))
-        self.spin_http_conn.setValue(int(d["http_max_connections"]))
-        self.spin_http_timeout.setValue(int(d["http_timeout"]))
+    def _reset_page(self) -> None:
+        self._load_defaults(self._pages.currentIndex())
 
     def _restore_defaults(self) -> None:
         self._load_defaults()
@@ -536,22 +783,14 @@ class SettingsDialog(QDialog):
         _drop_auth_configs(self._created)
         super().reject()
 
+    def done(self, result: int) -> None:  # accept() and reject() both end here
+        settings.save_settings_page(self._nav.currentRow())
+        super().done(result)
+
     def collect_values(self) -> dict[str, object]:
         """Return all widget values as a dict suitable for settings.save_all()."""
-        return {
-            "auto_open": self.chk_auto_open.isChecked(),
-            "catalog": self._catalog,
-            "default_date_range": self.spin_date_range.value(),
-            "page_size": self.spin_page_size.value(),
-            "default_cloud_cover": self.spin_cloud_cover.value(),
-            "min_overlap_pct": self.spin_overlap.value(),
-            "use_visual_asset": self.chk_visual_asset.isChecked(),
-            "zoom_to_scene": "always" if self.chk_zoom.isChecked() else "never",
-            "stretch_method": self.combo_stretch_method.currentData(),
-            "vsi_cache_mb": self.spin_vsi_cache.value(),
-            "http_max_connections": self.spin_http_conn.value(),
-            "http_timeout": self.spin_http_timeout.value(),
-        }
+        values = {key: self._value(w) for key, (w, _page) in self._fields.items()}
+        return {**values, "catalog": self._catalog}
 
 
 # Login choices: (detect.py login kind, label shown in the editor). "auto"
@@ -724,15 +963,9 @@ class CatalogEditor(QDialog):
         adv = QVBoxLayout(advanced)
         adv.setSpacing(4)
 
-        def hint(text: str) -> QLabel:
-            label = QLabel(text)
-            label.setWordWrap(True)
-            label.setStyleSheet(_HINT_CSS)
-            return label
-
         adv.addWidget(QLabel("Extra headers"))
         adv.addWidget(
-            hint(
+            _hint(
                 "Fixed lines sent with every request to the API. Add one only "
                 "if your provider's documentation asks for it."
             )
@@ -749,7 +982,7 @@ class CatalogEditor(QDialog):
         adv.addSpacing(6)
         adv.addWidget(self.chk_auth_assets)
         adv.addWidget(
-            hint(
+            _hint(
                 "Sends your login with the image and thumbnail downloads too. "
                 "Leave it off unless images fail to load: most APIs hand out "
                 "ready-made download links, and those stop working when a "

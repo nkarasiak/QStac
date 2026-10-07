@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 
 from qgis.core import QgsSettings
 
@@ -23,6 +24,9 @@ DEFAULTS: dict[str, object] = {
     # General. Open the dock when QGIS starts: follows whether the user left
     # it open (plugin._toggle_dock, QStacDock.closeEvent).
     "auto_open": True,
+    # What the dock opens on: "default" (Planetary Computer, Sentinel-2 L2A)
+    # or "last", the catalog in use and the collection last searched.
+    "start_on": "default",
     # Active catalog: a built-in id ("planetary_computer", "earth_search",
     # "copernicus_data_space") or the id of a user catalog ("user:…").
     "catalog": "planetary_computer",
@@ -38,6 +42,9 @@ DEFAULTS: dict[str, object] = {
     "page_size": 10,
     "default_cloud_cover": 20,
     "min_overlap_pct": 1,
+    # The dock's date buttons, in order: a number is "last N days", then
+    # "this_year", "last_year" and "all" (parse_date_presets()).
+    "date_buttons": "7, 30, this_year, last_year, all",
     # Rendering
     # Prefer the provider-rendered true-color asset (Sentinel-2 TCI) for
     # default loads: one 8-bit COG instead of a 3-band 16-bit VRT.
@@ -50,6 +57,11 @@ DEFAULTS: dict[str, object] = {
     # tile's newest scene going back in time, or "time", every scene of the
     # dates with the newest on top.
     "mosaic_kind": "tile",
+    # How far before the start date a tile mosaic looks for a tile the dates
+    # leave empty; 0 keeps it to the search dates.
+    "mosaic_lookback_days": 365,
+    # A mosaic per date keeps the newest this many scenes of its dates.
+    "mosaic_max_scenes": 1000,
     # Performance
     "vsi_cache_mb": 512,
     "http_max_connections": 16,
@@ -57,6 +69,8 @@ DEFAULTS: dict[str, object] = {
     # Results whose COG headers are fetched right after a search (one 64 KB
     # request each), so clicking any of them skips a round trip.
     "prefetch_top_n": 10,
+    # Range requests in flight per COG when a load clips the map view.
+    "clip_workers": 16,
     # Indices the user wrote (Custom index…): a JSON list of
     # {label, expression, ramp, vmin, vmax}, vmin/vmax null for an auto range.
     "custom_indices": "[]",
@@ -76,6 +90,10 @@ def _get(key: str, type_: type = str) -> object:
 
 def auto_open() -> bool:
     return bool(_get("auto_open", bool))
+
+
+def start_on() -> str:
+    return "last" if _get("start_on", str) == "last" else "default"
 
 
 def catalog() -> str:
@@ -338,6 +356,45 @@ def min_overlap_pct() -> int:
     return int(_get("min_overlap_pct", int))
 
 
+# Date buttons besides "last N days" (a number of days).
+DATE_KINDS = ("this_year", "last_year", "all")
+
+
+def parse_date_presets(text: str) -> list[int | str]:
+    """``"7, this_year"`` → ``[7, "this_year"]``, in order, each once: whole
+    days from 1 to 3650 and ``DATE_KINDS``; anything else is skipped."""
+    presets: list[int | str] = []
+    for token in re.split(r"[\s,;]+", text.strip().lower()):
+        value: int | str = int(token) if token.isdecimal() else token
+        valid = value in DATE_KINDS if isinstance(value, str) else 0 < value <= 3650
+        if valid and value not in presets:
+            presets.append(value)
+    return presets
+
+
+def format_date_presets(presets: list[int | str]) -> str:
+    return ", ".join(map(str, presets))
+
+
+def preset_label(preset: int | str, year: int) -> str:
+    """A date button's text: 7 → "1w", 30 → "1m", 365 → "1y", 10 → "10d";
+    this_year and last_year → the year (*year* is this one), all → "All"."""
+    if preset == "this_year":
+        return str(year)
+    if preset == "last_year":
+        return str(year - 1)
+    if not isinstance(preset, int):
+        return "All"
+    for unit, size in (("y", 365), ("m", 30), ("w", 7)):
+        if preset % size == 0:
+            return f"{preset // size}{unit}"
+    return f"{preset}d"
+
+
+def date_presets() -> list[int | str]:
+    return parse_date_presets(str(_get("date_buttons", str)))
+
+
 # -- Rendering --
 
 
@@ -352,6 +409,14 @@ def zoom_to_scene() -> str:
 
 def mosaic_kind() -> str:
     return "time" if _get("mosaic_kind", str) == "time" else "tile"
+
+
+def mosaic_lookback_days() -> int:
+    return int(_get("mosaic_lookback_days", int))
+
+
+def mosaic_max_scenes() -> int:
+    return int(_get("mosaic_max_scenes", int))
 
 
 def stretch_method() -> str:
@@ -377,6 +442,10 @@ def prefetch_top_n() -> int:
     return int(_get("prefetch_top_n", int))
 
 
+def clip_workers() -> int:
+    return int(_get("clip_workers", int))
+
+
 # ---------------------------------------------------------------------------
 # Session state persistence (last search + dock geometry)
 #
@@ -392,19 +461,21 @@ def last_search() -> dict[str, object]:
     return {
         "date_from": str(s.value(_PREFIX + "last_date_from", "")),
         "date_to": str(s.value(_PREFIX + "last_date_to", "")),
+        "collection": str(s.value(_PREFIX + "last_collection", "")),
     }
 
 
-def save_last_search(date_from: str, date_to: str) -> None:
-    """Persist the dates of the most recent search.
+def save_last_search(date_from: str, date_to: str, collection: str) -> None:
+    """Persist the dates and collection of the most recent search.
 
     Cloud cover is deliberately excluded — the slider always opens at
     ``default_cloud_cover`` so the settings dialog is the only source of truth.
-    The collection too: the dock always opens on the default one.
+    The collection comes back only with ``start_on`` "last".
     """
     s = QgsSettings()
     s.setValue(_PREFIX + "last_date_from", date_from)
     s.setValue(_PREFIX + "last_date_to", date_to)
+    s.setValue(_PREFIX + "last_collection", collection)
     s.remove(_PREFIX + "last_cloud_cover")
 
 
@@ -416,6 +487,15 @@ def last_export_dir() -> str:
 def save_last_export_dir(path: str) -> None:
     """Remember where the user last saved a clipped GeoTIFF."""
     QgsSettings().setValue(_PREFIX + "last_export_dir", path)
+
+
+def settings_page() -> int:
+    """The settings dialog page last shown."""
+    return int(QgsSettings().value(_PREFIX + "settings_page", 0, type=int))
+
+
+def save_settings_page(row: int) -> None:
+    QgsSettings().setValue(_PREFIX + "settings_page", row)
 
 
 def dock_geometry() -> object:
