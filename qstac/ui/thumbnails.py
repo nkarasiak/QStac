@@ -5,11 +5,12 @@ from __future__ import annotations
 import contextlib
 from typing import TYPE_CHECKING
 
-from qgis.core import QgsApplication, QgsNetworkAccessManager
+from qgis.core import QgsApplication, QgsNetworkAccessManager, QgsTask
 from qgis.PyQt.QtCore import QObject, QTimer, QUrl
 from qgis.PyQt.QtGui import QPixmap
 from qgis.PyQt.QtNetwork import QNetworkReply, QNetworkRequest
 
+from ..stac.auth import pc_sign_fetches
 from ..stac.net import StacError, same_origin
 from .constants import _sign_func
 from .widgets import _ResultCard
@@ -50,6 +51,7 @@ class ThumbnailLoader(QObject):
         self._failed: set[str] = set()  # item_ids whose thumbnail failed
         self._cards: dict[str, _ResultCard] = {}  # item_id → card widget
         self._pending: dict[str, QNetworkReply] = {}  # keep replies alive
+        self._signing: dict[str, QgsTask] = {}  # item_id → its token fetch
 
     def make_card(
         self,
@@ -101,8 +103,10 @@ class ThumbnailLoader(QObject):
         self._catalog = None
 
     def _fetch(self, item_id: str, url: str) -> None:
-        if item_id in self._pending or item_id in self._failed:
-            return  # on its way, or a badge to click for a retry
+        if item_id in self._pending or item_id in self._signing:
+            return  # on its way
+        if item_id in self._failed:
+            return  # a badge to click for a retry
         if item_id in self._cache:
             self._paint(item_id, self._cache[item_id])
             return
@@ -113,8 +117,11 @@ class ThumbnailLoader(QObject):
         # SAS token instead of re-requesting an expired one. The signer no-ops
         # on anything that is not a PC blob URL.
         sign = _sign_func(catalog)
+        if sign and pc_sign_fetches(url):
+            self._sign_first(item_id, url, sign)
+            return
         if sign:
-            url = sign(url)
+            url = sign(url)  # the token is cached: no HTTP
 
         request = QNetworkRequest(QUrl(url))
         if catalog.auth_assets and _catalog_origin(url, catalog):
@@ -132,6 +139,25 @@ class ThumbnailLoader(QObject):
         self._pending[item_id] = reply
         reply.finished.connect(lambda r=reply, i=item_id: self._on_finished(r, i))
         QTimer.singleShot(_ABORT_MS, lambda r=reply, i=item_id: self._abort(r, i))
+
+    def _sign_first(self, item_id: str, url: str, sign) -> None:
+        """Fetch *url*'s SAS token off the GUI thread, then the thumbnail."""
+        catalog = self._catalog
+
+        def finished(exc: Exception | None, _signed: str | None = None) -> None:
+            self._signing.pop(item_id, None)
+            if catalog is not self._catalog:
+                return  # cleared, or another catalog's results by now
+            if exc is not None:
+                self._show_fallback(item_id)
+            else:
+                self._fetch(item_id, url)  # signs from the cache now
+
+        task = QgsTask.fromFunction(
+            "Signing a thumbnail URL", lambda _task: sign(url), on_finished=finished
+        )
+        self._signing[item_id] = task
+        QgsApplication.taskManager().addTask(task)
 
     def _on_finished(self, reply: QNetworkReply, item_id: str) -> None:
         reply.deleteLater()

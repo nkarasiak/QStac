@@ -209,8 +209,12 @@ class CogPrefetchTask(_EventTask):
         bake_stretch: tuple[float, float] | None = None,
         index_preset: IndexPreset | None = None,
         prepare: Callable[[], object] | None = None,
+        remote_only: bool = False,
     ) -> None:
         super().__init__("Prefetching COG tiles")
+        # No clips: only each item's remote source (``remoteReady``), for a
+        # layer whose first pan came after the load's own had expired.
+        self.remote_only = remote_only
         # Run first, in the task's thread: hands GDAL an asset login, which
         # may mean an OAuth2 token fetch.
         self.prepare = prepare
@@ -249,7 +253,7 @@ class CogPrefetchTask(_EventTask):
         return item_id, asset_name, local
 
     def _process_warm(self, job: _Job) -> None:
-        if self.progressive:
+        if self.progressive or self.remote_only:
             _warm_one_source(_vsicurl(job[2]))
         else:
             _warm_header(_vsicurl(job[2]))
@@ -319,7 +323,7 @@ class CogPrefetchTask(_EventTask):
         # sharp clip. Non-progressive (post-search) runs warm headers only.
         if not self._run_pass(self._process_warm, jobs, 6):
             return False
-        if self.progressive:
+        if self.progressive or self.remote_only:
             self._emit_remote(jobs)
         return not self._cancel.is_set()
 

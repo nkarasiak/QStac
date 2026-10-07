@@ -110,7 +110,6 @@ from .loading import (
     _guess_item_asset,
     _natural_key,
     _raster_assets,
-    signed_assets,
     viewport_bbox_4326,
 )
 from .styles import fs
@@ -1922,8 +1921,16 @@ class QStacDock(QDockWidget):
     ) -> None:
         """Submit a StacSearchTask for a page of *run*."""
         catalog, coll = run.catalog, run.collection
+        # Skip overlap filter when viewport is very large (e.g. worldwide
+        # search); a drawn or selected area is always filtered by its shape.
+        bbox, area = run.bbox, run.area
+        wide = (bbox[2] - bbox[0]) > 20 or (bbox[3] - bbox[1]) > 20
+        pct = settings.min_overlap_pct()
         task = StacSearchTask(
             catalog,
+            keep=None
+            if wide and area is None
+            else lambda items: _filter_by_overlap(items, bbox, pct, area),
             collection=coll.id,
             bbox=run.bbox,
             datetime_range=f"{run.date_from}T00:00:00Z/{run.date_to}T23:59:59Z",
@@ -1964,16 +1971,7 @@ class QStacDock(QDockWidget):
         if run is None:
             return
 
-        # Skip overlap filter when viewport is very large (e.g. worldwide
-        # search); a drawn or selected area is always filtered by its shape.
-        bbox = run.bbox
-        wide = (bbox[2] - bbox[0]) > 20 or (bbox[3] - bbox[1]) > 20
-        if wide and run.area is None:
-            new_items = list(task.results)
-        else:
-            new_items = _filter_by_overlap(
-                task.results, bbox, settings.min_overlap_pct(), run.area
-            )
+        new_items = list(task.results)  # trimmed to the area by the task
         self._next_page = task.next_page
 
         if not new_items and not self._results:
@@ -2608,10 +2606,12 @@ class QStacDock(QDockWidget):
     def _make_copy_asset_handler(
         self, item: StacItemResult, asset_name: str, catalog: CatalogProvider
     ) -> Callable[[], None]:
-        def handler() -> None:
-            href = signed_assets(item, catalog).get(asset_name, "")
-            QgsApplication.clipboard().setText(href)
+        def copy(assets: dict[str, str]) -> None:
+            QgsApplication.clipboard().setText(assets.get(asset_name, ""))
             self._flash_status(f"{asset_name} URL copied.")
+
+        def handler() -> None:
+            self._loader.sign_then(item, catalog, copy)
 
         return handler
 
@@ -2664,10 +2664,14 @@ class QStacDock(QDockWidget):
         settings.save_last_export_dir(str(Path(path).parent))
 
         self._flash_status(f"Exporting {Path(path).name}…", ms=0)
-        task = ExportClipTask(signed_assets(item, catalog), band_names, viewport, path)
-        task.taskCompleted.connect(lambda: self._on_export_finished(task, True))
-        task.taskTerminated.connect(lambda: self._on_export_finished(task, False))
-        self._loader.run_task(task)
+
+        def start(assets: dict[str, str]) -> None:
+            task = ExportClipTask(assets, band_names, viewport, path)
+            task.taskCompleted.connect(lambda: self._on_export_finished(task, True))
+            task.taskTerminated.connect(lambda: self._on_export_finished(task, False))
+            self._loader.run_task(task)
+
+        self._loader.sign_then(item, catalog, start)
 
     def _on_export_finished(self, task: ExportClipTask, ok: bool) -> None:
         if self._closed:

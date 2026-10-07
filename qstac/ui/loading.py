@@ -45,7 +45,6 @@ from ..raster.tasks import (
 from ..stac.auth import pc_token_ttl, request_headers, s3_keys
 from ..stac.indices import _is_jp2, resolve_variables
 from ..stac.items import AssetMeta
-from ..stac.net import StacError
 from .constants import _item_key, _scenes, _sign_func
 
 if TYPE_CHECKING:
@@ -344,7 +343,6 @@ class _ProgressiveLoad:
     remote: dict[str, dict] = field(default_factory=dict)
     started: float = field(default_factory=time.monotonic)
     remote_ttl: float = _REMOTE_TTL_S  # see _remote_ttl
-    error: str = ""  # why a layer could not be built, when known
 
 
 @dataclass
@@ -398,6 +396,37 @@ class LayerLoader(QObject):
         task.taskCompleted.connect(lambda t=task: self._tasks.discard(t))
         task.taskTerminated.connect(lambda t=task: self._tasks.discard(t))
         QgsApplication.taskManager().addTask(task)
+
+    def sign_then(
+        self,
+        item: StacItemResult,
+        catalog: CatalogProvider,
+        then: Callable[[dict[str, str]], object],
+        failed: Callable[[str], object] | None = None,
+    ) -> None:
+        """Call *then* with :func:`signed_assets`, signed off the GUI thread.
+
+        Signing may fetch a PC SAS token or an asset login's OAuth2 token:
+        up to a 15 s wait. *failed* (else a flash) gets why it could not.
+        """
+
+        def finished(exc: Exception | None, assets: dict | None = None) -> None:
+            if self._closed:
+                return
+            if exc is None and assets is not None:
+                then(assets)
+            elif failed is not None:
+                failed(str(exc))
+            else:
+                self._flash(f"Could not sign the asset URLs: {exc}", ms=8000)
+
+        self.run_task(
+            QgsTask.fromFunction(
+                "Signing asset URLs",
+                lambda _task: signed_assets(item, catalog),
+                on_finished=finished,
+            )
+        )
 
     def shutdown(self) -> None:
         """Cancel every task and wait briefly for them to stop.
@@ -497,7 +526,7 @@ class LayerLoader(QObject):
         """Save asset *name* of *item* where the user picks, then open it."""
         if not self.ensure_s3_login(catalog):
             return
-        href = signed_assets(item, catalog)[name]
+        href = item.assets[name]  # signed below, off this thread
         file_name = Path(urllib.parse.urlsplit(href).path).name or item.id
         start = settings.last_export_dir() or QDir.homePath()
         path, _ = QFileDialog.getSaveFileName(
@@ -506,11 +535,15 @@ class LayerLoader(QObject):
         if not path:
             return
         settings.save_last_export_dir(str(Path(path).parent))
-        task = DownloadTask(href, path)
-        task.taskCompleted.connect(lambda: self._on_downloaded(task, item))
-        task.taskTerminated.connect(lambda: self._on_downloaded(task, item))
         self._flash(f"Downloading {Path(path).name}…", ms=0)
-        self.run_task(task)
+
+        def start(assets: dict[str, str]) -> None:
+            task = DownloadTask(assets[name], path)
+            task.taskCompleted.connect(lambda: self._on_downloaded(task, item))
+            task.taskTerminated.connect(lambda: self._on_downloaded(task, item))
+            self.run_task(task)
+
+        self.sign_then(item, catalog, start)
 
     def _on_downloaded(self, task: DownloadTask, item: StacItemResult) -> None:
         """Open a finished download: one layer per variable it holds."""
@@ -766,11 +799,18 @@ class LayerLoader(QObject):
         ld: _ProgressiveLoad,
         local_clips: dict | None = None,
     ) -> QgsRasterLayer | None:
-        """Layer for *it* as *ld* asks for it — local clips, or the remote VRT."""
+        """Layer for *it* from what a task built: local clips, or the remote VRT.
+
+        None without either: building the remote source here would read the
+        network on the GUI thread. The assets go unsigned, as the builders
+        never read them when given clips or a remote source.
+        """
+        if not local_clips:
+            return None
         if ld.index_preset is not None:
             return build_index_layer(
                 item_id=it.id,
-                assets=signed_assets(it, ld.catalog),
+                assets=it.assets,
                 collection_info=ld.coll,
                 index_preset=ld.index_preset,
                 epsg=it.epsg,
@@ -779,7 +819,7 @@ class LayerLoader(QObject):
             )
         return build_layer(
             item_id=it.id,
-            assets=signed_assets(it, ld.catalog),
+            assets=it.assets,
             collection_info=ld.coll,
             epsg=it.epsg,
             band_override=ld.band_override,
@@ -859,24 +899,25 @@ class LayerLoader(QObject):
             self._flash(f"{_scenes(built)} loaded.")
             return
         self._flash("Loading failed.")
-        reason = ld.task.error or ld.error
+        reason = ld.task.error
         if reason:
             self._show_failure(ld, reason)
             return
         # Nothing said why: ask GDAL about the first asset, off this thread.
         name = next((n for n in ld.task.asset_names if n in ld.items[0].assets), "")
-        try:
-            href = signed_assets(ld.items[0], ld.catalog).get(name, "")
-        except StacError as exc:
-            self._show_failure(ld, str(exc))
-            return
-        if not href:
+        if not name:
             self._show_failure(ld, "The scene has none of the assets asked for.")
             return
-        task = DiagnoseTask(href)
-        task.taskCompleted.connect(lambda: self._show_failure(ld, task.reason))
-        task.taskTerminated.connect(lambda: self._show_failure(ld, ""))
-        self.run_task(task)
+
+        def diagnose(assets: dict[str, str]) -> None:
+            task = DiagnoseTask(assets[name])
+            task.taskCompleted.connect(lambda: self._show_failure(ld, task.reason))
+            task.taskTerminated.connect(lambda: self._show_failure(ld, ""))
+            self.run_task(task)
+
+        self.sign_then(
+            ld.items[0], ld.catalog, diagnose, lambda e: self._show_failure(ld, e)
+        )
 
     def _show_failure(self, ld: _ProgressiveLoad, reason: str) -> None:
         """Say why *ld* loaded nothing; offer new S3 keys where they are used."""
@@ -901,15 +942,12 @@ class LayerLoader(QObject):
 
         Their clips failed, but the prefetch still warmed the GDAL cache, so
         this renders the current viewport fast while streaming tiles on pan.
+        One with no remote source (the task could not build it) is left out.
         Returns how many layers were added.
         """
         pairs = []
         for item in items:
-            try:
-                layer = self._build_item_layer(item, ld, ld.remote.get(item.id))
-            except StacError as exc:  # its assets could not be signed
-                ld.error = str(exc)
-                continue
+            layer = self._build_item_layer(item, ld, ld.remote.get(item.id))
             if layer is not None:
                 stamp_layer(layer, [item], ld.coll, ld.catalog, ld.key_suffix or "")
                 pairs.append((layer, _item_key(item, ld.key_suffix)))
@@ -929,18 +967,54 @@ class LayerLoader(QObject):
         user moves the map they need the pannable full-COG source. Deferring the
         swap until then means the sharp clip stays on screen instead of being
         re-rendered from the network the instant it appears. The source the
-        task built is used while fresh; else it is rebuilt here.
+        task built is used while fresh; else it is rebuilt in a task
+        (:meth:`_rebuild_remote`), the clip staying on screen meanwhile.
         """
         pending, self._local = self._local, {}
         now = time.monotonic()
+        stale: dict[int, list[_LocalLayer]] = {}
         for entry in pending.values():
             ld = entry.load
             if sip.isdeleted(entry.layer):
                 continue
             fresh = now - ld.started < ld.remote_ttl
             remote = ld.remote.get(entry.item.id) if fresh else None
-            if self._swap_source(entry.layer, entry.item, ld, remote):
+            if remote is None:
+                stale.setdefault(id(ld), []).append(entry)
+            elif self._swap_source(entry.layer, entry.item, ld, remote):
                 delete_clips(entry.clips.values())
+        for entries in stale.values():
+            self._rebuild_remote(entries)
+
+    def _rebuild_remote(self, entries: list[_LocalLayer]) -> None:
+        """Build *entries*' remote sources off-thread; swap each as it lands.
+
+        Their load's own expired (PC SAS URLs in it) or never came. Signing,
+        warming the COGs and BuildVRT all read the network: on the GUI thread
+        they froze QGIS for seconds per layer.
+        """
+        ld = entries[0].load
+        by_id = {e.item.id: e for e in entries}
+        items = [e.item for e in entries]
+        task = CogPrefetchTask(
+            items,
+            ld.task.asset_names,
+            sign_func=_sign_func(ld.catalog),
+            bake_stretch=ld.task.bake_stretch,
+            index_preset=ld.index_preset,
+            prepare=_asset_login(items, ld.catalog),
+            remote_only=True,
+        )
+        task.remoteReady.connect(lambda i, remote: self._on_rebuilt(by_id[i], remote))
+        self.run_task(task)
+
+    def _on_rebuilt(self, entry: _LocalLayer, remote: dict) -> None:
+        """Repoint *entry*'s layer at its rebuilt remote source."""
+        if self._closed or sip.isdeleted(entry.layer):
+            delete_clips(entry.clips.values())  # the layer went meanwhile
+            return
+        if self._swap_source(entry.layer, entry.item, entry.load, remote):
+            delete_clips(entry.clips.values())
 
     def _on_layers_removed(self, layer_ids: list[str]) -> None:
         """Forget layers about to be removed, and delete the clips they read."""

@@ -258,6 +258,49 @@ def test_day_cover_is_the_share_of_the_area() -> None:
     assert abs(half["2026-09-01"] - 0.75) < 1e-6, half
 
 
+def test_remote_only_task_builds_just_the_remote_source() -> None:
+    """A stale layer's rebuild: signed and built in the task, no clips."""
+    import functools
+    import http.server
+    import threading
+
+    from qstac.raster.layers import REMOTE_VRT
+    from qstac.raster.tasks import CogPrefetchTask
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _tif(f"{tmp}/a.tif", np.array([[7, 8]], np.uint16))
+        handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=tmp)
+        handler.log_message = lambda *_a: None
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+        try:
+            item = SimpleNamespace(
+                id="X",
+                assets={"a": f"{base}/a.tif"},
+                asset_proj={"a": _proj(2)},
+                epsg=32631,
+            )
+            signed: list[str] = []
+            task = CogPrefetchTask(
+                [item],
+                ["a"],
+                sign_func=lambda h: signed.append(h) or h,
+                remote_only=True,
+            )
+            got: dict[str, list] = {"coarse": [], "sharp": [], "remote": []}
+            task.coarseReady.connect(lambda i, c: got["coarse"].append(i))
+            task.sharpReady.connect(lambda i, c: got["sharp"].append(i))
+            task.remoteReady.connect(lambda i, r: got["remote"].append((i, r)))
+            assert task.run()
+        finally:
+            srv.shutdown()
+    assert signed == [f"{base}/a.tif"], signed
+    assert got["coarse"] == got["sharp"] == [], got
+    [(item_id, remote)] = got["remote"]
+    assert item_id == "X" and gdal.Open(remote[REMOTE_VRT]) is not None, remote
+
+
 def test_gdal_options_keep_the_users_and_unset_ours() -> None:
     restore_gdal_config()
     gdal.SetConfigOption("GDAL_NUM_THREADS", "2")  # set in QGIS's GDAL options

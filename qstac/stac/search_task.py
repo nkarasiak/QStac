@@ -19,6 +19,8 @@ from .net import StacError
 from .search import search_catalog, server_cloud_filter
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from qgis.core import QgsGeometry
 
     from .catalogs import CatalogProvider
@@ -45,9 +47,16 @@ class StacSearchTask(QgsTask):
     background thread, so an OAuth2 token fetch never blocks the UI. Every
     other keyword goes straight to :func:`search_catalog`, except that
     ``server_side_cloud_filter`` is narrowed by :func:`server_cloud_filter`.
+    *keep* trims the results here too (``geo._filter_by_overlap``): it grows
+    with the page size, so not on the GUI thread.
     """
 
-    def __init__(self, catalog: CatalogProvider, **search_kwargs):
+    def __init__(
+        self,
+        catalog: CatalogProvider,
+        keep: Callable[[list[StacItemResult]], list[StacItemResult]] | None = None,
+        **search_kwargs,
+    ):
         desc = (
             "Searching more…"
             if search_kwargs.get("page_token")
@@ -55,6 +64,7 @@ class StacSearchTask(QgsTask):
         )
         super().__init__(desc)
         self.catalog = catalog
+        self.keep = keep
         search_kwargs["server_side_cloud_filter"] = search_kwargs.get(
             "server_side_cloud_filter", False
         ) and server_cloud_filter(catalog, search_kwargs["collection"])
@@ -71,6 +81,8 @@ class StacSearchTask(QgsTask):
                 auth_headers=request_headers(self.catalog) or None,
                 cancel_check=self.isCanceled,
             )
+            if self.keep is not None:
+                self.results = self.keep(self.results)
             return True
         except Exception as e:
             self.error_kind = e.kind if isinstance(e, StacError) else "unknown"

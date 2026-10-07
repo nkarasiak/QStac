@@ -7,6 +7,7 @@ Pure stdlib — ``qstac.stac.catalogs`` imports nothing from QGIS.
 from __future__ import annotations
 
 import datetime
+import threading
 import time
 
 from qstac.stac import auth
@@ -125,6 +126,33 @@ def test_pc_token_ttl_and_expiry() -> None:
     )
     left = auth._pc_sas_ttl(soon.strftime("%Y-%m-%dT%H:%M:%SZ"))
     assert 500 < left < 600, left
+
+
+def test_pc_token_is_fetched_once_for_concurrent_signers() -> None:
+    """Eight threads signing one cold container wait for one token fetch."""
+    href = "https://acct2.blob.core.windows.net/cont/a.tif"
+    assert auth.pc_sign_fetches(href)  # cold: signing would be an HTTP GET
+    assert not auth.pc_sign_fetches("https://example.org/cont/a.tif")
+    calls = []
+
+    def fake_get(_req, _timeout, _context):
+        calls.append(1)
+        time.sleep(0.2)  # the threads pile up behind this fetch
+        return b'{"token": "st=1&se=2&sp=r"}'
+
+    real, auth._urlopen_safe = auth._urlopen_safe, fake_get
+    try:
+        threads = [
+            threading.Thread(target=auth.pc_sign_url, args=(href,)) for _ in range(8)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        auth._urlopen_safe = real
+    assert len(calls) == 1, calls
+    assert not auth.pc_sign_fetches(href)  # cached now
 
 
 if __name__ == "__main__":

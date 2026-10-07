@@ -248,11 +248,21 @@ _PC_SAS_URL = "https://planetarycomputer.microsoft.com/api/sas/v1/token"
 _PC_BLOB_DOMAIN = ".blob.core.windows.net"
 _pc_sas_cache: dict[str, tuple[str, float]] = {}  # key → (token, expiry)
 _pc_sas_lock = threading.Lock()
+# One fetch per container at a time: the threads signing alongside it (a
+# load's pool, thumbnails) wait for its token rather than each asking.
+_pc_fetch_locks: dict[str, threading.Lock] = {}
 
 
 def _pc_get_sas_token(account: str, container: str) -> str:
     """Get a cached or fresh SAS token for a PC Azure blob container."""
     cache_key = f"{account}/{container}"
+    with _pc_sas_lock:
+        fetch_lock = _pc_fetch_locks.setdefault(cache_key, threading.Lock())
+    with fetch_lock:
+        return _pc_cached_or_fetched(cache_key, account, container)
+
+
+def _pc_cached_or_fetched(cache_key: str, account: str, container: str) -> str:
     with _pc_sas_lock:
         cached = _pc_sas_cache.get(cache_key)
         if cached:
@@ -310,6 +320,11 @@ def pc_token_ttl(href: str) -> float | None:
     with _pc_sas_lock:
         cached = _pc_sas_cache.get("/".join(blob)) if blob else None
     return max(0.0, cached[1] - time.monotonic()) if cached else None
+
+
+def pc_sign_fetches(href: str) -> bool:
+    """Whether :func:`pc_sign_url` on *href* would fetch a token (HTTP)."""
+    return _pc_container(href) is not None and not pc_token_ttl(href)
 
 
 def pc_sign_url(href: str) -> str:
