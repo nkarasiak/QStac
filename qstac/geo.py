@@ -59,15 +59,24 @@ def _filter_by_overlap(
     results: list[StacItemResult],
     search_bbox: tuple[float, float, float, float] | None,
     min_overlap_pct: int = 1,
+    area: QgsGeometry | None = None,
 ) -> list[StacItemResult]:
     """Keep items whose overlap with the viewport is >= min_overlap_pct of
     the smaller of the two: a scene wholly inside a country-wide view is kept,
-    a sliver at the edge of a zoomed-in view is not."""
+    a sliver at the edge of a zoomed-in view is not.
+
+    *area* (WGS84) is a drawn or selected search area: it stands in for the
+    *search_bbox* rectangle, which is then only what the server was sent.
+    """
     if search_bbox is None:
         return list(results)
 
     west, south, east, north = search_bbox
-    viewport_geom = QgsGeometry.fromRect(QgsRectangle(west, south, east, north))
+    viewport_geom = (
+        area
+        if area is not None
+        else QgsGeometry.fromRect(QgsRectangle(west, south, east, north))
+    )
     viewport_area = viewport_geom.area()
     if viewport_area <= 0:
         return list(results)

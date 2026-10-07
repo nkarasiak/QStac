@@ -278,6 +278,7 @@ qstac/                   The plugin — the zip is exactly this folder (+ LICENS
     ├── styles.py        Stylesheets, as functions of the palette
     ├── settings_dialog.py  SettingsDialog (catalogs, search, display, advanced), CatalogEditor, ask_s3_keys
     ├── collection_combo.py _CollectionDelegate, _ComboFilter
+    ├── area_tool.py     AreaTool: the map tool drawing a search rectangle or polygon
     ├── index_dialog.py  IndexDialog (custom index), custom_index_presets
     ├── widgets.py       ClickableDateEdit, _ResultCard, _WheelGuard
     ├── constants.py     Palette, date presets, display helpers (ids, emoji)
@@ -311,6 +312,7 @@ stac:    net, items, collections (leaves) ← detect;  collections ← catalogs 
 raster:  pixel_fn, vrt (leaves) ← cog ← clip, style ← layers ← index ← tasks
          (cog imports stac/items for s3_to_https)
 ui:      theme ← constants, styles ← widgets, collection_combo, thumbnails ← loading ← index_dialog ← dock
+         area_tool (leaf) ← dock
 geo.py, log.py   leaves (qgis.core only); raster/ and ui/ log, stac/ never does
 plugin.py → ui/ lazily in _open_dock(); settings.py → raster/cog, stac/auth lazily
 ```
@@ -374,7 +376,14 @@ QGIS font size setting.
 
 The search area is the map view, so the button says *Search this map view*
 and `_show_search_area()` tints the searched box on the map until the search
-ends (`_stop_progress()`). A result card leads with the day it was taken
+ends (`_stop_progress()`). The ▾ beside it (`_show_area_menu()`) swaps in a
+drawn rectangle or polygon (`ui/area_tool.py`, clicks, not a drag)
+or the active layer's selected features, which is searched right away, stays
+tinted and is kept for later searches until *This map view* is picked again
+(`_set_area()`, `_SearchRun.area`, WGS84). The server only gets its bbox
+(every API takes one; `intersects` is optional and a detailed shape is too
+big to send), and `_filter_by_overlap(area=)` trims the results to its shape.
+Loads still clip the map view. A result card leads with the day it was taken
 (`stac.items.scene_date()`, "29 Jul 2025"), then the satellite and tile
 (`scene_name()`, "Sentinel-2A · tile 32UNU", from `platform` / `s2:mgrs_tile` /
 `grid:code` / WRS path/row properties or the id's tokens; else `_shorten_id()`).

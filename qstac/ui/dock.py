@@ -16,6 +16,7 @@ from qgis.core import (
     Qgis,
     QgsApplication,
     QgsCoordinateReferenceSystem,
+    QgsCoordinateTransform,
     QgsGeometry,
     QgsProject,
     QgsRasterLayer,
@@ -88,6 +89,7 @@ from ..stac.net import StacError
 from ..stac.search import PageToken, fetch_collections, fetch_root
 from ..stac.search_task import StacSearchTask
 from . import styles
+from .area_tool import AreaTool
 from .collection_combo import _CollectionDelegate, _ComboFilter
 from .constants import (
     _DATE_CALENDAR_DELAY_MS,
@@ -240,6 +242,7 @@ class _SearchRun:
     catalog: CatalogProvider
     collection: CollectionInfo
     bbox: tuple[float, float, float, float]
+    area: QgsGeometry | None  # drawn or selected (WGS84); None = the map view
     date_from: str
     date_to: str
     cloud: int | None
@@ -274,6 +277,12 @@ class QStacDock(QDockWidget):
         self._next_page: PageToken | None = None
         self._rubber_band: QgsRubberBand | None = None  # hovered footprint
         self._search_band: QgsRubberBand | None = None  # area being searched
+        # The search area picked from the Search button's ▾ (WGS84), and the
+        # button's text for it; None searches the map view.
+        self._area: QgsGeometry | None = None
+        self._area_text = _SEARCH_TEXT
+        self._area_tool = None  # the drawing map tool, kept alive while used
+        self._prev_map_tool = None  # given back once drawn
 
         # Animated search progress
         self._progress_timer = QTimer(self)
@@ -561,6 +570,7 @@ class QStacDock(QDockWidget):
         plugin reload, and no task still writes into the clip dir it deletes.
         """
         self._closed = True
+        self._end_area_tool()
         self._loader.shutdown()
         self._thumbs.clear()
         for band in (self._rubber_band, self._search_band):
@@ -955,7 +965,22 @@ class QStacDock(QDockWidget):
             " cloud limit above (Ctrl+Return)"
         )
         self.btn_search.setStyleSheet(styles.search_btn_style(P))
-        layout.addWidget(self.btn_search)
+        # ▾: search a drawn area or selected features instead of the view.
+        self.btn_area = QPushButton("\u25be")
+        self.btn_area.setFixedSize(34, 34)
+        self.btn_area.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_area.setToolTip(
+            "Search another area: draw a rectangle or polygon, or use the"
+            " selected features"
+        )
+        self.btn_area.setStyleSheet(styles.search_btn_style(P))
+        self.btn_area.clicked.connect(self._show_area_menu)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
+        row.addWidget(self.btn_search, 1)
+        row.addWidget(self.btn_area)
+        layout.addLayout(row)
 
     def _build_results_list(self, layout: QVBoxLayout) -> None:
         """Build the status row (count + sort) and results list."""
@@ -1235,14 +1260,15 @@ class QStacDock(QDockWidget):
     def _stop_progress(self) -> None:
         """The search ended (done, failed or canceled)."""
         self._progress_timer.stop()
-        if self._search_band is not None:
+        if self._search_band is not None and self._area is None:
             self._search_band.reset(QgsWkbTypes.GeometryType.Polygon)
 
-    def _show_search_area(self, bbox: tuple[float, float, float, float]) -> None:
-        """Tint the searched area on the map while the search runs.
+    def _show_search_area(self, area: QgsGeometry) -> None:
+        """Tint the searched area (WGS84) on the map.
 
-        It is the map view itself, so this says "this is what is searched"
-        (and still shows where, if the map is panned meanwhile).
+        The map view only while the search runs, which says "this is what is
+        searched" (and still shows where, if the map is panned meanwhile); a
+        drawn or selected area for as long as it is the one searched.
         """
         if self._search_band is None:
             band = QgsRubberBand(
@@ -1252,10 +1278,119 @@ class QStacDock(QDockWidget):
             band.setFillColor(QColor(*P.accent_rgba_fill))
             band.setWidth(2)
             self._search_band = band
-        self._search_band.setToGeometry(
-            QgsGeometry.fromRect(QgsRectangle(*bbox)),
-            QgsCoordinateReferenceSystem(_WGS84),
+        self._search_band.setToGeometry(area, QgsCoordinateReferenceSystem(_WGS84))
+
+    def _show_area_menu(self) -> None:
+        """The Search button's ▾: which area the next searches cover."""
+        menu = QMenu(self)
+        view = menu.addAction(_SEARCH_TEXT.replace("Search this", "This"))
+        view.setCheckable(True)
+        view.setChecked(self._area is None)
+        view.triggered.connect(lambda: self._set_area(None, _SEARCH_TEXT))
+        menu.addAction("Draw a rectangle…").triggered.connect(
+            lambda: self._draw_area(polygon=False)
         )
+        menu.addAction("Draw a polygon…").triggered.connect(
+            lambda: self._draw_area(polygon=True)
+        )
+        layer = self.iface.activeLayer()
+        n = layer.selectedFeatureCount() if isinstance(layer, QgsVectorLayer) else 0
+        sel = menu.addAction(f"Selected features ({n})" if n else "Selected features")
+        sel.setEnabled(n > 0)
+        if not n:
+            sel.setToolTip("Select features on a vector layer first.")
+            menu.setToolTipsVisible(True)
+        sel.triggered.connect(self._use_selected_features)
+        btn = self.btn_area
+        menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
+
+    def _set_area(self, area: QgsGeometry | None, text: str) -> None:
+        """Search *area* (WGS84) from now on, or the map view when None."""
+        if area is not None and not area.isGeosValid():
+            area = area.makeValid()  # a self-crossing polygon
+        self._area, self._area_text = area, text
+        if not self._search_in_flight():
+            self.btn_search.setText(text)
+        if area is not None:
+            self._show_search_area(area)
+        elif self._search_band is not None:
+            self._search_band.reset(QgsWkbTypes.GeometryType.Polygon)
+
+    def _draw_area(self, polygon: bool) -> None:
+        """Hand the map a drawing tool; the area it draws is searched."""
+        canvas = self.iface.mapCanvas()
+        if canvas.mapTool() is not self._area_tool or self._area_tool is None:
+            self._prev_map_tool = canvas.mapTool()
+        tool = AreaTool(
+            canvas,
+            QColor(*P.accent_rgba_stroke),
+            QColor(*P.accent_rgba_fill),
+            rectangle=not polygon,
+        )
+        text = "Search drawn polygon" if polygon else "Search drawn rectangle"
+        tool.drawn.connect(lambda g: self._on_area_drawn(g, text))
+        if polygon:
+            hint = (
+                "Click the corners of the area, then double-click to search it"
+                " (Backspace undoes a corner, Esc cancels)."
+            )
+        else:
+            hint = "Click one corner of the area, then the opposite one (Esc cancels)."
+        # Kept until the next one replaces it: it is still emitting when
+        # _on_area_drawn gives the map its previous tool back.
+        self._area_tool = tool
+        canvas.setMapTool(tool)
+        self._notify(hint, Qgis.MessageLevel.Info, 6)
+
+    def _end_area_tool(self) -> None:
+        """Give the map back the tool it had before drawing."""
+        canvas = self.iface.mapCanvas()
+        tool = self._area_tool
+        if tool is None or canvas.mapTool() is not tool:
+            return
+        if self._prev_map_tool is not None and not sip.isdeleted(self._prev_map_tool):
+            canvas.setMapTool(self._prev_map_tool)
+        else:
+            canvas.unsetMapTool(tool)
+
+    def _on_area_drawn(self, geom: QgsGeometry, text: str) -> None:
+        """A drawing tool finished: *geom* in the canvas CRS, null if given up."""
+        self._end_area_tool()
+        if geom.isNull() or geom.isEmpty():
+            return
+        canvas = self.iface.mapCanvas()
+        geom = QgsGeometry(geom)
+        geom.transform(
+            QgsCoordinateTransform(
+                canvas.mapSettings().destinationCrs(),
+                QgsCoordinateReferenceSystem(_WGS84),
+                QgsProject.instance(),
+            )
+        )
+        self._set_area(geom, text)
+        if not self._search_in_flight():
+            self._on_search()
+
+    def _use_selected_features(self) -> None:
+        """Search the selected features of the active vector layer."""
+        layer = self.iface.activeLayer()
+        if not isinstance(layer, QgsVectorLayer) or not layer.selectedFeatureCount():
+            return
+        geom = QgsGeometry.unaryUnion([f.geometry() for f in layer.selectedFeatures()])
+        if geom.isNull() or geom.isEmpty():
+            self._notify(
+                "The selected features have no geometry.", Qgis.MessageLevel.Warning, 5
+            )
+            return
+        geom.transform(
+            QgsCoordinateTransform(
+                layer.crs(), QgsCoordinateReferenceSystem(_WGS84), QgsProject.instance()
+            )
+        )
+        n = layer.selectedFeatureCount()
+        self._set_area(geom, f"Search {n} selected feature{'s' if n > 1 else ''}")
+        if not self._search_in_flight():
+            self._on_search()
 
     def _on_progress_tick(self) -> None:
         self._progress_dots = (self._progress_dots % 3) + 1
@@ -1591,13 +1726,15 @@ class QStacDock(QDockWidget):
         self.btn_search.setEnabled(True)
         self.btn_search.setText("Cancel search")
         self.btn_search.setStyleSheet(styles.outline_btn_style(P))
+        self.btn_area.setEnabled(False)
         self._sync_more_bar()
 
     def _restore_search_button(self) -> None:
         """Return the search button to its idle 'Search' appearance."""
         self.btn_search.setEnabled(True)
-        self.btn_search.setText(_SEARCH_TEXT)
+        self.btn_search.setText(self._area_text)
         self.btn_search.setStyleSheet(styles.search_btn_style(P))
+        self.btn_area.setEnabled(True)
 
     def _cancel_search(self) -> None:
         """Cancel the in-flight search task, if any, and reset the UI."""
@@ -1632,10 +1769,16 @@ class QStacDock(QDockWidget):
         date_to = self.date_to.date().toString("yyyy-MM-dd")
         # Persist these params so the dock reopens here.
         settings.save_last_search(coll.id, date_from, date_to)
+        if self._area is None:
+            bbox = viewport_bbox_4326(self.iface.mapCanvas())
+        else:  # the server gets its bbox, the results are trimmed to its shape
+            r = self._area.boundingBox()
+            bbox = (r.xMinimum(), r.yMinimum(), r.xMaximum(), r.yMaximum())
         self._run = _SearchRun(
             catalog=self._catalog,
             collection=coll,
-            bbox=viewport_bbox_4326(self.iface.mapCanvas()),
+            bbox=bbox,
+            area=self._area,
             date_from=date_from,
             date_to=date_to,
             cloud=self.cloud_slider.value() if coll.has_cloud_cover else None,
@@ -1689,7 +1832,10 @@ class QStacDock(QDockWidget):
         task.taskTerminated.connect(lambda t=task: self._on_search_failed(t))
         self._enter_search_state()
         self._start_progress()
-        self._show_search_area(run.bbox)
+        area = run.area
+        self._show_search_area(
+            area if area is not None else QgsGeometry.fromRect(QgsRectangle(*run.bbox))
+        )
         self._loader.run_task(task)
 
     def _finish_search_task(self, task: StacSearchTask) -> _SearchRun | None:
@@ -1707,14 +1853,15 @@ class QStacDock(QDockWidget):
         if run is None:
             return
 
-        # Skip overlap filter when viewport is very large (e.g. worldwide search)
+        # Skip overlap filter when viewport is very large (e.g. worldwide
+        # search); a drawn or selected area is always filtered by its shape.
         bbox = run.bbox
         wide = (bbox[2] - bbox[0]) > 20 or (bbox[3] - bbox[1]) > 20
-        if wide:
+        if wide and run.area is None:
             new_items = list(task.results)
         else:
             new_items = _filter_by_overlap(
-                task.results, bbox, settings.min_overlap_pct()
+                task.results, bbox, settings.min_overlap_pct(), run.area
             )
         self._next_page = task.next_page
 
@@ -1723,7 +1870,8 @@ class QStacDock(QDockWidget):
             cloud = " raising the cloud limit," if run.cloud is not None else ""
             self.label_empty.setText(
                 "No scenes matched.\n\n"
-                f"Try widening the date range,{cloud} or zooming out."
+                f"Try widening the date range,{cloud} or"
+                f" {'zooming out' if run.area is None else 'a larger area'}."
             )
             self._set_results_visible(False)
             return
