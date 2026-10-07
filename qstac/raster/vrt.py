@@ -17,17 +17,23 @@ def _build_vrt(
     path: str,
     sources: list[str],
     separate: bool = False,
-    nodata: float | None = None,
+    nodata: float | str | None = None,
+    default_nodata: float | str | None = None,
 ) -> str | None:
     """``gdal.BuildVRT`` with scale/offset cleared (see ``_strip_scale_offset``).
 
     Returns *path*, or with ``path=""`` the VRT XML itself — a GDAL datasource
     of its own, so a layer opened on it needs no file. *nodata* overrides the
-    sources' own. None when GDAL could not build it, in either GDAL exception
-    mode (a plugin may have switched them on process-wide): exceptions on, it
-    raises RuntimeError; off, a failed open reaches Translate as a NULL
-    (TypeError).
+    sources' own; *default_nodata* applies only to an unsigned-integer first
+    source with no nodata or mask at all (PC's Sentinel-2 TCI: black edges,
+    nothing declared), so a mosaic's empty corners stop painting over the
+    other scenes — never to a signed or float file (a DEM's 0 is sea level). None
+    when GDAL could not build it, in either GDAL exception mode (a plugin may
+    have switched them on process-wide): exceptions on, it raises
+    RuntimeError; off, a failed open reaches Translate as a NULL (TypeError).
     """
+    if nodata is None and default_nodata is not None and _unmasked_unsigned(sources[0]):
+        nodata = default_nodata
     ds = None
     with contextlib.suppress(RuntimeError, TypeError):
         ds = gdal.BuildVRT(
@@ -43,6 +49,39 @@ def _build_vrt(
     _strip_scale_offset(ds)
     ds.FlushCache()
     return path or ds.GetMetadata("xml:VRT")[0]
+
+
+def _unmasked_unsigned(src: str) -> bool:
+    """Whether *src* is Byte/UInt16 with every pixel valid (no nodata, mask, alpha)."""
+    ds = None
+    with contextlib.suppress(RuntimeError):
+        ds = gdal.Open(src)
+    if ds is None:
+        return False
+    band = ds.GetRasterBand(1)
+    unsigned = band.DataType in (gdal.GDT_Byte, gdal.GDT_UInt16)
+    return unsigned and band.GetMaskFlags() == gdal.GMF_ALL_VALID
+
+
+def _store_statistics(path: str) -> bool:
+    """Store approximate band statistics in the VRT at *path*; False if unreadable.
+
+    ``QgsRasterLayer``'s constructor asks every band for its min/max (the
+    default contrast enhancement, whatever the algorithm), and QGIS's GDAL
+    provider answers from stored statistics before computing any. Computing
+    them here, off the GUI thread, from the overviews, keeps construction
+    from reading pixels on it.
+    """
+    ds = None
+    with contextlib.suppress(RuntimeError):
+        ds = gdal.Open(path)
+    if ds is None:
+        return False
+    with contextlib.suppress(RuntimeError):
+        for i in range(1, ds.RasterCount + 1):
+            ds.GetRasterBand(i).ComputeStatistics(True)
+    ds = None  # a VRT writes its new metadata back on close
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +118,11 @@ def _band_type(proj: AssetProj) -> tuple[str | None, float | str | None]:
     if gdal_type == "UInt16" and nodata is None:
         nodata = 0
     return gdal_type, nodata
+
+
+def _stac_nodata(proj: AssetProj | None) -> float | str | None:
+    """Nodata to assume for an asset whose file declares none (``_band_type``)."""
+    return _band_type(proj)[1] if proj is not None else None
 
 
 def _write_vrt_xml(

@@ -89,11 +89,12 @@ class _EventTask(QgsTask):
 
 
 class MosaicBuildTask(_EventTask):
-    """Background build of the mosaic VRT for several scenes.
+    """Background build of the mosaic VRTs (one per CRS) for several scenes.
 
     Everything that reaches the network — per-item VRT writes, COG warming,
-    ``gdal.BuildVRT`` — happens here; the caller opens the result with
-    :func:`open_mosaic_layer` on the GUI thread once the task completes.
+    ``gdal.BuildVRT``, statistics — happens here; the caller opens each of
+    ``mosaics`` with :func:`open_mosaic_layer` on the GUI thread once the
+    task completes.
     """
 
     def __init__(
@@ -108,8 +109,8 @@ class MosaicBuildTask(_EventTask):
         self.collection_info = collection_info
         self.band_override = band_override
         self.stretch_override = stretch_override
-        self.mosaic_path: str | None = None
-        self.epsg: int | None = None
+        # (path, epsg, item ids) per CRS, largest first.
+        self.mosaics: list[tuple[str, int | None, list[str]]] = []
         self.dropped: int = len(parts)
         self.stretch_baked: bool = False
         self.error: str | None = None
@@ -128,7 +129,7 @@ class MosaicBuildTask(_EventTask):
             return False
         if built is None:
             return False
-        self.mosaic_path, self.epsg, self.dropped, self.stretch_baked = built
+        self.mosaics, self.dropped, self.stretch_baked = built
         return True
 
 

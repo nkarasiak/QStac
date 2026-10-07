@@ -157,6 +157,12 @@ slot; and a load that built nothing runs `raster.tasks.DiagnoseTask`, whose
 `raster.cog.explain_read_error()` turns GDAL's own error into the sentence
 `LayerLoader._show_failure()` shows (401/403, 404, 429, 5xx, not a raster,
 an unreadable link scheme).
+Nodata: a declared one (file, else STAC `raster:bands`) always wins. A
+Byte/UInt16 file with no nodata, mask or alpha (PC's Sentinel-2 TCI and
+bands declare nothing) gets the STAC one, else 0 (`_build_vrt(default_nodata=)`,
+`vrt._stac_nodata()`), so its black edge is transparent and a mosaic's empty
+corners never paint over a neighbour. Never a signed or float file: a DEM's
+0 (Cop-DEM, ALOS) is sea level.
 When `item_assets` names no raster the guess is left empty and the scene's first
 `.tif` loads; right-click > *Load asset* loads any of its rasters instead. Asset
 names may hold a `/`, so temp files are always named through `raster.cog._vrt_path()`.
@@ -313,6 +319,7 @@ Cross-module imports of `_private` names inside the package are normal here.
 
 ### Performance-sensitive paths
 
+- **`QgsRasterLayer` construction reads pixels on the GUI thread**: its default contrast enhancement asks every band for min/max, whatever the algorithm (`loadDefaultStyle = False` does not skip it). Cheap from a COG's overviews; a source without overviews (a warped VRT) is read whole, and an 81-scene mosaic warped into one CRS froze QGIS. So mosaics are one layer per EPSG (QGIS reprojects at render), never warped, and `vrt._store_statistics()` stores their stats in the task, which QGIS's GDAL provider reads before computing any. Never hand the GUI thread a source without overviews.
 - **VRT construction**: Direct XML write saves 1-3s vs GDAL BuildVRT (avoids HTTP per band)
 - **Default stretch values**: fixed (100, 3500) for Sentinel-2/Mosaics avoids cumulative cut computation
 - **GDAL config** in `configure_gdal_for_cog()` (called at plugin start, so saved index layers open; process-wide, so `_set_option()` leaves any option the user already set, and `restore_gdal_config()` unsets the rest and every asset login in `unload()`): a shared `/vsicurl/` cache sized from Settings, a 25 MB per-handle `VSI_CACHE_SIZE`, HTTP multiplex, a low-speed timeout, and directory listing off for `/vsicurl/` only (path-specific, so local layers keep their `.ovr` sidecars)

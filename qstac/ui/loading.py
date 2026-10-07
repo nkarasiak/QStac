@@ -962,7 +962,7 @@ class LayerLoader(QObject):
         coll: CollectionInfo,
         catalog: CatalogProvider,
     ) -> None:
-        """Build one mosaicked layer from several scenes, off the GUI thread."""
+        """Mosaic several scenes off the GUI thread: one layer per CRS."""
         key = "mosaic:" + ",".join(sorted(it.id for it in items))
         if key in self._loading or key in self._added.values():
             return
@@ -1009,7 +1009,7 @@ class LayerLoader(QObject):
         catalog: CatalogProvider,
         ok: bool,
     ) -> None:
-        """Open the finished mosaic VRT on the GUI thread and add it."""
+        """Open the finished mosaic VRTs (one per CRS) on the GUI thread, add them."""
         self._loading.discard(key)
         if self._closed:
             return
@@ -1017,17 +1017,22 @@ class LayerLoader(QObject):
             self._flash("Mosaic canceled.")
             return
 
-        layer = None
-        if ok and task.mosaic_path:
+        layers = []
+        many = len(task.mosaics) > 1
+        for path, epsg, ids in task.mosaics if ok else []:
             layer = open_mosaic_layer(
-                task.mosaic_path,
-                name,
-                task.epsg,
+                path,
+                f"{name} · EPSG:{epsg}" if many else name,
+                epsg,
                 task.collection_info,
                 stretch_override=task.stretch_override,
                 stretch_baked=task.stretch_baked,
             )
-        if layer is None:
+            if layer is not None:
+                scenes = [it for it in items if it.id in ids]
+                stamp_layer(layer, scenes, task.collection_info, catalog, "Mosaic")
+                layers.append(layer)
+        if not layers:
             self._flash("Mosaic failed.")
             QMessageBox.warning(
                 self.parent(),
@@ -1036,14 +1041,14 @@ class LayerLoader(QObject):
             )
             return
 
-        stamp_layer(layer, items, task.collection_info, catalog, "Mosaic")
-        self._add_to_project([layer], task.collection_info.label)
-        self._added[layer.id()] = key
+        self._add_to_project(layers, task.collection_info.label)
+        for layer in layers:
+            self._added[layer.id()] = key
         total = len(items)
         if task.dropped:
             self._flash(
                 f"Mosaicked {total - task.dropped} of {total} scenes"
-                " (mixed projections)."
+                " (the others lack its bands)."
             )
         else:
             self._flash(f"Mosaic ({_scenes(total)}) loaded.")

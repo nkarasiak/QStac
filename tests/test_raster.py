@@ -20,6 +20,7 @@ os.environ.setdefault("PROJ_DATA", str(Path(sys.prefix) / "share" / "proj"))
 import numpy as np
 from osgeo import gdal
 
+import qstac.raster.layers as layers_mod
 from qstac.geo import _filter_by_overlap
 from qstac.raster.clip import _cog_geometry
 from qstac.raster.cog import (
@@ -139,6 +140,58 @@ def test_inline_vrt_is_a_datasource() -> None:
         vrt = gdal.Open(xml)
         assert vrt.GetRasterBand(1).GetScale() in (None, 1.0), "scale kept"
         assert _build_vrt("", [f"{tmp}/missing.tif"]) is None
+
+
+def test_default_nodata_only_fills_unmasked_sources() -> None:
+    """PC's TCI declares no nodata: a mosaic's black corner must not paint over."""
+    with tempfile.TemporaryDirectory() as tmp:
+        a = _tif(f"{tmp}/a.tif", np.array([[5, 5]], np.uint8), gdal.GDT_Byte)
+        b = _tif(f"{tmp}/b.tif", np.array([[0, 9]], np.uint8), gdal.GDT_Byte)
+        mosaic = gdal.Open(_build_vrt("", [a, b], default_nodata=0))
+        assert mosaic.ReadAsArray().tolist() == [[5, 9]], mosaic.ReadAsArray()
+        # A file's own nodata wins over the default.
+        ds = gdal.Open(b, gdal.GA_Update)
+        ds.GetRasterBand(1).SetNoDataValue(9)
+        ds = None
+        own = gdal.Open(_build_vrt("", [b], default_nodata=0))
+        assert own.GetRasterBand(1).GetNoDataValue() == 9
+        # A signed/float file (a DEM) never gets one: its 0 is sea level.
+        dem = _tif(f"{tmp}/d.tif", np.array([[0, 3]], np.int16), gdal.GDT_Int16)
+        dem_vrt = gdal.Open(_build_vrt("", [dem], default_nodata=0))
+        assert dem_vrt.GetRasterBand(1).GetNoDataValue() is None
+
+
+def test_mosaic_is_one_layer_per_crs_with_stored_statistics() -> None:
+    """Scenes either side of a UTM zone line all load, each zone its own VRT.
+
+    Its statistics are stored: QgsRasterLayer's constructor reads them instead
+    of computing a min/max on the GUI thread.
+    """
+    coll = SimpleNamespace(rgb_assets=("visual",), id="x")
+    with tempfile.TemporaryDirectory() as tmp:
+        parts = []
+        for epsg, x0, value in ((32631, 700000, 5), (32632, 260000, 9), (32631, 0, 7)):
+            path = f"{tmp}/{epsg}_{x0}.tif"
+            ds = gdal.GetDriverByName("GTiff").Create(path, 10, 10, 1, gdal.GDT_Byte)
+            ds.SetGeoTransform([x0, 1000, 0, 4820000, 0, -1000])
+            ds.SetProjection(f"EPSG:{epsg}")
+            ds.GetRasterBand(1).Fill(value)
+            ds = None
+            parts.append((f"{epsg}_{x0}", {"visual": path}, epsg, {}))
+        vsicurl, layers_mod._vsicurl = layers_mod._vsicurl, lambda href: href
+        try:
+            mosaics, dropped, _ = layers_mod._build_mosaic_vrt(parts, coll)
+        finally:
+            layers_mod._vsicurl = vsicurl
+        assert dropped == 0, dropped
+        assert [(e, sorted(ids)) for _, e, ids in mosaics] == [
+            (32631, ["32631_0", "32631_700000"]),
+            (32632, ["32632_260000"]),
+        ], mosaics
+        ds = gdal.Open(mosaics[1][0])
+        # What QGIS's GDAL provider asks first: stored stats, never computed.
+        stats = ds.GetRasterBand(1).GetStatistics(True, False)
+        assert stats[:2] == [9.0, 9.0], stats
 
 
 def test_invalid_footprint_is_kept() -> None:

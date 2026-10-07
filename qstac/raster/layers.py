@@ -25,7 +25,7 @@ from .cog import (
     configure_gdal_for_cog,
 )
 from .style import _apply_rgb_renderer, _apply_singleband_renderer, resolve_bake_stretch
-from .vrt import _band_type, _build_vrt, _write_vrt_xml
+from .vrt import _band_type, _build_vrt, _stac_nodata, _store_statistics, _write_vrt_xml
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -97,6 +97,7 @@ def build_layer(
             stretch_override,
             local_clips,
             layer_name=f"{item_id} [{rgb_assets[0]}]" if picked else item_id,
+            asset_proj=asset_proj,
         )
 
     return _build_rgb_vrt_layer(
@@ -144,17 +145,18 @@ def _remote_source(
     if not hrefs or not all(hrefs):
         return None
     sources = [_vsicurl(h) for h in hrefs]  # type: ignore[arg-type]
+    nodata = _stac_nodata((asset_proj or {}).get(asset_names[0]))
     if len(sources) == 1:
         # A bare /vsicurl/ COG costs ~6.5 MB per layer construction; behind a
         # VRT it constructs from the cached header (see _build_single_band_layer).
-        src = _build_vrt("", sources)
+        src = _build_vrt("", sources, default_nodata=nodata)
         return (src, False) if src else None
     if asset_proj and epsg and all(n in asset_proj for n in asset_names):
         # Fast path: VRT XML from STAC metadata (no HTTP).
         src = _write_vrt_xml("", sources, asset_names, epsg, asset_proj, bake_stretch)
         if src:
             return src, bake_stretch is not None
-    src = _build_vrt("", sources, separate=True)
+    src = _build_vrt("", sources, separate=True, default_nodata=nodata)
     return (src, False) if src else None
 
 
@@ -289,6 +291,7 @@ def _build_single_band_layer(
     stretch_override: tuple[float, float] | None = None,
     local_clips: dict[str, str] | None = None,
     layer_name: str = "",
+    asset_proj: dict[str, AssetProj] | None = None,
 ) -> QgsRasterLayer | None:
     """Build a single-asset raster layer.
 
@@ -309,7 +312,7 @@ def _build_single_band_layer(
             if not href:
                 return None
             _prewarm_sources([_vsicurl(href)])
-            built = _remote_source(assets, [asset_name], epsg, None)
+            built = _remote_source(assets, [asset_name], epsg, asset_proj)
             if built is None:
                 return None
             source = built[0]
@@ -480,19 +483,23 @@ def _build_mosaic_vrt(
     band_override: list[str] | None = None,
     stretch_override: tuple[float, float] | None = None,
     cancel_check: Callable[[], bool] | None = None,
-) -> tuple[str, int | None, int, bool] | None:
-    """Write the mosaic VRT for several STAC items — the network-heavy half.
+) -> tuple[list[tuple[str, int | None, list[str]]], int, bool] | None:
+    """Write the mosaic VRTs for several STAC items — the network-heavy half.
 
     *parts* is one ``(item_id, assets, epsg, asset_proj)`` tuple per scene,
-    with assets already signed. Returns
-    ``(mosaic_path, epsg, dropped_count, stretch_baked)``, or None when no
-    scene is usable.
+    with assets already signed. Returns ``(mosaics, dropped_count,
+    stretch_baked)``, *mosaics* being one ``(path, epsg, item_ids)`` per CRS,
+    largest first, or None when no scene is usable.
 
-    ``gdal.BuildVRT`` refuses inputs in mixed CRS, so items are grouped by
-    EPSG and only the largest group is mosaicked — the rest are reported as
-    dropped. Multi-band composites additionally need STAC projection metadata
-    and band types it can declare (the ``_write_vrt_xml`` fast path); items
-    without them are dropped too.
+    One mosaic per EPSG: ``gdal.BuildVRT`` refuses mixed CRS, and QGIS
+    reprojects each layer while rendering, from the COGs' overviews. Never
+    warp scenes into one CRS: a warped VRT has no overviews, so QGIS's
+    min/max at layer construction warped every pixel of the scenes on the
+    GUI thread (81 scenes froze QGIS). Each mosaic's statistics are stored
+    here instead (``_store_statistics``) so that construction reads none.
+    Multi-band composites additionally need STAC projection metadata and
+    band types it can declare (the ``_write_vrt_xml`` fast path); items
+    without them are reported as dropped.
     Parts and mosaic are temp files, so a saved project's mosaic does not
     outlive the session.
 
@@ -517,34 +524,56 @@ def _build_mosaic_vrt(
     if not groups:
         return None
 
-    epsg, group = max(groups.items(), key=lambda kv: len(kv[1]))
-    dropped = len(parts) - len(group)
-    bake = resolve_bake_stretch(collection_info, stretch_override)
-
-    inputs: list[str] = []
-    sources: list[str] = []
-    if len(band_names) == 1:
-        # Single asset (possibly itself multi-band, e.g. NAIP): BuildVRT can
-        # mosaic the COGs directly, no per-item VRT needed.
-        inputs = sources = [_vsicurl(a[band_names[0]]) for _, a, _ in group]
-        bake = None
-    else:
-        for item_id, assets, proj in group:
-            srcs = [_vsicurl(assets[n]) for n in band_names]
-            part_path = _vrt_path(f"{item_id}_mosaic_part.vrt")
-            _write_vrt_xml(part_path, srcs, band_names, epsg, proj, bake_stretch=bake)
-            inputs.append(part_path)
-            sources.extend(srcs)
+    bake = (
+        None
+        if len(band_names) == 1
+        else resolve_bake_stretch(collection_info, stretch_override)
+    )
+    built, sources = _mosaic_parts(groups, band_names, bake)
 
     _prewarm_sources(sources)
-    if cancel_check is not None and cancel_check():
+    mosaics: list[tuple[str, int | None, list[str]]] = []
+    for epsg in sorted(groups, key=lambda e: -len(groups[e])):
+        if cancel_check is not None and cancel_check():
+            return None
+        ids = [i for i, _, e in built if e == epsg]
+        path = _build_vrt(
+            _vrt_path(f"mosaic_{abs(hash('_'.join(sorted(ids)))):x}.vrt"),
+            [src for _, src, e in built if e == epsg],
+            default_nodata=_stac_nodata(groups[epsg][0][2].get(band_names[0])),
+        )
+        if path is not None and _store_statistics(path):
+            mosaics.append((path, epsg, ids))
+    if not mosaics:
         return None
+    dropped = len(parts) - sum(len(ids) for _, _, ids in mosaics)
+    return mosaics, dropped, bake is not None
 
-    ids = "_".join(sorted(i for i, _, _ in group))
-    mosaic_path = _build_vrt(_vrt_path(f"mosaic_{abs(hash(ids)):x}.vrt"), inputs)
-    if mosaic_path is None:
-        return None
-    return mosaic_path, epsg, dropped, bake is not None
+
+def _mosaic_parts(
+    groups: dict[int | None, list[tuple[str, dict[str, str], dict]]],
+    band_names: list[str],
+    bake: tuple[float, float] | None,
+) -> tuple[list[tuple[str, str, int | None]], list[str]]:
+    """((item id, mosaic input, its EPSG) per item, every COG they read).
+
+    An input is the COG itself for a single asset (possibly multi-band, e.g.
+    NAIP: BuildVRT mosaics the COGs directly), else a per-item VRT stacking
+    the bands.
+    """
+    built: list[tuple[str, str, int | None]] = []
+    sources: list[str] = []
+    for part_epsg, group in groups.items():
+        for item_id, assets, proj in group:
+            srcs = [_vsicurl(assets[n]) for n in band_names]
+            sources.extend(srcs)
+            if len(band_names) == 1:
+                built.append((item_id, srcs[0], part_epsg))
+                continue
+            part = _vrt_path(f"{item_id}_mosaic_part.vrt")
+            _write_vrt_xml(part, srcs, band_names, part_epsg, proj, bake_stretch=bake)
+            built.append((item_id, part, part_epsg))
+    return built, sources
 
 
 def open_mosaic_layer(

@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 from osgeo import gdal, osr
 
 from ..log import log
-from .vrt import _build_vrt
+from .vrt import _build_vrt, _stac_nodata
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -238,7 +238,9 @@ def _materialize_window_tiles(
             return out if tile is not None else None
 
         tiles = _run_hedged(translate, len(pieces), hedge_after, cancel)
-        return _build_vrt(f"{out_prefix}.vrt", tiles) if tiles else None
+        if not tiles:
+            return None
+        return _build_vrt(f"{out_prefix}.vrt", tiles, default_nodata=_stac_nodata(proj))
     except Exception as exc:
         if cancel is None or not cancel():
             log(f"Could not clip {url}: {exc}")
