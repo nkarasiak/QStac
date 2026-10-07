@@ -16,11 +16,12 @@ pages, not the server.
 
 A start opens on Planetary Computer › Sentinel-2 L2A
 (`DEFAULT_CATALOG`, `_DEFAULT_COLLECTION`; the `catalog` setting is reset to it
-at open): only the last search's dates come back, not its collection — the
-last one searched (a MODIS product, a DEM...) made a poor first view. The
-`start_on` setting (Settings > Catalogs, *Start on*) set to `last` keeps the
-catalog in use and reselects the collection last searched (`last_collection`,
-once listed when it is a discovered one).
+at open), on the default dates (`default_date_range`): neither the last
+search's collection nor its dates come back — the last one searched (a MODIS
+product, a DEM...) made a poor first view, and its *Any date* started the next
+one in 1900. The `start_on` setting (Settings > Catalogs, *Start on*) set to
+`last` keeps the catalog in use and brings back the collection last searched
+(`last_collection`, once listed when it is a discovered one) and its dates.
 
 The date buttons under the dates are the `date_buttons` setting, in its order
 (Settings > Search, a table: `settings_dialog._DatePresetEditor`): a number of

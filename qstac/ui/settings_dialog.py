@@ -494,7 +494,7 @@ class SettingsDialog(QDialog):
                         ", Sentinel-2 L2A",
                         "default",
                     ),
-                    ("The catalog and collection last searched", "last"),
+                    ("The catalog, collection and dates last searched", "last"),
                 ]
             ),
         )

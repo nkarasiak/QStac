@@ -577,9 +577,11 @@ class QStacDock(QDockWidget):
                 self.restoreGeometry(geom)
 
         ls = settings.last_search()
-        # The dates come back; the collection only with start_on "last".
+        # The collection and dates come back only with start_on "last": an
+        # "Any date" search starts the next Sentinel-2 view in 1900.
+        last = settings.start_on() == "last"
         coll_id = _DEFAULT_COLLECTION
-        if settings.start_on() == "last" and ls["collection"]:
+        if last and ls["collection"]:
             coll_id = str(ls["collection"])
         idx = self.combo_collection.findData(coll_id)
         if idx >= 0:
@@ -587,11 +589,11 @@ class QStacDock(QDockWidget):
         else:  # a discovered collection: picked once the listing lands
             self._pending_collection_id = coll_id
         # Block dateChanged so restoring date_from doesn't pop the calendar.
-        if ls["date_from"]:
+        if last and ls["date_from"]:
             self.date_from.blockSignals(True)
             self.date_from.setDate(QDate.fromString(str(ls["date_from"]), "yyyy-MM-dd"))
             self.date_from.blockSignals(False)
-        if ls["date_to"]:
+        if last and ls["date_to"]:
             self.date_to.setDate(QDate.fromString(str(ls["date_to"]), "yyyy-MM-dd"))
         # Cloud cover is intentionally NOT restored from the last search — the
         # configured default always wins, so the settings dialog stays the single
