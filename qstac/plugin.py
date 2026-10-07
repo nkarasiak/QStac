@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
     from .ui.dock import QStacDock
 
-_ICON_PATH = str(Path(__file__).parent / "icons" / "icon.png")
+_ICONS = Path(__file__).parent / "icons"
 _PLUGIN_NAME = "QStac"
 
 
@@ -28,7 +28,9 @@ class QStacPlugin:
         self.settings_action: QAction | None = None
 
     def initGui(self) -> None:  # noqa: N802
-        icon = QIcon(_ICON_PATH) if Path(_ICON_PATH).exists() else QIcon()
+        icon = QIcon()
+        for size in (16, 32):
+            icon.addFile(str(_ICONS / f"icon_{size}.png"))
         self.action = QAction(icon, _PLUGIN_NAME, self.iface.mainWindow())
         self.action.setCheckable(True)
         self.action.triggered.connect(self._toggle_dock)

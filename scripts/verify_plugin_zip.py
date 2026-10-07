@@ -22,7 +22,7 @@ from pathlib import Path
 REQUIRED = (
     "metadata.txt",
     "__init__.py",
-    "icons/icon.png",
+    "icons/icon_64.png",
     "LICENSE",
     "plugin.py",
     "stac/catalogs.py",

@@ -105,7 +105,7 @@ docs/                    One file per area, see "Where to read" above
 ### QGIS plugin contract
 
 - `qstac/__init__.py` must export `classFactory(iface)` — QGIS calls this. Keep it import-free at module level (`tests/test_collections.py` imports the package without QGIS)
-- `qstac/metadata.txt` and `qstac/icons/icon.png` sit beside it — QGIS reads them from the plugin folder
+- `qstac/metadata.txt` and its `icon=icons/icon_64.png` sit beside it — QGIS reads them from the plugin folder. 64 px exactly: the plugin manager shows it at 64 px without smoothing, so a larger file looks jagged
 - `qstac/` is the plugin directory (symlinked into the QGIS plugins folder); everything else at the repo root is dev-only and never ships
 - CI builds the zip with `git archive --prefix=qstac/ --add-file=LICENSE --add-file=README.md HEAD:qstac`
 
