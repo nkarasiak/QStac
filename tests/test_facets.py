@@ -96,6 +96,13 @@ def test_card_labels() -> None:
     )
     assert scene_name(es) == "Sentinel-2C \u00b7 tile 31TCJ"
     assert scene_date(es) == "unknown"
+    # Dotted ids carry tiles too; Sentinel-1's six-digit orbit is no path/row.
+    for fid, name in (
+        ("HLS.S30.T31TDN.2026274T105811.v2.0", "HLS \u00b7 tile 31TDN"),
+        ("MYD09Q1.A2026257.h18v04.061.2026266040354", "MYD09Q1 \u00b7 tile h18v04"),
+        ("S1C_IW_GRDH_1SDV_20261002T173124_20261002T173149_009709_013561", None),
+    ):
+        assert scene_name(_feature_to_result(_feat(fid), "x")) == name, fid
     # Nothing to name it by: the card falls back to the shortened id.
     assert scene_name(_feature_to_result(_feat("cop-dem_N47_E009"), "dem")) is None
     # A narrow dock shortens each line rather than cutting it.

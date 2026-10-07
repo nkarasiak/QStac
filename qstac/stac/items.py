@@ -124,10 +124,14 @@ def facet_counts(items: list[StacItemResult]) -> dict[str, Counter[str]]:
 _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")  # fmt: skip
 _ISO_DATE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
-# Tile tokens of an item id: MGRS (S2A_MSIL2A_..._T32UNU_...) and Landsat
-# WRS-2 path/row (LC08_L2SP_199030_...).
+# Tile tokens of an item id, split on "_" and ".": MGRS (S2A_MSIL2A_..._T32UNU_...,
+# HLS.S30.T31TDN...), MODIS (MYD09Q1.A2026257.h18v04...) and, on Landsat ids
+# only, WRS-2 path/row (LC08_L2SP_199030_...): Sentinel-1's absolute orbit
+# (..._009709_...) is six digits too.
 _MGRS_TOKEN = re.compile(r"^T(\d{2}[A-Z]{3})$")
+_MODIS_TOKEN = re.compile(r"^(h\d{2}v\d{2})$")
 _WRS_TOKEN = re.compile(r"^(\d{3})(\d{3})$")
+_ID_TOKENS = re.compile(r"[._]")
 
 
 def scene_date(item: StacItemResult) -> str:
@@ -156,10 +160,11 @@ def _tile(item: StacItemResult) -> str:
         return f"tile {f['grid:code'][5:]}"
     if "landsat:wrs_path" in f and "landsat:wrs_row" in f:
         return f"path/row {f['landsat:wrs_path']}/{f['landsat:wrs_row']}"
-    for token in item.id.split("_")[1:]:
-        if m := _MGRS_TOKEN.match(token):
+    landsat = item.id.startswith("L")
+    for token in _ID_TOKENS.split(item.id)[1:]:
+        if m := _MGRS_TOKEN.match(token) or _MODIS_TOKEN.match(token):
             return f"tile {m[1]}"
-        if m := _WRS_TOKEN.match(token):
+        if landsat and (m := _WRS_TOKEN.match(token)):
             return f"path/row {m[1]}/{m[2]}"
     return ""
 
@@ -174,7 +179,7 @@ def scene_name(item: StacItemResult) -> str | None:
     if platform:
         platform = _platform(platform)
     elif tile:
-        platform = item.id.split("_")[0]  # "S2A", "LC08"
+        platform = _ID_TOKENS.split(item.id)[0]  # "S2A", "LC08", "HLS"
     return " \u00b7 ".join(p for p in (platform, tile) if p) or None
 
 
