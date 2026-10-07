@@ -129,6 +129,34 @@ class TileCover:
         return sorted(self.picked, key=lambda i: i.datetime_str)
 
 
+def day_cover(
+    scenes: list[StacItemResult],
+    bbox: tuple[float, float, float, float],
+    area: QgsGeometry | None = None,
+) -> dict[str, float]:
+    """Per UTC day of *scenes*, the share (0-1) of the search area it covers.
+
+    *area* (WGS84) stands in for *bbox*, as in :func:`_filter_by_overlap`.
+    A day whose footprints say nothing (none, or GEOS failing) counts as
+    whole: never dropped for want of a shape.
+    """
+    area = area if area is not None else QgsGeometry.fromRect(QgsRectangle(*bbox))
+    total = area.area()
+    shapes: dict[str, QgsGeometry | None] = {}
+    for item in scenes:
+        day, shape = item.datetime_str[:10], _footprint(item)
+        have = shapes.get(day)
+        if shape is None or (day in shapes and have is None):
+            shapes[day] = None
+        else:
+            shapes[day] = shape if have is None else have.combine(shape)
+    cover = {}
+    for day, shape in shapes.items():
+        part = None if shape is None or total <= 0 else shape.intersection(area)
+        cover[day] = 1.0 if part is None or part.isNull() else part.area() / total
+    return cover
+
+
 def _filter_by_overlap(
     results: list[StacItemResult],
     search_bbox: tuple[float, float, float, float] | None,

@@ -22,7 +22,7 @@ from osgeo import gdal
 from qgis.core import QgsGeometry
 
 import qstac.raster.layers as layers_mod
-from qstac.geo import TileCover, _filter_by_overlap
+from qstac.geo import TileCover, _filter_by_overlap, day_cover
 from qstac.raster.clip import _cog_geometry
 from qstac.raster.cog import (
     _vrt_path,
@@ -227,6 +227,35 @@ def test_search_area_replaces_its_bbox() -> None:
     triangle = QgsGeometry.fromWkt("POLYGON((0 0, 10 10, 0 10, 0 0))")
     assert _filter_by_overlap([item], (0, 0, 10, 10), 1) == [item]
     assert _filter_by_overlap([item], (0, 0, 10, 10), 1, triangle) == []
+
+
+def test_day_cover_is_the_share_of_the_area() -> None:
+    """Two halves of one day make it whole; another day's sliver is a sliver."""
+
+    def scene(day: int, x0, x1, ring: bool = True):
+        box = [[x0, 0], [x1, 0], [x1, 1], [x0, 1], [x0, 0]]
+        return SimpleNamespace(
+            datetime_str=f"2026-09-{day:02d} 10:56",
+            geometry={"type": "Polygon", "coordinates": [box]} if ring else None,
+        )
+
+    cover = day_cover(
+        [
+            scene(1, 0, 0.5),
+            scene(1, 0.5, 1),
+            scene(2, 0.9, 1.5),  # a sliver, mostly outside
+            scene(3, 5, 6),  # outside: the bbox search's corner
+            scene(4, 0, 0.1),
+            scene(4, 0, 0, ring=False),  # no footprint: the day counts whole
+        ],
+        (0, 0, 1, 1),
+    )
+    rounded = {d[-2:]: round(c, 3) for d, c in cover.items()}
+    assert rounded == {"01": 1.0, "02": 0.1, "03": 0.0, "04": 1.0}, rounded
+    # A drawn area replaces its bbox: the west triangle of the square.
+    west = QgsGeometry.fromWkt("POLYGON((0 0, 0 1, 1 1, 0 0))")
+    half = day_cover([scene(1, 0, 0.5)], (0, 0, 1, 1), west)
+    assert abs(half["2026-09-01"] - 0.75) < 1e-6, half
 
 
 def test_gdal_options_keep_the_users_and_unset_ours() -> None:
@@ -497,7 +526,7 @@ def test_mosaic_by_time_takes_every_scene_of_the_dates() -> None:
     import qstac.stac.search_task as st
 
     def scene(fid: str, day: object) -> SimpleNamespace:
-        return SimpleNamespace(id=fid, datetime_str=f"{day} 10:30")
+        return SimpleNamespace(id=fid, datetime_str=f"{day} 10:30", geometry=None)
 
     seen: list[tuple[object, int | None]] = []
 
@@ -519,6 +548,7 @@ def test_mosaic_by_time_takes_every_scene_of_the_dates() -> None:
     assert [i.id for i in task.scenes] == [f"s{d}" for d in days], task.scenes
     assert all(cloud == 20 for _end, cloud in seen), seen  # no reach search
     assert not task.capped
+    assert task.day_cover == dict.fromkeys(days, 1.0), task.day_cover
 
 
 def test_new_layers_go_on_top() -> None:

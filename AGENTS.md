@@ -423,7 +423,10 @@ click builds, kept in the `mosaic_kind` setting: *Newest scene per tile*
 `_EveryScene` in place of `TileCover` takes every scene of the dates, no
 reach, the newest `_BY_TIME_MAX`; `_mosaic_per_date()` builds one mosaic per
 UTC day, `load_mosaic(stack=True)` so the time filter is not lifted, and
-`_show_time_slider()` steps the Temporal Controller through those days). Tried before: two equal
+`_show_time_slider()` steps the Temporal Controller through those days;
+over `_DATES_ASKED` (12) dates it asks first, via `_choose()`, whether to build
+only the 12 covering most of the area — `geo.day_cover()`, computed in the
+task — or all: over a wide area most dates are one orbit's strip of it). Tried before: two equal
 Search/Mosaic buttons, a Scenes | Mosaic mode switch, a text link under
 Search. It shows only for collections with `CollectionInfo.mosaic_reach_days`
 (the days within which every tile has a scene at any cloud cover: revisit
@@ -448,6 +451,8 @@ along its track (one pass, several products), so neither the relative orbit
 nor `s2:nodata_pixel_percentage` says what fills it (`_FILL_GAPS`: tried
 off, most of France showed the basemap). France and Iberia at 20%: 331 tiles,
 587 scenes, 3 s to search, 6 s to build.
+Over `_MOSAIC_ASKED` (1000, as *Load all*) scenes it asks before building
+(`_on_tiles_found()`): one long build, and every redraw zoomed out reads each.
 
 Loading several selected scenes from the load bar or Return/Space
 (`_shortcut_load()`) asks every time how: separate layers, mosaic or time

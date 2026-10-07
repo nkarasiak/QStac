@@ -13,12 +13,14 @@ from typing import TYPE_CHECKING
 
 from qgis.core import QgsTask
 
-from ..geo import TileCover
+from ..geo import TileCover, day_cover
 from .auth import request_headers
 from .net import StacError
 from .search import search_catalog, server_cloud_filter
 
 if TYPE_CHECKING:
+    from qgis.core import QgsGeometry
+
     from .catalogs import CatalogProvider
     from .items import StacItemResult
     from .search import PageToken
@@ -132,6 +134,7 @@ class TileSearchTask(QgsTask):
         http_timeout: int,
         reach_days: int = 10,
         by_time: bool = False,
+        area: QgsGeometry | None = None,
     ) -> None:
         super().__init__(f"Finding a scene for every tile of {collection}")
         self.catalog = catalog
@@ -145,6 +148,8 @@ class TileSearchTask(QgsTask):
         self.reach_days = reach_days
         self.by_time = by_time  # every scene of the dates (_EveryScene)
         self.capped = False  # by time: more than _BY_TIME_MAX scenes
+        self.area = area  # by time: a drawn or selected area (WGS84)
+        self.day_cover: dict[str, float] = {}  # by time: geo.day_cover()
         self.scenes: list[StacItemResult] = []
         self.missing: list[str] = []  # tiles never covered
         self.error: str | None = None
@@ -224,6 +229,8 @@ class TileSearchTask(QgsTask):
             self.scenes = cover.scenes()
             self.missing = cover.missing()
             self.capped = self.by_time and len(cover.found) > _BY_TIME_MAX
+            if self.by_time:  # here: it grows with the scenes
+                self.day_cover = day_cover(self.scenes, self.bbox, self.area)
             return True
         except Exception as e:
             self.error = f"{e}\n{traceback.format_exc()}"

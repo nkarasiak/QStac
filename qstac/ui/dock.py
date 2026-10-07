@@ -198,6 +198,12 @@ _DISCOVERY_CACHE: dict[str, tuple[CollectionInfo, ...]] = {}
 # "Load all" stops here: every card is a widget with a thumbnail, and the
 # list is rebuilt on each sort. "Load more results" goes on from there.
 _LOAD_ALL_MAX = 1000
+# A mosaic per date over more dates than this asks first: each is a build of
+# its own, and over a wide area most dates are one orbit's strip of it.
+_DATES_ASKED = 12
+# A tile mosaic of more scenes than this asks first: one long build, and each
+# redraw zoomed out reads every scene. The same 1000 as "Load all".
+_MOSAIC_ASKED = 1000
 
 # What the dock opens on, in DEFAULT_CATALOG.
 _DEFAULT_COLLECTION = "sentinel-2-l2a"
@@ -2311,6 +2317,7 @@ class QStacDock(QDockWidget):
             settings.http_timeout(),
             run.collection.mosaic_reach_days,
             by_time=settings.mosaic_kind() == "time",
+            area=run.area,
         )
         self._tile_task = task
         # A bound method: the signal comes from the worker thread.
@@ -2345,6 +2352,26 @@ class QStacDock(QDockWidget):
                     10,
                 )
             return
+        big = not task.by_time and len(task.scenes) > _MOSAIC_ASKED
+        if big and not self._choose(
+            "Build this mosaic?",
+            f"It takes {_scenes(len(task.scenes))}: one long build, and every"
+            " redraw zoomed out reads each of them. A smaller area builds"
+            " faster.",
+            [("mIconRaster.svg", "Build anyway", "One mosaic of them all.", True)],
+        ):
+            return
+        self._note_mosaic(task, run)
+        # Its own snapshot's collection: there may have been no search at all.
+        if task.by_time:
+            self._mosaic_per_date(
+                task.scenes, run.collection, run.catalog, task.day_cover
+            )
+        else:
+            self._load_mosaic(task.scenes, run.collection, run.catalog)
+
+    def _note_mosaic(self, task: TileSearchTask, run: _SearchRun) -> None:
+        """What the mosaic's scenes leave out or reach for, in the message bar."""
         notes = []
         oldest = task.scenes[0].datetime_str[:10]
         if oldest < run.date_from:
@@ -2360,22 +2387,51 @@ class QStacDock(QDockWidget):
             self._notify(
                 "Mosaic: " + "; ".join(notes) + ".", Qgis.MessageLevel.Info, 10
             )
-        # Its own snapshot's collection: there may have been no search at all.
-        if task.by_time:
-            self._mosaic_per_date(task.scenes, run.collection, run.catalog)
-        else:
-            self._load_mosaic(task.scenes, run.collection, run.catalog)
 
     def _mosaic_per_date(
         self,
         scenes: list[StacItemResult],
         coll: CollectionInfo,
         catalog: CatalogProvider,
+        cover: dict[str, float],
     ) -> None:
-        """One mosaic per (UTC) day, stepped through by the time slider."""
+        """One mosaic per (UTC) day, stepped through by the time slider.
+
+        Over _DATES_ASKED dates, asks whether to build only the ones covering
+        most of the area (*cover*: ``geo.day_cover()``) or all of them.
+        """
         days: dict[str, list[StacItemResult]] = {}
         for item in scenes:
             days.setdefault(item.datetime_str[:10], []).append(item)
+        if len(days) > _DATES_ASKED:
+            share = {d: cover.get(d, 1.0) for d in days}
+            best = sorted(days, key=share.__getitem__, reverse=True)[:_DATES_ASKED]
+            most = f"The {_DATES_ASKED} most complete dates"
+            picked = self._choose(
+                "Which dates?",
+                f"{len(days)} dates, {_scenes(len(scenes))}. Each date is a"
+                " mosaic of its own, built one after another. Build:",
+                [
+                    (
+                        "mIconRaster.svg",
+                        most,
+                        f"Each shows at least {share[best[-1]]:.0%} of the area.",
+                        True,
+                    ),
+                    (
+                        "mIconRasterGroup.svg",
+                        f"All {len(days)} dates",
+                        "The least complete shows"
+                        f" {min(share.values()):.0%} of the area.",
+                        True,
+                    ),
+                ],
+            )
+            if picked is None:
+                return
+            if picked == most:
+                days = {d: days[d] for d in sorted(best)}
+                scenes = [it for day in days.values() for it in day]
         self._zoom_on_open(scenes)
         for day in days.values():
             self._loader.load_mosaic(day, coll, catalog, stack=True)
