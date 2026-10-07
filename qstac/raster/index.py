@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from html import escape
 from typing import TYPE_CHECKING
 
@@ -44,6 +45,9 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 _INDEX_NODATA = -9999.0
+
+# Overview levels of a remote index VRT stop once the scene is this small.
+_MIN_OVERVIEW_PX = 256
 
 
 def _stats(lo: float, hi: float) -> dict[str, float]:
@@ -110,6 +114,14 @@ def _write_index_vrt_xml(
     on (A, B) for a plain normalized difference, :func:`expr_pixel_fn` for
     a preset with a formula — one band per channel for a colour composite.
     Output is resampled to the finest source grid.
+
+    A derived band gets no overviews from its sources (GDAL 3.12 still), so
+    every halving down to ``_MIN_OVERVIEW_PX`` is written as an inline
+    ``<Overview>``: the same VRT on a coarser grid, whose sources GDAL reads
+    from the COG's own overviews. Without them, QGIS's default-stretch
+    histogram at layer construction read a whole Sentinel-1 RTC scene at full
+    resolution through the pixel function (~24 s on the GUI thread, 2 GB),
+    and so did every zoomed-out render.
     Returns *vrt_path*, or with ``vrt_path=""`` the XML itself (no file).
     """
     projs = [asset_proj[n] for n in asset_names]
@@ -131,33 +143,56 @@ def _write_index_vrt_xml(
         )
         bands = [(_PIXEL_FN_NAME, args, (-1.0, 1.0))]
     finest = _finest_grid(asset_proj, asset_names)
-    sources_xml = "\n".join(
-        _source_xml(
-            src, asset_proj[name], finest, _band_type(asset_proj[name])[0] or "UInt16"
+
+    def bands_xml(grid: AssetProj, overviews: list[str]) -> list[str]:
+        sources_xml = "\n".join(
+            _source_xml(
+                src, asset_proj[name], grid, _band_type(asset_proj[name])[0] or "UInt16"
+            )
+            for src, name in zip(sources, asset_names, strict=True)
         )
-        for src, name in zip(sources, asset_names, strict=True)
-    )
-    xml = []
-    for i, (fn, args, (lo, hi)) in enumerate(bands, start=1):
-        stats_md = "".join(
-            f'      <MDI key="{k}">{v}</MDI>\n' for k, v in _stats(lo, hi).items()
+        xml = []
+        for i, (fn, args, (lo, hi)) in enumerate(bands, start=1):
+            stats_md = "".join(
+                f'      <MDI key="{k}">{v}</MDI>\n' for k, v in _stats(lo, hi).items()
+            )
+            overviews_xml = "".join(
+                "    <Overview>\n"
+                f'      <SourceFilename relativeToVRT="0">{escape(ov, quote=False)}'
+                "</SourceFilename>\n"
+                f"      <SourceBand>{i}</SourceBand>\n"
+                "    </Overview>\n"
+                for ov in overviews
+            )
+            xml.append(
+                f'  <VRTRasterBand dataType="Float32" band="{i}"'
+                f' subClass="VRTDerivedRasterBand">\n'
+                # Precomputed stats: without them QgsRasterLayer construction
+                # computes min/max itself, which reads pixels. A formula's
+                # range is unknown here: its ramp (or channel) range, else -1..1.
+                f"    <Metadata>\n{stats_md}    </Metadata>\n"
+                f"    <NoDataValue>{_INDEX_NODATA}</NoDataValue>\n"
+                f"    <PixelFunctionType>{fn}</PixelFunctionType>\n"
+                f"    <PixelFunctionLanguage>Python</PixelFunctionLanguage>\n"
+                f"    <PixelFunctionArguments {args} />\n"
+                f"{overviews_xml}"
+                f"{sources_xml}\n  </VRTRasterBand>"
+            )
+        return xml
+
+    overviews = []
+    h, w = finest.shape
+    t = finest.transform
+    factor = 2
+    while max(h, w) // factor >= _MIN_OVERVIEW_PX:
+        grid = replace(
+            finest,
+            shape=[-(-h // factor), -(-w // factor)],  # ceil: covers the edge
+            transform=[t[0] * factor, t[1], t[2], t[3], t[4] * factor, t[5]],
         )
-        xml.append(
-            f'  <VRTRasterBand dataType="Float32" band="{i}"'
-            f' subClass="VRTDerivedRasterBand">\n'
-            # Precomputed stats: without them QgsRasterLayer construction
-            # computes min/max itself, and a derived band has no overviews, so
-            # that pass ran the pixel function over the full 10980² scene
-            # (~20-30 s, GUI frozen). A formula's range is unknown here: its
-            # ramp (or channel) range, else -1..1.
-            f"    <Metadata>\n{stats_md}    </Metadata>\n"
-            f"    <NoDataValue>{_INDEX_NODATA}</NoDataValue>\n"
-            f"    <PixelFunctionType>{fn}</PixelFunctionType>\n"
-            f"    <PixelFunctionLanguage>Python</PixelFunctionLanguage>\n"
-            f"    <PixelFunctionArguments {args} />\n"
-            f"{sources_xml}\n  </VRTRasterBand>"
-        )
-    return _write_vrt_dataset(vrt_path, finest, epsg, xml)
+        overviews.append(_write_vrt_dataset("", grid, epsg, bands_xml(grid, [])))
+        factor *= 2
+    return _write_vrt_dataset(vrt_path, finest, epsg, bands_xml(finest, overviews))
 
 
 def _index_source(

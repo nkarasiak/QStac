@@ -300,6 +300,25 @@ def test_sentinel1_false_colour() -> None:
     assert (remote[:, 0, 2] == -9999).all(), remote
 
 
+def test_remote_index_has_overviews() -> None:
+    """A derived band gets no overviews from its sources: without inline ones,
+    QGIS's stretch histogram read a whole S1 RTC scene at layer construction."""
+    configure_gdal_for_cog()
+    with tempfile.TemporaryDirectory() as tmp:
+        a_p, b_p = f"{tmp}/a.tif", f"{tmp}/b.tif"
+        _tif(a_p, np.full((600, 1100), 3000, dtype=np.int16))
+        _tif(b_p, np.full((600, 1100), 1000, dtype=np.int16))
+        p = AssetProj([600, 1100], [30, 0, 500000, 0, -30, 4000000])
+        xml = _write_index_vrt_xml("", [a_p, b_p], ["a", "b"], 32631, {"a": p, "b": p})
+        ds = gdal.Open(xml)
+        band = ds.GetRasterBand(1)
+        # 1100 / 2 and / 4 stay >= 256 px; / 8 would not.
+        assert band.GetOverviewCount() == 2, band.GetOverviewCount()
+        ov = band.GetOverview(1)
+        assert (ov.XSize, ov.YSize) == (275, 150), (ov.XSize, ov.YSize)
+        assert abs(ov.ReadAsArray()[0, 0] - 0.5) < 1e-6  # (3000-1000)/(3000+1000)
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):
