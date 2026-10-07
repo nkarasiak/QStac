@@ -60,7 +60,9 @@ def _filter_by_overlap(
     search_bbox: tuple[float, float, float, float] | None,
     min_overlap_pct: int = 1,
 ) -> list[StacItemResult]:
-    """Keep only items whose geometry covers >= min_overlap_pct of the viewport."""
+    """Keep items whose overlap with the viewport is >= min_overlap_pct of
+    the smaller of the two: a scene wholly inside a country-wide view is kept,
+    a sliver at the edge of a zoomed-in view is not."""
     if search_bbox is None:
         return list(results)
 
@@ -87,7 +89,8 @@ def _filter_by_overlap(
         if intersection.isNull():  # GEOS still failed: keep rather than hide
             kept.append(item)
             continue
-        pct = (intersection.area() / viewport_area) * 100
+        smaller = min(viewport_area, item_geom.area()) or viewport_area
+        pct = (intersection.area() / smaller) * 100
         if pct >= min_overlap_pct:
             kept.append(item)
     return kept

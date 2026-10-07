@@ -302,11 +302,13 @@ class SettingsDialog(QDialog):
 
         self.spin_overlap = QSpinBox()
         self.spin_overlap.setRange(0, 100)
-        self.spin_overlap.setSuffix(" % of the map view")
+        self.spin_overlap.setSuffix(" % overlap")
         self.spin_overlap.setToolTip(
-            "Scenes that barely touch the map view are left out of the results."
+            "Scenes that barely touch the map view are left out of the results:"
+            " the share of the scene, or of the map view when it is the smaller,"
+            " that the two have in common."
         )
-        form.addRow("Hide scenes covering under:", self.spin_overlap)
+        form.addRow("Hide scenes overlapping under:", self.spin_overlap)
 
         self._tabs.addTab(tab, "Search")
 

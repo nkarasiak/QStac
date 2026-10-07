@@ -151,6 +151,18 @@ def test_invalid_footprint_is_kept() -> None:
     assert _filter_by_overlap([item], (0.5, 0.5, 1.5, 1.5)) == [item]
 
 
+def test_small_scene_in_wide_view_is_kept() -> None:
+    """A 1x1 tile inside an 18x9 view covers 0.6 % of it: still a match."""
+    tile = {
+        "type": "Polygon",
+        "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]],
+    }
+    item = SimpleNamespace(geometry=tile)
+    assert _filter_by_overlap([item], (-9, -4, 9, 5), 1) == [item]
+    # A sliver of a zoomed-in view stays hidden: 0.5 % of the view.
+    assert _filter_by_overlap([item], (0.995, 0, 1.995, 1), 1) == []
+
+
 def test_gdal_options_keep_the_users_and_unset_ours() -> None:
     restore_gdal_config()
     gdal.SetConfigOption("GDAL_NUM_THREADS", "2")  # set in QGIS's GDAL options
