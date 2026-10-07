@@ -1036,17 +1036,27 @@ class LayerLoader(QObject):
         coll: CollectionInfo,
         catalog: CatalogProvider,
         stack: bool = False,
+        index_preset: IndexPreset | None = None,
     ) -> None:
         """Mosaic several scenes off the GUI thread: one layer per CRS.
 
         *stack*: one frame of a time stack, meant to hide outside its date.
+        *index_preset*: the index each scene computes before mosaicking.
         """
         key = "mosaic:" + ",".join(sorted(it.id for it in items))
+        if index_preset is not None:
+            key += f"|{index_preset!r}"  # frozen: a changed formula is a new key
         if key in self._loading or key in self._added.values():
             return
-        # What one of these scenes shows on its own: the collection's default
-        # composite (Sentinel-1 false colour) when every scene has its bands.
-        preset = _load_preset(coll, items, None, None)
+        # What one of these scenes shows on its own: the index asked for, else
+        # the collection's default composite (Sentinel-1 false colour) when
+        # every scene has its bands.
+        preset = _load_preset(coll, items, None, index_preset)
+        if index_preset is not None and not any(
+            all(n in it.assets for n in preset.assets) for it in items
+        ):
+            self._flash(_missing_index_assets(items[0], preset))
+            return
         assets = list(preset.assets) if preset else _default_assets(coll)
         if self._refuse_unstreamable(items, assets, catalog):
             return

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import tempfile
 import time
+from types import SimpleNamespace
 
 import numpy as np
 from osgeo import gdal
@@ -74,6 +75,31 @@ def test_baked_index_matches_vrt() -> None:
     nir, red = 0.5 + offset, 0.15 + offset
     assert abs(got[0] - (nir - red) / (nir + red)) < 1e-4, got
     assert got[1] == -9999 and got[2] == 0, got
+
+
+def test_index_mosaic_computes_each_scene() -> None:
+    """An NDVI mosaic is each scene's NDVI side by side, not raw red."""
+    import qstac.raster.layers as layers_mod
+
+    ndvi = IndexPreset("NDVI", ("nir", "red"), "ndvi")
+    parts = []
+    with tempfile.TemporaryDirectory() as tmp:
+        for i, (nir, red) in enumerate(((3000, 1000), (2000, 2000))):
+            _tif(f"{tmp}/nir{i}.tif", np.array([[nir]], dtype=np.int16))
+            _tif(f"{tmp}/red{i}.tif", np.array([[red]], dtype=np.int16))
+            p = AssetProj([1, 1], [30, 0, 500000 + 30 * i, 0, -30, 4000000])
+            assets = {"nir": f"{tmp}/nir{i}.tif", "red": f"{tmp}/red{i}.tif"}
+            parts.append((f"s{i}", assets, 32631, {"nir": p, "red": p}))
+        vsicurl, layers_mod._vsicurl = layers_mod._vsicurl, lambda href: href
+        try:
+            built = layers_mod._build_mosaic_vrt(
+                parts, SimpleNamespace(rgb_assets=("red",), id="x"), index_preset=ndvi
+            )
+        finally:
+            layers_mod._vsicurl = vsicurl
+        assert built is not None
+        got = gdal.Open(built[0][0][0]).ReadAsArray()
+    assert np.allclose(got, [[0.5, 0.0]]), got
 
 
 def test_item_level_proj_feeds_every_asset() -> None:

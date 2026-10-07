@@ -152,7 +152,8 @@ has a layer in the project get an *On map* badge (`LayerLoader.addedChanged`,
 The result menu starts with *Add & zoom to scene* (*… to N scenes* for a
 selection: zooms, then loads, whatever `zoom_to_scene` says; zoom alone is
 the list's Z key), then the default load, mosaic and time stack, then submenus:
-*Band combinations*, *Spectral indices* (with *Custom index…*), *Load asset*,
+*Band combinations*, *Spectral indices* (with *Custom index…*; for several
+scenes also *Spectral index mosaic*, one mosaic of each scene's index), *Load asset*,
 then export and *Copy* (item ID, asset URL). *Load asset* lists every raster
 as "name — title", in natural order (B2 before B10), `data`/`visual` assets
 first; a JPEG 2000 twin of a COG (`nir-jp2` beside `nir`) is hidden. Items

@@ -2245,12 +2245,13 @@ class QStacDock(QDockWidget):
         items: list[StacItemResult],
         coll: CollectionInfo,
         catalog: CatalogProvider,
+        index_preset: IndexPreset | None = None,
     ) -> None:
         items = self._one_orbit(items)
         if not items:
             return
         self._zoom_on_open(items)
-        self._loader.load_mosaic(items, coll, catalog)
+        self._loader.load_mosaic(items, coll, catalog, index_preset=index_preset)
 
     def _sync_mosaic_button(self, progress: float = 0.0) -> None:
         """The area caption, and the 9-square button: its rule, or progress.
@@ -2551,20 +2552,7 @@ class QStacDock(QDockWidget):
                 action = bands.addAction(preset.label)
                 action.triggered.connect(self._make_preset_add_handler(targets, preset))
 
-        # Indices: the curated ones, then templates and the user's saved
-        # ones whose variables this scene's assets resolve, then a new one.
-        indices = menu.addMenu("Spectral indices" + suffix)
-        curated = list(coll.index_presets)
-        extra = custom_index_presets(item, {p.label for p in curated})
-        for index_preset in curated + extra:
-            action = indices.addAction(index_preset.label)
-            action.triggered.connect(
-                self._make_index_add_handler(targets, index_preset)
-            )
-        if not indices.isEmpty():
-            indices.addSeparator()
-        custom_action = indices.addAction("Custom index…")
-        custom_action.triggered.connect(lambda: self._custom_index(item, targets))
+        self._add_index_menus(menu, item, targets, coll, suffix)
 
         self._add_load_asset_menu(menu, item, targets, suffix)
 
@@ -2585,6 +2573,36 @@ class QStacDock(QDockWidget):
         )
         self._add_copy_asset_menu(copy_menu, item, catalog)
         return menu
+
+    def _add_index_menus(
+        self,
+        menu: QMenu,
+        item: StacItemResult,
+        targets: list[StacItemResult],
+        coll: CollectionInfo,
+        suffix: str,
+    ) -> None:
+        """Indices: the curated ones, then templates and the user's saved ones
+        whose variables this scene's assets resolve, then a new one. Several
+        scenes: also as one mosaic, each scene's index mosaicked."""
+        curated = list(coll.index_presets)
+        extra = custom_index_presets(item, {p.label for p in curated})
+        submenus = [("Spectral indices" + suffix, False)]
+        if len(targets) > 1:
+            submenus.append((f"Spectral index mosaic ({len(targets)} scenes)", True))
+        for title, mosaic in submenus:
+            indices = menu.addMenu(title)
+            for index_preset in curated + extra:
+                action = indices.addAction(index_preset.label)
+                action.triggered.connect(
+                    self._make_index_add_handler(targets, index_preset, mosaic)
+                )
+            if not indices.isEmpty():
+                indices.addSeparator()
+            custom_action = indices.addAction("Custom index…")
+            custom_action.triggered.connect(
+                lambda _=False, m=mosaic: self._custom_index(item, targets, m)
+            )
 
     def _add_load_asset_menu(
         self,
@@ -2758,19 +2776,21 @@ class QStacDock(QDockWidget):
         return handler
 
     def _custom_index(
-        self, item: StacItemResult, targets: list[StacItemResult]
+        self, item: StacItemResult, targets: list[StacItemResult], mosaic: bool
     ) -> None:
         """Ask for an index over *item*'s assets, then load it for *targets*."""
         dlg = IndexDialog(item, self)
         if dlg.exec() == IndexDialog.DialogCode.Accepted and dlg.preset is not None:
-            self._add_items(
-                list(targets), key_suffix=index_key(dlg.preset), index_preset=dlg.preset
-            )
+            self._make_index_add_handler(targets, dlg.preset, mosaic)()
 
     def _make_index_add_handler(
-        self, items: list[StacItemResult], index_preset: IndexPreset
+        self, items: list[StacItemResult], index_preset: IndexPreset, mosaic: bool
     ) -> Callable[[], None]:
         def handler():
+            coll = self._item_collection(items[0])
+            if mosaic and coll is not None and self._run is not None:
+                self._load_mosaic(list(items), coll, self._run.catalog, index_preset)
+                return
             self._add_items(
                 list(items),
                 key_suffix=index_key(index_preset),

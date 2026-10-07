@@ -75,7 +75,9 @@ copied from PC's `mosaic/info` renderOptions); *Band combinations* keeps VV
 and VH as they are. A mosaic shows what one of its scenes shows: the
 default composite, computed per scene (`_write_index_vrt_xml` parts, with
 their overviews) and mosaicked (`_build_mosaic_vrt(index_preset=)`), when every
-scene has its bands. *Save clipped GeoTIFF* still uses VV. Every mosaic goes
+scene has its bands. Several selected scenes' *Spectral index mosaic* menu
+mosaics an index the same way (`load_mosaic(index_preset=)`), from scenes
+with projection metadata only (so never MODIS on PC). *Save clipped GeoTIFF* still uses VV. Every mosaic goes
 through `QStacDock._load_mosaic()`, which asks *Which orbit?* when its scenes
 mix `sat:orbit_state` (`_one_orbit()`, the `_choose()` dialog of command links
 also used by *Load N scenes*): radar sees a slope from opposite sides

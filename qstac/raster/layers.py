@@ -494,9 +494,9 @@ def _build_mosaic_vrt(
 ) -> tuple[list[tuple[str, int | None, list[str]]], int, bool] | None:
     """Write the mosaic VRTs for several STAC items — the network-heavy half.
 
-    With *index_preset* (a collection's default composite, e.g. Sentinel-1
-    false colour) each scene is the derived VRT a single load shows, so the
-    mosaic looks like its scenes.
+    With *index_preset* (a spectral index, or a collection's default
+    composite, e.g. Sentinel-1 false colour) each scene is the derived VRT a
+    single load shows, so the mosaic looks like its scenes.
 
     *parts* is one ``(item_id, assets, epsg, asset_proj)`` tuple per scene,
     with assets already signed. Returns ``(mosaics, dropped_count,
@@ -541,10 +541,11 @@ def _build_mosaic_vrt(
     # A baked or overridden stretch renders over a fixed range: its statistics
     # can be stored as is, so only headers need warming (the overviews were
     # read for statistics, 3/4 of a 600-scene mosaic's build). A composite's
-    # channels each have theirs (_apply_band_ranges): the stats go unused.
+    # channels each have theirs (_apply_band_ranges), an index its ramp's
+    # (_index_range): the stats go unused.
     if index_preset is not None:
         ranges = index_preset.rgb_ranges
-        fixed = ranges[0] if ranges else None
+        fixed = ranges[0] if ranges else (index_preset.vrange or (-1.0, 1.0))
     else:
         fixed = (0.0, 255.0) if bake is not None else stretch_override
     _prewarm_sources(sources, headers_only=fixed is not None)
@@ -607,7 +608,7 @@ def _mosaic_parts(
         for item_id, assets, proj in group:
             srcs = [_vsicurl(assets[n]) for n in band_names]
             sources.extend(srcs)
-            if len(band_names) == 1:
+            if len(band_names) == 1 and index_preset is None:
                 built.append((item_id, srcs[0], part_epsg))
                 continue
             part = _vrt_path(f"{item_id}_mosaic_part.vrt")
