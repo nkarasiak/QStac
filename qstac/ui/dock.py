@@ -446,7 +446,6 @@ class QStacDock(QDockWidget):
 
     def _clear_results(self) -> None:
         """Drop the result list, its thumbnails, paging and search."""
-        self._remove_load_more_item()
         self.list_results.clear()
         self._results.clear()
         self._facet_filter.clear()
@@ -455,6 +454,7 @@ class QStacDock(QDockWidget):
         self._next_page = None
         self._run = None
         self._sync_load_bar()
+        self._sync_more_bar()
 
     def _discover_collections(self) -> None:
         """Extend the curated registry with everything the provider serves.
@@ -1032,6 +1032,26 @@ class QStacDock(QDockWidget):
         layout.addWidget(self.label_empty, 1)
         self.list_results.setVisible(False)
 
+        # Paging bar: fixed under the list, not a row at its end, so that more
+        # scenes to fetch shows without scrolling to the bottom.
+        self.more_bar = QWidget()
+        more = QHBoxLayout(self.more_bar)
+        more.setContentsMargins(0, 2, 0, 0)
+        more.setSpacing(4)
+        for text, load_all, tip in (
+            ("Load more results", False, "The next page of scenes."),
+            ("Load all", True, f"Every remaining scene, up to {_LOAD_ALL_MAX} more."),
+        ):
+            btn = QPushButton(text)
+            btn.setFixedHeight(30)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setStyleSheet(styles.load_more_btn_style(P))
+            btn.setToolTip(tip)
+            btn.clicked.connect(lambda _=False, a=load_all: self._on_load_more(a))
+            more.addWidget(btn, 1 if load_all else 2)
+        self.more_bar.setVisible(False)
+        layout.addWidget(self.more_bar)
+
         # Load bar: shown while scenes are selected, so loading does not hang
         # on knowing to double-click. ▾ opens the same menu as a right-click.
         self.load_bar = QWidget()
@@ -1056,8 +1076,6 @@ class QStacDock(QDockWidget):
         self.load_bar.setVisible(False)
         layout.addWidget(self.load_bar)
 
-        self._load_more_item: QListWidgetItem | None = None
-
     def _notify(self, text: str, level: Qgis.MessageLevel, duration: int) -> None:
         """Push *text* to the QGIS message bar."""
         self.iface.messageBar().pushMessage("QStac", text, level, duration)
@@ -1067,6 +1085,12 @@ class QStacDock(QDockWidget):
         self.label_empty.setVisible(not visible)
         self.list_results.setVisible(visible)
         self._sync_load_bar()
+        self._sync_more_bar()
+
+    def _sync_more_bar(self) -> None:
+        """Show "Load more results / Load all" while another page can be fetched."""
+        idle = not self._search_in_flight() and not self.list_results.isHidden()
+        self.more_bar.setVisible(self._next_page is not None and idle)
 
     def _sync_load_bar(self) -> None:
         """Show the load bar while scenes are selected, counting them."""
@@ -1191,8 +1215,7 @@ class QStacDock(QDockWidget):
 
         The list is in ExtendedSelection mode, so a range or ctrl-click
         selection is expected to load as a batch rather than silently
-        collapsing to the current row. Skips the trailing "Load more results" row,
-        which carries no item.
+        collapsing to the current row.
         """
         items = [
             it
@@ -1568,6 +1591,7 @@ class QStacDock(QDockWidget):
         self.btn_search.setEnabled(True)
         self.btn_search.setText("Cancel search")
         self.btn_search.setStyleSheet(styles.outline_btn_style(P))
+        self._sync_more_bar()
 
     def _restore_search_button(self) -> None:
         """Return the search button to its idle 'Search' appearance."""
@@ -1586,8 +1610,7 @@ class QStacDock(QDockWidget):
         self._stop_progress()
         self._restore_search_button()
         self._set_status("Search canceled.")
-        if self._next_page is not None:
-            self._add_load_more_item()  # a canceled "Load more results" can retry
+        self._sync_more_bar()  # a canceled "Load more results" can retry
 
     def _on_search(self) -> None:
         coll = self._current_collection()
@@ -1626,7 +1649,6 @@ class QStacDock(QDockWidget):
         if token is None or run is None or run.task is not None:
             return
 
-        self._remove_load_more_item()
         if not load_all:
             self._flash_status("Searching for more…", ms=0)
             self._launch_search(run, page_token=token)
@@ -1669,43 +1691,6 @@ class QStacDock(QDockWidget):
         self._start_progress()
         self._show_search_area(run.bbox)
         self._loader.run_task(task)
-
-    def _add_load_more_item(self) -> None:
-        self._remove_load_more_item()
-
-        row = QWidget()
-        lay = QHBoxLayout(row)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
-        for text, load_all, tip in (
-            ("Load more results", False, "The next page of scenes."),
-            (
-                "Load all",
-                True,
-                f"Every remaining scene, up to {_LOAD_ALL_MAX} more.",
-            ),
-        ):
-            btn = QPushButton(text)
-            btn.setFixedHeight(32)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setStyleSheet(styles.load_more_btn_style(P))
-            btn.setToolTip(tip)
-            btn.clicked.connect(lambda _=False, a=load_all: self._on_load_more(a))
-            lay.addWidget(btn, 2 if not load_all else 1)
-
-        item = QListWidgetItem(self.list_results)
-        item.setSizeHint(QSize(0, 40))
-        item.setFlags(Qt.ItemFlag.NoItemFlags)
-        self.list_results.addItem(item)
-        self.list_results.setItemWidget(item, row)
-        self._load_more_item = item
-
-    def _remove_load_more_item(self) -> None:
-        if self._load_more_item is not None:
-            row = self.list_results.row(self._load_more_item)
-            if row >= 0:
-                self.list_results.takeItem(row)
-            self._load_more_item = None
 
     def _finish_search_task(self, task: StacSearchTask) -> _SearchRun | None:
         """The run *task* belongs to, if it is still the one in flight."""
@@ -1837,13 +1822,13 @@ class QStacDock(QDockWidget):
         self.btn_filter.setText(f"Filter ({n})" if n else "Filter")
         self.btn_filter.setVisible(bool(n or facet_counts(self._results)))
         total = len(self._results)
-        # A full page is not the whole answer: say there is more, and where.
-        more = " \u00b7 more below" if self._next_page is not None else ""
+        # A full page is not the whole answer (the paging bar offers the rest).
+        more = self._next_page is not None
         if n:
             shown = len(self._sorted_results())
-            self._set_status(f"{shown} of {total} scenes shown{more}")
+            self._set_status(f"{shown} of {total}{'+' if more else ''} scenes shown")
         elif more:
-            self._set_status(f"First {_scenes(total)}{more}")
+            self._set_status(f"First {_scenes(total)}")
         else:
             self._set_status(f"{_scenes(total)} found.")
 
@@ -1856,7 +1841,6 @@ class QStacDock(QDockWidget):
         holding a pointer that dies on the next event-loop turn — a segfault on
         the following paint. Called after search completion and sort changes.
         """
-        self._remove_load_more_item()
         self._thumbs.forget_cards()  # deleted with their rows
         while self.list_results.count():
             self.list_results.takeItem(0)
@@ -1870,10 +1854,9 @@ class QStacDock(QDockWidget):
             self.list_results.addItem(list_item)
             self.list_results.setItemWidget(list_item, card)
 
-        if self._next_page is not None and not self._search_in_flight():
-            self._add_load_more_item()
         self._sync_on_map()
         self._sync_load_bar()
+        self._sync_more_bar()
 
     def _on_search_failed(self, task: StacSearchTask) -> None:
         # taskTerminated also fires on user cancel — _cancel_search already
@@ -1883,8 +1866,7 @@ class QStacDock(QDockWidget):
             return
 
         self._set_status("Search failed.")
-        if self._next_page is not None:
-            self._add_load_more_item()  # a failed "Load more results" can retry
+        self._sync_more_bar()  # a failed "Load more results" can retry
 
         kind = task.error_kind
         raw = task.error or "Unknown error"

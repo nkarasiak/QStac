@@ -182,11 +182,11 @@ def results_list_style(p: Palette) -> str:
 
 
 def load_more_btn_style(p: Palette) -> str:
-    """The outlined "Load more results" row at the end of the list."""
+    """The outlined "Load more results" / "Load all" buttons under the list."""
     return (
         f"QPushButton {{ background: transparent; color: {p.accent};"
         f" border: 1px solid {p.accent}; border-radius: 4px;"
-        f" font-size: {fs(0.92)}; margin: 4px 8px; }}"
+        f" font-size: {fs(0.92)}; }}"
         f"QPushButton:hover {{ background: {p.accent_bg}; }}"
         f"QPushButton:pressed {{ background: {p.btn_pressed}; }}"
     )

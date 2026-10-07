@@ -378,8 +378,10 @@ ends (`_stop_progress()`). A result card leads with the day it was taken
 (`stac.items.scene_date()`, "29 Jul 2025"), then the satellite and tile
 (`scene_name()`, "Sentinel-2A · tile 32UNU", from `platform` / `s2:mgrs_tile` /
 `grid:code` / WRS path/row properties or the id's tokens; else `_shorten_id()`).
-While another page exists the status reads "First N scenes · more below",
-not "N scenes found". Card text lines are `ElidedLabel`s (date, satellite,
+While another page exists the status reads "First N scenes", not "N scenes
+found", and *Load more results* / *Load all* sit fixed under the list
+(`more_bar`), not at its end: a newcomer must not have to scroll to learn
+there is more. Card text lines are `ElidedLabel`s (date, satellite,
 tile, one line each): the card is held to the list's width, so a label that
 cannot shrink overlaps the thumbnail in a narrow dock.
 
