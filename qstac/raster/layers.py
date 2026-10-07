@@ -25,7 +25,14 @@ from .cog import (
     configure_gdal_for_cog,
 )
 from .style import _apply_rgb_renderer, _apply_singleband_renderer, resolve_bake_stretch
-from .vrt import _band_type, _build_vrt, _stac_nodata, _store_statistics, _write_vrt_xml
+from .vrt import (
+    _band_type,
+    _build_vrt,
+    _stac_nodata,
+    _store_statistics,
+    _warm_histogram_sample,
+    _write_vrt_xml,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -33,7 +40,7 @@ if TYPE_CHECKING:
     from qgis.core import QgsMapSettings
 
     from ..stac.catalogs import CatalogProvider
-    from ..stac.collections import CollectionInfo
+    from ..stac.collections import CollectionInfo, IndexPreset
     from ..stac.items import AssetProj, StacItemResult
 
 __all__ = [
@@ -483,8 +490,13 @@ def _build_mosaic_vrt(
     band_override: list[str] | None = None,
     stretch_override: tuple[float, float] | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    index_preset: IndexPreset | None = None,
 ) -> tuple[list[tuple[str, int | None, list[str]]], int, bool] | None:
     """Write the mosaic VRTs for several STAC items — the network-heavy half.
+
+    With *index_preset* (a collection's default composite, e.g. Sentinel-1
+    false colour) each scene is the derived VRT a single load shows, so the
+    mosaic looks like its scenes.
 
     *parts* is one ``(item_id, assets, epsg, asset_proj)`` tuple per scene,
     with assets already signed. Returns ``(mosaics, dropped_count,
@@ -506,32 +518,36 @@ def _build_mosaic_vrt(
     Safe to call off the GUI thread: it only touches GDAL and the filesystem.
     """
     configure_gdal_for_cog()
-    band_names = list(band_override or collection_info.rgb_assets)
+    if index_preset is not None:
+        band_names = list(index_preset.assets)
+    else:
+        band_names = list(band_override or collection_info.rgb_assets)
     if not band_names:
         # No advertised bands: ``all(n in assets for n in [])`` is vacuously
         # true and would otherwise write a zero-band VRT.
         return None
 
-    groups: dict[int | None, list[tuple[str, dict[str, str], dict]]] = {}
-    for item_id, assets, epsg, proj in parts:
-        if not all(n in assets for n in band_names):
-            continue
-        if len(band_names) > 1 and not (
-            epsg and all(n in proj and _band_type(proj[n])[0] for n in band_names)
-        ):
-            continue
-        groups.setdefault(epsg, []).append((item_id, assets, proj))
+    groups = _mosaic_groups(parts, band_names, len(band_names) > 1 or index_preset)
     if not groups:
         return None
 
     bake = (
         None
-        if len(band_names) == 1
+        if len(band_names) == 1 or index_preset
         else resolve_bake_stretch(collection_info, stretch_override)
     )
-    built, sources = _mosaic_parts(groups, band_names, bake)
+    built, sources = _mosaic_parts(groups, band_names, bake, index_preset)
 
-    _prewarm_sources(sources)
+    # A baked or overridden stretch renders over a fixed range: its statistics
+    # can be stored as is, so only headers need warming (the overviews were
+    # read for statistics, 3/4 of a 600-scene mosaic's build). A composite's
+    # channels each have theirs (_apply_band_ranges): the stats go unused.
+    if index_preset is not None:
+        ranges = index_preset.rgb_ranges
+        fixed = ranges[0] if ranges else None
+    else:
+        fixed = (0.0, 255.0) if bake is not None else stretch_override
+    _prewarm_sources(sources, headers_only=fixed is not None)
     mosaics: list[tuple[str, int | None, list[str]]] = []
     for epsg in sorted(groups, key=lambda e: -len(groups[e])):
         if cancel_check is not None and cancel_check():
@@ -542,7 +558,8 @@ def _build_mosaic_vrt(
             [src for _, src, e in built if e == epsg],
             default_nodata=_stac_nodata(groups[epsg][0][2].get(band_names[0])),
         )
-        if path is not None and _store_statistics(path):
+        if path is not None and _store_statistics(path, fixed):
+            _warm_histogram_sample(path)
             mosaics.append((path, epsg, ids))
     if not mosaics:
         return None
@@ -550,17 +567,40 @@ def _build_mosaic_vrt(
     return mosaics, dropped, bake is not None
 
 
+def _mosaic_groups(
+    parts: list[tuple[str, dict[str, str], int | None, dict[str, AssetProj]]],
+    band_names: list[str],
+    needs_grid: bool,
+) -> dict[int | None, list[tuple[str, dict[str, str], dict]]]:
+    """The usable *parts* by EPSG: every band there, and (when *needs_grid*,
+    for a per-item VRT) the STAC grid and band types it is written from."""
+    groups: dict[int | None, list[tuple[str, dict[str, str], dict]]] = {}
+    for item_id, assets, epsg, proj in parts:
+        if not all(n in assets for n in band_names):
+            continue
+        if needs_grid and not (
+            epsg and all(n in proj and _band_type(proj[n])[0] for n in band_names)
+        ):
+            continue
+        groups.setdefault(epsg, []).append((item_id, assets, proj))
+    return groups
+
+
 def _mosaic_parts(
     groups: dict[int | None, list[tuple[str, dict[str, str], dict]]],
     band_names: list[str],
     bake: tuple[float, float] | None,
+    index_preset: IndexPreset | None = None,
 ) -> tuple[list[tuple[str, str, int | None]], list[str]]:
     """((item id, mosaic input, its EPSG) per item, every COG they read).
 
     An input is the COG itself for a single asset (possibly multi-band, e.g.
     NAIP: BuildVRT mosaics the COGs directly), else a per-item VRT stacking
-    the bands.
+    the bands, or computing *index_preset* (with its own overviews).
     """
+    # Lazy: index imports this module.
+    from .index import _write_index_vrt_xml
+
     built: list[tuple[str, str, int | None]] = []
     sources: list[str] = []
     for part_epsg, group in groups.items():
@@ -571,7 +611,14 @@ def _mosaic_parts(
                 built.append((item_id, srcs[0], part_epsg))
                 continue
             part = _vrt_path(f"{item_id}_mosaic_part.vrt")
-            _write_vrt_xml(part, srcs, band_names, part_epsg, proj, bake_stretch=bake)
+            if index_preset is not None:
+                _write_index_vrt_xml(
+                    part, srcs, band_names, part_epsg, proj, index_preset
+                )
+            else:
+                _write_vrt_xml(
+                    part, srcs, band_names, part_epsg, proj, bake_stretch=bake
+                )
             built.append((item_id, part, part_epsg))
     return built, sources
 
@@ -628,9 +675,12 @@ def _layer_start(lyr: object) -> QDateTime | None:
 def _deferred_tree_insert(layer_ids: list[str], group: str | None = None) -> None:
     """Insert layers into the layer tree if still alive in the project.
 
-    With *group*, layers go into a top-level group of that name (created at
-    the top of the tree when missing), newest scene first, so a set of dates
-    reads as a time stack in the legend and the Temporal Controller.
+    What was just added must show: with *group*, layers go into the group of
+    that name, moved to the top of its parent (or created at the top of the
+    tree), and they go on top of it. Only within one batch are they ordered
+    newest scene first, so a time stack reads as one in the legend and the
+    Temporal Controller; a date order across loads put an older scene, or a
+    reused group, under what was already there, hidden.
 
     Refetch project + root fresh — captured wrappers can be stale after
     project close, layer removal, or plugin reload.
@@ -642,29 +692,32 @@ def _deferred_tree_insert(layer_ids: list[str], group: str | None = None) -> Non
         tree_root = proj.layerTreeRoot()
         parent = tree_root
         if group:
-            parent = tree_root.findGroup(group) or tree_root.insertGroup(0, group)
+            parent = tree_root.findGroup(group)
+            if parent is None:
+                parent = tree_root.insertGroup(0, group)
+            elif parent.parent().children()[0] != parent:
+                # A layer tree node cannot move: a clone goes on top.
+                above, moved = parent.parent(), parent.clone()
+                above.insertChildNode(0, moved)
+                above.removeChildNode(parent)
+                parent = moved
+        layers = [proj.mapLayer(lid) for lid in layer_ids]
     except RuntimeError:
         return
-    for lid in layer_ids:
-        try:
-            lyr = proj.mapLayer(lid)
-            if lyr is None or sip.isdeleted(lyr):
-                continue
-            if tree_root.findLayer(lid) is not None:
-                continue
-            # Newest first: drop in above the first sibling not newer than us.
-            pos = 0
-            start = _layer_start(lyr)
-            if start is not None:
-                pos = len(parent.children())
-                for i, node in enumerate(parent.findLayers()):
-                    other = _layer_start(node.layer()) if node.layer() else None
-                    if other is not None and other <= start:
-                        pos = i
-                        break
+    layers = [lyr for lyr in layers if lyr is not None and not sip.isdeleted(lyr)]
+    layers = [lyr for lyr in layers if tree_root.findLayer(lyr.id()) is None]
+    # Newest first; undated ones (start None) after, in the order given.
+    dated = sorted(
+        (lyr for lyr in layers if _layer_start(lyr) is not None),
+        key=_layer_start,
+        reverse=True,
+    )
+    undated = [lyr for lyr in layers if _layer_start(lyr) is None]
+    try:
+        for pos, lyr in enumerate(dated + undated):
             parent.insertLayer(pos, lyr)
-        except RuntimeError:
-            continue
+    except RuntimeError:
+        return  # the tree went with its project
 
 
 def add_layers_to_project(

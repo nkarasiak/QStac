@@ -12,7 +12,7 @@ from qgis.PyQt.QtNetwork import QNetworkReply, QNetworkRequest
 
 from ..stac.net import StacError, same_origin
 from .constants import _sign_func
-from .widgets import _pixmap_to_base64, _ResultCard
+from .widgets import _ResultCard
 
 if TYPE_CHECKING:
     from ..stac.catalogs import CatalogProvider
@@ -101,6 +101,8 @@ class ThumbnailLoader(QObject):
         self._catalog = None
 
     def _fetch(self, item_id: str, url: str) -> None:
+        if item_id in self._pending or item_id in self._failed:
+            return  # on its way, or a badge to click for a retry
         if item_id in self._cache:
             self._paint(item_id, self._cache[item_id])
             return
@@ -149,8 +151,6 @@ class ThumbnailLoader(QObject):
 
         self._cache[item_id] = pixmap
         self._failed.discard(item_id)
-        # Pre-compute base64 for tooltip (avoids PNG compression on every hover)
-        self._b64[item_id] = _pixmap_to_base64(pixmap)
         self._paint(item_id, pixmap)
 
     def _abort(self, reply: QNetworkReply, item_id: str) -> None:

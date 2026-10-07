@@ -12,6 +12,7 @@ from qstac.stac.items import (
     facet_label,
     scene_date,
     scene_name,
+    short_forms,
 )
 
 
@@ -97,6 +98,13 @@ def test_card_labels() -> None:
     assert scene_date(es) == "unknown"
     # Nothing to name it by: the card falls back to the shortened id.
     assert scene_name(_feature_to_result(_feat("cop-dem_N47_E009"), "dem")) is None
+    # A narrow dock shortens each line rather than cutting it.
+    assert short_forms("3 Oct 2025") == ["3 Oct '25", "3 Oct"]
+    assert short_forms("Sentinel-2A") == ["S2A"]
+    assert short_forms("tile 31TEN") == ["31TEN"]
+    assert short_forms("path/row 199/030") == ["199/030"]
+    assert short_forms("5% clouds") == ["5%"]
+    assert short_forms("LC08") == []
 
 
 if __name__ == "__main__":

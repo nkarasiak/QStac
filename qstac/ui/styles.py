@@ -79,7 +79,9 @@ def combo_style(p: Palette) -> str:
         "}"
         f"QComboBox:hover {{ border-color: {p.border_strong}; }}"
         f"QComboBox:focus {{ border-color: {p.accent}; }}"
-        "QComboBox::drop-down { border: none; width: 22px; }"
+        # Transparent: an editable combo's (the collection one) drop-down
+        # otherwise takes a stylesheet theme's button fill (Night Mapping).
+        "QComboBox::drop-down { border: none; width: 22px; background: transparent; }"
         f'QComboBox::down-arrow {{ image: url("{chevron}");'
         "  width: 10px; height: 7px; }"
         "QComboBox QAbstractItemView {"
@@ -101,6 +103,8 @@ def date_edit_style(p: Palette) -> str:
         "}"
         f"QDateEdit:focus {{ border-color: {p.accent}; }}"
         "QDateEdit::drop-down { width: 0px; border: none; }"
+        # The theme's arrow image (Night Mapping) still paints on the border.
+        "QDateEdit::down-arrow { image: none; width: 0px; }"
     )
 
 

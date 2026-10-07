@@ -14,6 +14,7 @@ __all__ = [
     "facet_label",
     "scene_date",
     "scene_name",
+    "short_forms",
 ]
 
 # Post-search "Filter" choices are built from whatever properties the results
@@ -175,6 +176,24 @@ def scene_name(item: StacItemResult) -> str | None:
     elif tile:
         platform = item.id.split("_")[0]  # "S2A", "LC08"
     return " \u00b7 ".join(p for p in (platform, tile) if p) or None
+
+
+# Shorter ways to write a card line, tried in turn when it does not fit a
+# narrow dock: "3 Oct 2…" or "Sentinel-…" no longer say which scene it is.
+_SHORTER = (
+    (re.compile(r"(\d{1,2} \w{3}) \d\d(\d\d)"), (r"\1 '\2", r"\1")),  # 3 Oct '25
+    (re.compile(r"([A-Z])[a-z]+-(\w+)"), (r"\1\2",)),  # Sentinel-2A → S2A
+    (re.compile(r"(?:tile|path/row) (.+)"), (r"\1",)),  # tile 32UNU → 32UNU
+    (re.compile(r"(\d+%) clouds"), (r"\1",)),
+)
+
+
+def short_forms(text: str) -> list[str]:
+    """Shorter forms of a result card line, longest first; [] if none."""
+    for pattern, forms in _SHORTER:
+        if m := pattern.fullmatch(text):
+            return [m.expand(f) for f in forms]
+    return []
 
 
 def facet_label(key: str) -> str:

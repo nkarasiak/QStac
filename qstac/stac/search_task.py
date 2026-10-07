@@ -5,11 +5,15 @@ Kept apart so ``search.py`` stays stdlib-only and testable without QGIS.
 
 from __future__ import annotations
 
+import datetime
+import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 from qgis.core import QgsTask
 
+from ..geo import TileCover
 from .auth import request_headers
 from .net import StacError
 from .search import search_catalog, server_cloud_filter
@@ -19,7 +23,17 @@ if TYPE_CHECKING:
     from .items import StacItemResult
     from .search import PageToken
 
-__all__ = ["StacSearchTask"]
+__all__ = ["StacSearchTask", "TileSearchTask"]
+
+_DEEPEST_DAYS = 365  # how far before the start date a tile mosaic looks
+_WINDOW_DAYS = 2  # a tile mosaic's searches: about a page each over France
+_IN_FLIGHT = 8  # windows searched at once
+# Older scenes under a tile's newest where it is a sliver (TileCover). France
+# and Iberia take 587 scenes instead of 331, but tried without, most of
+# France showed the basemap: Sentinel-2's newest scene there is a strip.
+_FILL_GAPS = True
+_TRANSIENT = frozenset({"rate_limit", "timeout", "network", "server"})
+_RETRIES = 2  # per page, after search.py's own one retry on 429/5xx
 
 
 class StacSearchTask(QgsTask):
@@ -60,3 +74,160 @@ class StacSearchTask(QgsTask):
             self.error_kind = e.kind if isinstance(e, StacError) else "unknown"
             self.error = f"{e}\n{traceback.format_exc()}"
             return False
+
+
+# A mosaic "by time" keeps the newest this many scenes of its dates, as
+# "Load all" does its results: a mosaic layer's scenes are read at build.
+_BY_TIME_MAX = 1000
+
+
+class _EveryScene:
+    """A mosaic by time: every scene of the dates, the newest painted on top.
+
+    TileCover's interface, with no tile to cover: every window is read.
+    """
+
+    goal: dict = {}  # noqa: RUF012 (read only)
+
+    def __init__(self) -> None:
+        self.found: dict[str, StacItemResult] = {}
+
+    def add(self, items: list[StacItemResult]) -> None:
+        for item in items:
+            self.found.setdefault(item.id, item)
+
+    def missing(self) -> list[str]:
+        return []
+
+    def scenes(self) -> list[StacItemResult]:
+        """The newest _BY_TIME_MAX, oldest first."""
+        ordered = sorted(self.found.values(), key=lambda i: i.datetime_str)
+        return ordered[-_BY_TIME_MAX:]
+
+
+class TileSearchTask(QgsTask):
+    """The scenes of a tile mosaic: every tile covered, newest scenes first.
+
+    The dates are cut into _WINDOW_DAYS windows, searched _IN_FLIGHT at a
+    time and read newest first into a :class:`TileCover`, from *date_to*
+    back to _DEEPEST_DAYS before *date_from*, stopping once every tile is
+    covered. The last *reach_days* (the collection's revisit and publishing
+    delay: ``CollectionInfo.mosaic_reach_days``), searched alongside without
+    the cloud limit, say which tiles there are and how far their scenes
+    reach. One chain of next-page tokens took 30 s for France and Iberia;
+    windows need no token, so they run side by side. Items are trimmed to
+    what is used (the fields extension): *assets*, the footprint and the
+    properties.
+    """
+
+    def __init__(
+        self,
+        catalog: CatalogProvider,
+        collection: str,
+        bbox: tuple[float, float, float, float],
+        date_from: str,
+        date_to: str,
+        cloud: int | None,
+        assets: list[str],
+        http_timeout: int,
+        reach_days: int = 10,
+        by_time: bool = False,
+    ) -> None:
+        super().__init__(f"Finding a scene for every tile of {collection}")
+        self.catalog = catalog
+        self.collection = collection
+        self.bbox = bbox
+        self.date_from = date_from
+        self.date_to = date_to
+        self.cloud = cloud
+        self.assets = assets
+        self.http_timeout = http_timeout
+        self.reach_days = reach_days
+        self.by_time = by_time  # every scene of the dates (_EveryScene)
+        self.capped = False  # by time: more than _BY_TIME_MAX scenes
+        self.scenes: list[StacItemResult] = []
+        self.missing: list[str] = []  # tiles never covered
+        self.error: str | None = None
+
+    def _window(
+        self, end: datetime.date, cloud: int | None, headers: dict | None
+    ) -> list[StacItemResult]:
+        """Every scene of the _WINDOW_DAYS ending on *end*, page by page."""
+        cat = self.catalog
+        start = end - datetime.timedelta(days=_WINDOW_DAYS - 1)
+        fields = None
+        if cat.supports_fields:
+            parts = ["id", "collection", "geometry", "bbox", "properties"]
+            fields = {"include": parts + [f"assets.{a}" for a in self.assets]}
+        server_cloud = cat.supports_query and server_cloud_filter(cat, self.collection)
+        found: list[StacItemResult] = []
+        token = None
+        while not self.isCanceled():
+            for attempt in range(_RETRIES + 1):
+                try:
+                    items, token = search_catalog(
+                        self.collection,
+                        self.bbox,
+                        f"{start}T00:00:00Z/{end}T23:59:59Z",
+                        max_items=cat.page_limit,  # one full page per request
+                        cloud_cover_max=cloud,
+                        catalog_url=cat.search_url,
+                        page_limit=cat.page_limit,
+                        auth_headers=headers,
+                        http_timeout=self.http_timeout,
+                        page_token=token,
+                        cancel_check=self.isCanceled,
+                        server_side_cloud_filter=server_cloud,
+                        fields=fields,
+                    )
+                    break
+                except StacError as e:
+                    # Eight requests at once: a busy API may turn one away.
+                    if e.kind not in _TRANSIENT or attempt == _RETRIES:
+                        raise
+                    time.sleep(1 + attempt)
+            found += items
+            if token is None:
+                break
+        return found
+
+    def run(self) -> bool:
+        day = datetime.date.fromisoformat
+        step = datetime.timedelta(days=_WINDOW_DAYS)
+        last, deepest = day(self.date_to), day(self.date_from)
+        if not self.by_time:
+            deepest -= datetime.timedelta(days=_DEEPEST_DAYS)
+        ends = []
+        while last >= deepest:
+            ends.append(last)
+            last -= step
+        reach_ends = [] if self.by_time else ends[: -(-self.reach_days // _WINDOW_DAYS)]
+        pool = ThreadPoolExecutor(_IN_FLIGHT)
+        try:
+            headers = request_headers(self.catalog) or None
+            reach = [pool.submit(self._window, e, None, headers) for e in reach_ends]
+            window = [pool.submit(self._window, e, self.cloud, headers) for e in ends]
+            cover = (
+                _EveryScene()
+                if self.by_time
+                else TileCover([i for f in reach for i in f.result()], _FILL_GAPS)
+            )
+            for n, future in enumerate(window):
+                if self.isCanceled():
+                    return False
+                cover.add(future.result())
+                # No tile seen in the reach (none published lately): no goal
+                # to meet, so every window is read rather than none.
+                if cover.goal and not cover.missing():
+                    break
+                self.setProgress(100 * (n + 1) / len(window))
+            self.scenes = cover.scenes()
+            self.missing = cover.missing()
+            self.capped = self.by_time and len(cover.found) > _BY_TIME_MAX
+            return True
+        except Exception as e:
+            self.error = f"{e}\n{traceback.format_exc()}"
+            return False
+        finally:
+            # Windows not started yet are dropped; running ones end unread.
+            pool.shutdown(wait=False, cancel_futures=True)

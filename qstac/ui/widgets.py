@@ -10,15 +10,19 @@ from typing import TYPE_CHECKING
 from qgis.core import QgsCoordinateReferenceSystem, QgsRectangle
 from qgis.PyQt.QtCore import (
     QBuffer,
+    QDate,
     QEvent,
     QIODevice,
     QObject,
     QRectF,
+    QSize,
     Qt,
+    pyqtSignal,
 )
 from qgis.PyQt.QtGui import (
     QColor,
     QFont,
+    QIcon,
     QMouseEvent,
     QPainter,
     QPen,
@@ -29,6 +33,7 @@ from qgis.PyQt.QtWidgets import (
     QDateEdit,
     QHBoxLayout,
     QLabel,
+    QPushButton,
     QSizePolicy,
     QToolTip,
     QVBoxLayout,
@@ -36,7 +41,7 @@ from qgis.PyQt.QtWidgets import (
 )
 
 from ..geo import _transform_to_wgs84
-from ..stac.items import scene_date, scene_name
+from ..stac.items import scene_date, scene_name, short_forms
 from .constants import (
     _EMOJI_FONT_FAMILY,
     P,
@@ -54,6 +59,7 @@ __all__ = [
     "_CARD_H",
     "ClickableDateEdit",
     "ElidedLabel",
+    "MosaicButton",
     "RefreshingCombo",
     "_ResultCard",
     "_WheelGuard",
@@ -117,6 +123,19 @@ class ClickableDateEdit(QDateEdit):
         self.lineEdit().setReadOnly(True)
         self.lineEdit().setCursor(Qt.CursorShape.PointingHandCursor)
         self.lineEdit().installEventFilter(self)
+        self.calendarWidget().currentPageChanged.connect(self._on_page_changed)
+
+    def _on_page_changed(self, year: int, month: int) -> None:
+        """Keep the month or year navigated to, without waiting for a day click.
+
+        Otherwise closing the popup (a click elsewhere) drops the new year.
+        """
+        cw = self.calendarWidget()
+        # Only while the user browses: a date set in code also moves the page.
+        if not cw.isVisible():
+            return
+        day = min(cw.selectedDate().day(), QDate(year, month, 1).daysInMonth())
+        self.setDate(QDate(year, month, day))
 
     def show_calendar(self) -> None:
         """Show the calendar popup positioned below this widget."""
@@ -247,7 +266,8 @@ class _ResultCard(QWidget):
         # the list's width, so a label that cannot shrink in a narrow dock
         # spills over the thumbnail instead.
         # Title: the day it was taken, what a scene is mostly picked by.
-        self.title_label = ElidedLabel(scene_date(item))
+        date = scene_date(item)
+        self.title_label = ElidedLabel(date, shorter=short_forms(date))
         title_font = QFont()
         title_font.setBold(True)
         title_font.setPointSizeF(pt(1.0))
@@ -261,27 +281,28 @@ class _ResultCard(QWidget):
         name_font.setPointSizeF(pt(0.9))
         name = scene_name(item) or _shorten_id(item.id)
         for part in name.split(" \u00b7 ", 1) if scene_name(item) else [name]:
-            line = ElidedLabel(part)
+            line = ElidedLabel(part, shorter=short_forms(part))
             line.setFont(name_font)
             line.setStyleSheet(f"color: {P.text_muted};")
             info_layout.addWidget(line)
 
-        # Cloud cover with colored weather emoji
+        # Cloud cover with colored weather emoji; the text shortens to "5%".
         if item.cloud_cover is not None:
-            emoji = _cloud_emoji(item.cloud_cover)
-            cloud_html = (
+            emoji = QLabel(
                 f'<span style="font-family: {_EMOJI_FONT_FAMILY};'
-                f' font-size: {fs(0.92)};">{emoji}</span>'
-                f' <span style="color: {P.text_muted}; font-size: {fs(0.8)};">'
-                f"{item.cloud_cover:.0f}% clouds</span>"
+                f' font-size: {fs(0.92)};">{_cloud_emoji(item.cloud_cover)}</span>'
             )
-            self.cloud_label = QLabel()
-            self.cloud_label.setSizePolicy(
-                QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
-            )
-            self.cloud_label.setTextFormat(Qt.TextFormat.RichText)
-            self.cloud_label.setText(cloud_html)
-            info_layout.addWidget(self.cloud_label)
+            clouds = f"{item.cloud_cover:.0f}% clouds"
+            self.cloud_label = ElidedLabel(clouds, shorter=short_forms(clouds))
+            cloud_font = QFont()
+            cloud_font.setPointSizeF(pt(0.8))
+            self.cloud_label.setFont(cloud_font)
+            self.cloud_label.setStyleSheet(f"color: {P.text_muted};")
+            cloud_row = QHBoxLayout()
+            cloud_row.setSpacing(4)
+            cloud_row.addWidget(emoji)
+            cloud_row.addWidget(self.cloud_label, 1)
+            info_layout.addLayout(cloud_row)
 
         info_layout.addStretch()
         layout.addLayout(info_layout, 1)
@@ -409,12 +430,15 @@ class _ResultCard(QWidget):
         item = self.item
         rows: list[str] = []
 
-        # Thumbnail image (prefer pre-encoded base64 cache)
+        # Thumbnail image, PNG-encoded on the first hover only: encoding every
+        # reply's on arrival stalled the GUI when 1000 results came in.
         b64_cache = self._b64_cache
-        if b64_cache and item.id in b64_cache:
+        if b64_cache is not None and item.id in b64_cache:
             b64 = b64_cache[item.id]
         elif self._thumb_cache and item.id in self._thumb_cache:
             b64 = _pixmap_to_base64(self._thumb_cache[item.id])
+            if b64_cache is not None:
+                b64_cache[item.id] = b64
         else:
             b64 = None
         if b64:
@@ -458,6 +482,58 @@ class _ResultCard(QWidget):
         return f'<div style="{style}">{body}</div>'
 
 
+class MosaicButton(QPushButton):
+    """The tile mosaic button between Search and the area ▾: 9 squares.
+
+    The patchwork says "a mosaic" without a word (bright tiles a tile's
+    newest scene, faded ones older fill), and while it builds the tiles
+    fill in with its progress: the icon is the progress bar.
+    """
+
+    hovered = pyqtSignal(bool)  # True on enter, False on leave
+
+    # 3x3 tile opacities at rest: full = a tile's newest scene, faded = older.
+    _REST = (1.0, 1.0, 0.4, 0.4, 1.0, 1.0, 1.0, 0.4, 1.0)
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setFixedSize(34, 34)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setIconSize(QSize(20, 20))
+        self.set_progress(None)
+
+    def set_progress(self, progress: float | None) -> None:
+        """At rest (None), or *progress* % of the tiles filled in."""
+        side = self.iconSize().width()
+        dpr = self.devicePixelRatioF()
+        pm = QPixmap(round(side * dpr), round(side * dpr))
+        pm.setDevicePixelRatio(dpr)
+        pm.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pm)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        gap = max(1.0, side / 12)
+        cell = (side - 2 * gap) / 3
+        filled = 9 if progress is None else round(9 * progress / 100)
+        for i, alpha in enumerate(self._REST):
+            colour = QColor(P.accent if i < filled else P.border)
+            if progress is None:
+                colour.setAlphaF(alpha)
+            painter.setBrush(colour)
+            x, y = (i % 3) * (cell + gap), (i // 3) * (cell + gap)
+            painter.drawRoundedRect(QRectF(x, y, cell, cell), gap, gap)
+        painter.end()
+        self.setIcon(QIcon(pm))
+
+    def enterEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        self.hovered.emit(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        self.hovered.emit(False)
+        super().leaveEvent(event)
+
+
 class RefreshingCombo(QComboBox):
     """Combo box that refills itself (``on_open``) each time its list opens.
 
@@ -482,13 +558,19 @@ class ElidedLabel(QLabel):
     would widen the whole dock to fit it.
     """
 
-    def __init__(self, text: str = "", parent: QWidget | None = None):
+    def __init__(
+        self,
+        text: str = "",
+        parent: QWidget | None = None,
+        shorter: list[str] | None = None,
+    ):
         super().__init__(parent)
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self.setText(text)
+        self.setText(text, shorter)
 
-    def setText(self, text: str) -> None:  # noqa: N802 (Qt override)
-        self._full = text
+    def setText(self, text: str, shorter: list[str] | None = None) -> None:  # noqa: N802 (Qt override)
+        # The first of text, then its shorter forms, that fits; else the last, elided.
+        self._forms = [text, *(shorter or ())]
         self._elide()
 
     def resizeEvent(self, event) -> None:  # noqa: N802 (Qt override)
@@ -497,11 +579,12 @@ class ElidedLabel(QLabel):
 
     def _elide(self) -> None:
         width = self.contentsRect().width()
-        super().setText(
-            self.fontMetrics().elidedText(
-                self._full, Qt.TextElideMode.ElideRight, width
-            )
-        )
+        fm = self.fontMetrics()
+        elided = [
+            fm.elidedText(t, Qt.TextElideMode.ElideRight, width) for t in self._forms
+        ]
+        fits = (e for e, t in zip(elided, self._forms) if e == t)
+        super().setText(next(fits, elided[-1]))
 
 
 class _WheelGuard(QObject):

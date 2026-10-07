@@ -7,6 +7,7 @@ import html
 import platform
 import time
 import urllib.parse
+from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from pathlib import Path
@@ -33,6 +34,7 @@ from qgis.PyQt.QtCore import (
     QDir,
     QEvent,
     QObject,
+    QPoint,
     QSize,
     Qt,
     QTimer,
@@ -87,7 +89,7 @@ from ..stac.collections import merge_collections
 from ..stac.items import facet_counts, facet_label
 from ..stac.net import StacError
 from ..stac.search import PageToken, fetch_collections, fetch_root
-from ..stac.search_task import StacSearchTask
+from ..stac.search_task import StacSearchTask, TileSearchTask
 from . import styles
 from .area_tool import AreaTool
 from .collection_combo import _CollectionDelegate, _ComboFilter
@@ -117,12 +119,13 @@ from .widgets import (
     _CARD_H,
     ClickableDateEdit,
     ElidedLabel,
+    MosaicButton,
     RefreshingCombo,
     _WheelGuard,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable
 
     from qgis.gui import QgisInterface
 
@@ -138,8 +141,17 @@ __all__ = ["QStacDock"]
 _EMPTY_HINT = (
     "Pan and zoom the map to the area you want, then click Search to list"
     " matching scenes.\n\nDouble-click a result to load it, or right-click it"
-    " for band combinations, spectral indices and export."
+    " for band combinations, spectral indices and export.\n\nOr click the"
+    " 9 squares beside Search (Sentinel-2, Landsat) for one image of the"
+    " whole area: each tile's newest clear scene."
 )
+
+
+def _mosaic_assets(coll: CollectionInfo) -> list[str]:
+    """The assets a mosaic of *coll* may read: its default composite's too."""
+    extra = list(coll.default_preset.assets) if coll.default_preset else []
+    return list(dict.fromkeys(_default_assets(coll) + extra))
+
 
 # Start of the "All" date preset — older than any imagery a STAC API serves.
 _ANYTIME_START = QDate(1900, 1, 1)
@@ -187,7 +199,11 @@ _DISCOVERY_CACHE: dict[str, tuple[CollectionInfo, ...]] = {}
 # list is rebuilt on each sort. "Load more results" goes on from there.
 _LOAD_ALL_MAX = 1000
 
-# The idle Search button.
+# What the dock opens on, in DEFAULT_CATALOG.
+_DEFAULT_COLLECTION = "sentinel-2-l2a"
+
+# The map view as the area: the caption above Search reads "Area: this map
+# view" (drawn areas and selections say theirs the same way).
 _SEARCH_TEXT = "Search this map view"
 
 # Basemap added to an empty project, so there is something to zoom on.
@@ -267,6 +283,10 @@ class QStacDock(QDockWidget):
         self._resolve_task: QgsTask | None = None
         self._pending_collection_id: str | None = None
 
+        # Every start opens on the default catalog and its Sentinel-2 (see
+        # _restore_state): the last collection searched (a MODIS product, a
+        # DEM...) made a poor first view.
+        settings.save_all({"catalog": DEFAULT_CATALOG.id})
         self._catalog: CatalogProvider = self._resolve_catalog()
         self._collection_by_id: dict[str, CollectionInfo] = {
             c.id: c for c in self._catalog.collections
@@ -274,6 +294,7 @@ class QStacDock(QDockWidget):
         self._run: _SearchRun | None = None  # the search the results belong to
         self._results: list[StacItemResult] = []
         self._facet_filter: dict[str, str] = {}  # FACETS key → chosen value
+        self._tile_task: TileSearchTask | None = None  # Tile mosaic's search
         self._next_page: PageToken | None = None
         self._rubber_band: QgsRubberBand | None = None  # hovered footprint
         self._search_band: QgsRubberBand | None = None  # area being searched
@@ -541,14 +562,10 @@ class QStacDock(QDockWidget):
                 self.restoreGeometry(geom)
 
         ls = settings.last_search()
-        coll_id = ls["collection"]
-        if coll_id:
-            idx = self.combo_collection.findData(coll_id)
-            if idx >= 0:
-                self.combo_collection.setCurrentIndex(idx)
-            else:
-                # Not in the curated registry — retry once discovery lands.
-                self._pending_collection_id = coll_id
+        # The dates come back; the collection is always the default one.
+        idx = self.combo_collection.findData(_DEFAULT_COLLECTION)
+        if idx >= 0:
+            self.combo_collection.setCurrentIndex(idx)
         # Block dateChanged so restoring date_from doesn't pop the calendar.
         if ls["date_from"]:
             self.date_from.blockSignals(True)
@@ -611,7 +628,7 @@ class QStacDock(QDockWidget):
             "such as Sentinel-2 or Landsat. Type in the open list to filter it.",
         )
         self._build_collection_combo(layout)
-        layout.addSpacing(8)
+        layout.addSpacing(6)
         self._add_caption(layout, "Dates", "When the images were taken.")
         self._build_date_range(layout)
         layout.addSpacing(4)
@@ -700,7 +717,7 @@ class QStacDock(QDockWidget):
     def _build_collection_combo(self, layout: QVBoxLayout) -> None:
         """Build the collection dropdown."""
         self.combo_collection = QComboBox()
-        self.combo_collection.setMinimumHeight(32)
+        self.combo_collection.setMinimumHeight(28)
         # Without this the combo sizes itself to its widest entry, and a
         # discovered collection with a 90-character title drags the whole dock
         # out to ~600px. The row gives it every spare pixel anyway; this only
@@ -954,19 +971,34 @@ class QStacDock(QDockWidget):
         layout.addLayout(cloud_row)
 
     def _build_search_button(self, layout: QVBoxLayout) -> None:
-        """Build the search button."""
+        """The area caption, Search and the area ▾, then the mosaic link.
+
+        Search is the one primary action; the mosaic is a link under it, in
+        words that say what it does (two equal buttons, then a mode switch,
+        made a newcomer pick before understanding either).
+        """
         # "This map view": the search area is the map extent, which nothing
         # else on the dock says.
-        self.btn_search = QPushButton(_SEARCH_TEXT)
+        self.label_area = QLabel()
+        self.label_area.setToolTip(
+            "What Search and the mosaic cover: the map view, or a drawn area"
+            " or selected features picked from ▾"
+        )
+        self.label_area.setStyleSheet(
+            f"color: {P.text_dim}; font-size: {fs(0.85)}; font-weight: bold;"
+        )
+        layout.addWidget(self.label_area)
+        layout.addSpacing(2)
+        self.btn_search = QPushButton("Search")
         self.btn_search.setFixedHeight(34)
         self.btn_search.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_search.setToolTip(
-            "Search the area shown on the map, with the collection, dates and"
+            "List the scenes of the area, with the collection, dates and"
             " cloud limit above (Ctrl+Return)"
         )
         self.btn_search.setStyleSheet(styles.search_btn_style(P))
         # ▾: search a drawn area or selected features instead of the view.
-        self.btn_area = QPushButton("\u25be")
+        self.btn_area = QPushButton("▾")
         self.btn_area.setFixedSize(34, 34)
         self.btn_area.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_area.setToolTip(
@@ -979,7 +1011,12 @@ class QStacDock(QDockWidget):
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(4)
         row.addWidget(self.btn_search, 1)
+        # Last, after Search and its ▾ (one control): its own search from the
+        # same form, shown for the collections a tile mosaic was tried on.
+        self.btn_mosaic = MosaicButton()
+        self.btn_mosaic.setStyleSheet(styles.outline_btn_style(P))
         row.addWidget(self.btn_area)
+        row.addWidget(self.btn_mosaic)
         layout.addLayout(row)
 
     def _build_results_list(self, layout: QVBoxLayout) -> None:
@@ -1005,6 +1042,7 @@ class QStacDock(QDockWidget):
         ]
         self._sort_index = 0
         link_style = styles.link_btn_style(P)
+
         # Post-search refine by item properties (orbit, tile...); shown only
         # when the results differ on at least one of them.
         self.btn_filter = QPushButton("Filter")
@@ -1028,6 +1066,10 @@ class QStacDock(QDockWidget):
         self.list_results = QListWidget()
         self.list_results.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.list_results.setStyleSheet(styles.results_list_style(P))
+        # Cards are built as rows come into view (_fill_visible).
+        bar = self.list_results.verticalScrollBar()
+        bar.valueChanged.connect(self._fill_visible)
+        bar.rangeChanged.connect(self._fill_visible)  # the dock grew or shrank
         self.list_results.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
@@ -1182,6 +1224,15 @@ class QStacDock(QDockWidget):
         self.combo_catalog.currentIndexChanged.connect(self._on_catalog_changed)
         self.cloud_slider.valueChanged.connect(self._update_cloud_label)
         self.btn_search.clicked.connect(self._on_search_button)
+        self.btn_mosaic.clicked.connect(self._on_mosaic_clicked)
+        self.btn_mosaic.hovered.connect(self._preview_mosaic_area)
+        self.btn_mosaic.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.btn_mosaic.customContextMenuRequested.connect(self._show_mosaic_menu)
+        self.cloud_slider.valueChanged.connect(lambda _: self._sync_mosaic_button())
+        self.combo_collection.currentIndexChanged.connect(
+            lambda _: self._sync_mosaic_button()
+        )
+        self._sync_mosaic_button()
         self.list_results.itemDoubleClicked.connect(self._on_item_double_clicked)
         self.list_results.customContextMenuRequested.connect(self._on_context_menu)
         self.list_results.itemEntered.connect(self._on_item_hovered)
@@ -1189,6 +1240,7 @@ class QStacDock(QDockWidget):
         self.list_results.itemSelectionChanged.connect(self._sync_load_bar)
         self._loader.addedChanged.connect(self._sync_on_map)
         self.date_from.dateChanged.connect(self._on_date_from_changed)
+        self.date_to.dateChanged.connect(self._on_date_to_changed)
         # Only a date picked in the calendar moves on to the end date: not
         # one restored, set by a preset, or typed.
         self.date_from.calendarWidget().clicked.connect(
@@ -1309,8 +1361,7 @@ class QStacDock(QDockWidget):
         if area is not None and not area.isGeosValid():
             area = area.makeValid()  # a self-crossing polygon
         self._area, self._area_text = area, text
-        if not self._search_in_flight():
-            self.btn_search.setText(text)
+        self._sync_mosaic_button()  # and the area caption
         if area is not None:
             self._show_search_area(area)
         elif self._search_band is not None:
@@ -1417,23 +1468,75 @@ class QStacDock(QDockWidget):
         elif items:
             self._ask_load_many(items)
 
-    def _ask_load_many(self, items: list[StacItemResult]) -> None:
-        """Ask how to load several scenes: separate layers, mosaic, time stack.
+    def _choose(
+        self,
+        title: str,
+        question: str,
+        choices: Iterable[tuple[str, str, str, bool]],
+    ) -> str | None:
+        """The title of the (icon, title, text, enabled) choice picked, or None.
 
         One big button per choice with its meaning under it (Qt's command
         links), not a message box: there the explanations sat apart from
         buttons the platform reordered.
         """
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        layout = QVBoxLayout(dlg)
+        label = QLabel(question)
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        picked: list[str] = []
+        for icon_name, name, text, enabled in choices:
+            button = QCommandLinkButton(name, text)
+            button.setIcon(QgsApplication.getThemeIcon(icon_name))
+            button.setEnabled(enabled)
+            button.clicked.connect(
+                lambda _=False, t=name: (picked.append(t), dlg.accept())
+            )
+            layout.addWidget(button)
+        cancel = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        cancel.rejected.connect(dlg.reject)
+        layout.addWidget(cancel)
+        return picked[0] if dlg.exec() and picked else None
+
+    def _one_orbit(self, items: list[StacItemResult]) -> list[StacItemResult]:
+        """*items* of one orbit direction, asking which when they mix; [] if none.
+
+        Radar looks sideways: ascending and descending passes see a slope
+        from opposite sides, so a mosaic mixing them shows seams. Only radar
+        scenes (``sar:`` properties) are asked: Sentinel-2 items state both
+        directions too, and an optical mosaic does not care.
+        """
+        if not any(k.startswith("sar:") for it in items for k in it.facets):
+            return items
+        counts = Counter(it.facets.get("sat:orbit_state") for it in items)
+        counts.pop(None, None)
+        if len(counts) < 2:
+            return items
+        picked = self._choose(
+            "Which orbit?",
+            "These scenes were taken from both orbit directions, which see"
+            " the ground from opposite sides: a mosaic of both shows seams."
+            " Mosaic the scenes of:",
+            [
+                ("mIconRaster.svg", state.capitalize(), _scenes(n), True)
+                for state, n in counts.most_common()
+            ],
+        )
+        if picked is None:
+            return []
+        return [
+            it for it in items if it.facets.get("sat:orbit_state") == picked.lower()
+        ]
+
+    def _ask_load_many(self, items: list[StacItemResult]) -> None:
+        """Ask how to load several scenes: separate layers, mosaic, time stack."""
         coll = self._item_collection(items[0])
         if coll is None or self._run is None:
             return
         days = len({it.datetime_str[:10] for it in items})
-        dlg = QDialog(self)
-        dlg.setWindowTitle(f"Load {_scenes(len(items))}")
-        layout = QVBoxLayout(dlg)
         when = "all from one day" if days == 1 else f"from {days} different days"
-        layout.addWidget(QLabel(f"{_scenes(len(items))}, {when}. Load them as:"))
-        icon = QgsApplication.getThemeIcon
         choices = (
             ("mIconRasterGroup.svg", "Separate layers", "One layer per scene.", True),
             ("mIconRaster.svg", "Mosaic", "One image joining them all.", True),
@@ -1446,23 +1549,16 @@ class QStacDock(QDockWidget):
                 days > 1,
             ),
         )
-        picked: list[str] = []
-        for icon_name, title, text, enabled in choices:
-            button = QCommandLinkButton(title, text)
-            button.setIcon(icon(icon_name))
-            button.setEnabled(enabled)
-            button.clicked.connect(
-                lambda _=False, t=title: (picked.append(t), dlg.accept())
-            )
-            layout.addWidget(button)
-        cancel = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
-        cancel.rejected.connect(dlg.reject)
-        layout.addWidget(cancel)
-        if not dlg.exec() or not picked:
+        picked = self._choose(
+            f"Load {_scenes(len(items))}",
+            f"{_scenes(len(items))}, {when}. Load them as:",
+            choices,
+        )
+        if picked is None:
             return
-        if picked[0] == "Separate layers":
+        if picked == "Separate layers":
             self._add_items(items)
-        elif picked[0] == "Mosaic":
+        elif picked == "Mosaic":
             self._load_mosaic(items, coll, self._run.catalog)
         else:
             self._add_time_stack(items)
@@ -1494,6 +1590,10 @@ class QStacDock(QDockWidget):
     def _on_date_from_changed(self, new_date: QDate) -> None:
         if self.date_to.date() < new_date:
             self.date_to.setDate(new_date)
+
+    def _on_date_to_changed(self, new_date: QDate) -> None:
+        if self.date_from.date() > new_date:
+            self.date_from.setDate(new_date)
 
     def _open_date_to_calendar(self) -> None:
         self.date_to.show_calendar()
@@ -1732,7 +1832,7 @@ class QStacDock(QDockWidget):
     def _restore_search_button(self) -> None:
         """Return the search button to its idle 'Search' appearance."""
         self.btn_search.setEnabled(True)
-        self.btn_search.setText(self._area_text)
+        self.btn_search.setText("Search")
         self.btn_search.setStyleSheet(styles.search_btn_style(P))
         self.btn_area.setEnabled(True)
 
@@ -1749,13 +1849,33 @@ class QStacDock(QDockWidget):
         self._set_status("Search canceled.")
         self._sync_more_bar()  # a canceled "Load more results" can retry
 
-    def _on_search(self) -> None:
+    def _form_run(self) -> _SearchRun | None:
+        """The form as a search snapshot: catalog, collection, area, dates."""
         coll = self._current_collection()
         if coll is None:
             self._flash_status("No collection to search yet.")
-            return
+            return None
         if self.ensure_basemap():
-            return  # the whole world is in view: zoom in first
+            return None  # the whole world is in view: zoom in first
+        if self._area is None:
+            bbox = viewport_bbox_4326(self.iface.mapCanvas())
+        else:  # the server gets its bbox, the results are trimmed to its shape
+            r = self._area.boundingBox()
+            bbox = (r.xMinimum(), r.yMinimum(), r.xMaximum(), r.yMaximum())
+        return _SearchRun(
+            catalog=self._catalog,
+            collection=coll,
+            bbox=bbox,
+            area=self._area,
+            date_from=self.date_from.date().toString("yyyy-MM-dd"),
+            date_to=self.date_to.date().toString("yyyy-MM-dd"),
+            cloud=self.cloud_slider.value() if coll.has_cloud_cover else None,
+        )
+
+    def _on_search(self) -> None:
+        run = self._form_run()
+        if run is None:
+            return
 
         self._clear_footprint()
         self._clear_results()
@@ -1765,24 +1885,9 @@ class QStacDock(QDockWidget):
         self.btn_sort.setText(self._sort_text())
         self.btn_sort.setVisible(False)
 
-        date_from = self.date_from.date().toString("yyyy-MM-dd")
-        date_to = self.date_to.date().toString("yyyy-MM-dd")
         # Persist these params so the dock reopens here.
-        settings.save_last_search(coll.id, date_from, date_to)
-        if self._area is None:
-            bbox = viewport_bbox_4326(self.iface.mapCanvas())
-        else:  # the server gets its bbox, the results are trimmed to its shape
-            r = self._area.boundingBox()
-            bbox = (r.xMinimum(), r.yMinimum(), r.xMaximum(), r.yMaximum())
-        self._run = _SearchRun(
-            catalog=self._catalog,
-            collection=coll,
-            bbox=bbox,
-            area=self._area,
-            date_from=date_from,
-            date_to=date_to,
-            cloud=self.cloud_slider.value() if coll.has_cloud_cover else None,
-        )
+        settings.save_last_search(run.date_from, run.date_to)
+        self._run = run
         self._flash_status("Searching…", ms=0)
         self._launch_search(self._run)
 
@@ -1881,9 +1986,7 @@ class QStacDock(QDockWidget):
         self.btn_sort.setVisible(True)
         self._set_results_visible(True)
 
-        # Cards are created by _populate_list; fetch thumbnails once they exist.
-        self._populate_list()
-        self._thumbs.fetch(new_items, run.catalog)
+        self._populate_list()  # cards and thumbnails: the rows in view
         # Warm the COG headers of the new results (64 KB each) so a click's
         # first clip skips that round trip. Cheap enough to run for every page.
         self._loader.warm(new_items, run.collection, run.catalog)
@@ -1993,18 +2096,39 @@ class QStacDock(QDockWidget):
         while self.list_results.count():
             self.list_results.takeItem(0)
 
-        bbox = self._run.bbox if self._run else None
         for item in self._sorted_results():
-            card = self._thumbs.make_card(item, bbox)
             list_item = QListWidgetItem(self.list_results)
             list_item.setSizeHint(QSize(0, _CARD_H + 4))
             list_item.setData(Qt.ItemDataRole.UserRole, item)
             self.list_results.addItem(list_item)
-            self.list_results.setItemWidget(list_item, card)
 
-        self._sync_on_map()
+        QTimer.singleShot(0, self._fill_visible)  # once the rows are laid out
         self._sync_load_bar()
         self._sync_more_bar()
+
+    def _fill_visible(self) -> None:
+        """Give the rows in view (and a screen below) their card and thumbnail.
+
+        Only those: "Load all" brings 1000 results, and a card each, plus
+        1000 thumbnail replies decoded on the GUI thread, froze QGIS for 20 s.
+        """
+        view = self.list_results
+        if self._run is None or not view.count():
+            return
+        first = view.indexAt(view.viewport().rect().topLeft()).row()
+        rows_in_view = view.viewport().height() // (_CARD_H + 4) + 1
+        start = max(first, 0)
+        new: list[StacItemResult] = []
+        for row in range(start, min(start + 2 * rows_in_view, view.count())):
+            list_item = view.item(row)
+            if view.itemWidget(list_item) is not None:
+                continue
+            item = list_item.data(Qt.ItemDataRole.UserRole)
+            card = self._thumbs.make_card(item, self._run.bbox)
+            card.set_on_map(self._loader.is_on_map(item.id))
+            view.setItemWidget(list_item, card)
+            new.append(item)
+        self._thumbs.fetch(new, self._run.catalog)
 
     def _on_search_failed(self, task: StacSearchTask) -> None:
         # taskTerminated also fires on user cancel — _cancel_search already
@@ -2083,8 +2207,179 @@ class QStacDock(QDockWidget):
         coll: CollectionInfo,
         catalog: CatalogProvider,
     ) -> None:
+        items = self._one_orbit(items)
+        if not items:
+            return
         self._zoom_on_open(items)
         self._loader.load_mosaic(items, coll, catalog)
+
+    def _sync_mosaic_button(self, progress: float = 0.0) -> None:
+        """The area caption, and the 9-square button: its rule, or progress.
+
+        *progress* comes from the tile mosaic's task (a worker signal).
+        """
+        where = self._area_text.removeprefix("Search ")
+        self.label_area.setText(f"Area: {where}")
+        btn = self.btn_mosaic
+        if self._tile_task is not None:
+            btn.set_progress(progress)
+            btn.setToolTip(
+                f"Building the mosaic\u2026 {progress:.0f}% \u00b7 click to cancel"
+            )
+            btn.setVisible(True)  # whatever the collection is now
+            return
+        btn.set_progress(None)
+        coll = self._current_collection()
+        btn.setVisible(coll is not None and coll.mosaic_reach_days > 0)
+        cloud = self.cloud_slider.value()
+        has_limit = coll is not None and coll.has_cloud_cover and cloud < 100
+        limit = f" under {cloud}% clouds" if has_limit else ""
+        rule = (
+            f"one per date{limit}, with the time slider"
+            if settings.mosaic_kind() == "time"
+            else f"each tile's newest scene{limit}"
+        )
+        # Short: hovering also tints the area it covers on the map.
+        btn.setToolTip(f"Mosaic: {rule}\nRight-click: options")
+
+    def _show_mosaic_menu(self, pos: QPoint) -> None:
+        """Right-click on the 9 squares: which mosaic a click builds."""
+        menu = QMenu(self)
+        kind = settings.mosaic_kind()
+        for key, text, tip in (
+            (
+                "tile",
+                "Newest scene per tile",
+                "Back up to a year before the start date for a tile the dates"
+                " leave empty",
+            ),
+            (
+                "time",
+                "One mosaic per date, with the time slider",
+                "See the area change: the Temporal Controller steps through"
+                " the dates that have scenes",
+            ),
+        ):
+            action = menu.addAction(text)
+            action.setCheckable(True)
+            action.setChecked(key == kind)
+            action.setToolTip(tip)
+            action.triggered.connect(lambda _=False, k=key: self._set_mosaic_kind(k))
+        menu.setToolTipsVisible(True)
+        menu.exec(self.btn_mosaic.mapToGlobal(pos))
+
+    def _set_mosaic_kind(self, kind: str) -> None:
+        settings.save_all({"mosaic_kind": kind})
+        self._sync_mosaic_button()
+
+    def _on_mosaic_clicked(self) -> None:
+        if self._tile_task is not None:
+            self._tile_task.cancel()  # _on_tiles_found resets the button
+        else:
+            self._tile_mosaic()
+
+    def _preview_mosaic_area(self, on: bool) -> None:
+        """Hovering the mosaic row tints, on the map, what it would cover."""
+        if self._search_in_flight():
+            return  # the search's own tint
+        if on:
+            area = self._area
+            if area is None:
+                bbox = viewport_bbox_4326(self.iface.mapCanvas())
+                area = QgsGeometry.fromRect(QgsRectangle(*bbox))
+            self._show_search_area(area)
+        elif self._area is None and self._search_band is not None:
+            self._search_band.reset(QgsWkbTypes.GeometryType.Polygon)
+
+    def _tile_mosaic(self) -> None:
+        """Mosaic every tile of the form's area, its newest scenes on top.
+
+        A search of its own (TileSearchTask), going back in time for the
+        tiles the dates leave uncovered: the result list is not used.
+        """
+        run = self._form_run()
+        if run is None or self._tile_task is not None:
+            return
+        task = TileSearchTask(
+            run.catalog,
+            run.collection.id,
+            run.bbox,
+            run.date_from,
+            run.date_to,
+            run.cloud,
+            _mosaic_assets(run.collection),  # what the mosaic reads
+            settings.http_timeout(),
+            run.collection.mosaic_reach_days,
+            by_time=settings.mosaic_kind() == "time",
+        )
+        self._tile_task = task
+        # A bound method: the signal comes from the worker thread.
+        task.progressChanged.connect(self._sync_mosaic_button)
+        task.taskCompleted.connect(lambda: self._on_tiles_found(task, run))
+        task.taskTerminated.connect(lambda: self._on_tiles_found(task, run))
+        self._sync_mosaic_button()
+        self._loader.run_task(task)
+
+    def _on_tiles_found(self, task: TileSearchTask, run: _SearchRun) -> None:
+        if self._closed or task is not self._tile_task:
+            return
+        self._tile_task = None
+        self._sync_mosaic_button()
+        if task.isCanceled():
+            self._flash_status("Mosaic canceled.")
+            return
+        if not task.scenes:
+            if task.error:
+                log(task.error)
+                self._flash_status("Mosaic failed: see the QStac log.")
+            else:
+                limit = f" under {run.cloud}% clouds" if run.cloud is not None else ""
+                when = (
+                    f"from {run.date_from} to {run.date_to}"
+                    if task.by_time
+                    else f"in the year before {run.date_from}"
+                )
+                self._notify(
+                    f"No {run.collection.label} scene of this area{limit} {when}.",
+                    Qgis.MessageLevel.Info,
+                    10,
+                )
+            return
+        notes = []
+        oldest = task.scenes[0].datetime_str[:10]
+        if oldest < run.date_from:
+            notes.append(f"some tiles go back to {oldest}")
+        if task.capped:
+            notes.append(f"the newest {len(task.scenes)} scenes of the dates only")
+        if task.missing:
+            names = ", ".join(t.split()[-1] for t in task.missing[:6])
+            more = "\u2026" if len(task.missing) > 6 else ""
+            limit = f" under {run.cloud}% clouds" if run.cloud is not None else ""
+            notes.append(f"no scene{limit} in a year for {names}{more}")
+        if notes:
+            self._notify(
+                "Mosaic: " + "; ".join(notes) + ".", Qgis.MessageLevel.Info, 10
+            )
+        # Its own snapshot's collection: there may have been no search at all.
+        if task.by_time:
+            self._mosaic_per_date(task.scenes, run.collection, run.catalog)
+        else:
+            self._load_mosaic(task.scenes, run.collection, run.catalog)
+
+    def _mosaic_per_date(
+        self,
+        scenes: list[StacItemResult],
+        coll: CollectionInfo,
+        catalog: CatalogProvider,
+    ) -> None:
+        """One mosaic per (UTC) day, stepped through by the time slider."""
+        days: dict[str, list[StacItemResult]] = {}
+        for item in scenes:
+            days.setdefault(item.datetime_str[:10], []).append(item)
+        self._zoom_on_open(scenes)
+        for day in days.values():
+            self._loader.load_mosaic(day, coll, catalog, stack=True)
+        self._show_time_slider(scenes)
 
     def _on_item_double_clicked(self, list_item: QListWidgetItem) -> None:
         item = list_item.data(Qt.ItemDataRole.UserRole)
@@ -2341,6 +2636,10 @@ class QStacDock(QDockWidget):
         """
         self._loader.expect_time_stack(items)
         self._add_items(items)
+        self._show_time_slider(items)
+
+    def _show_time_slider(self, items: list[StacItemResult]) -> None:
+        """Step the map through the days of *items*, the Temporal Controller open."""
         enable_time_stack(self.iface.mapCanvas(), [it.datetime_str for it in items])
         for dw in self.iface.mainWindow().findChildren(QDockWidget):
             if dw.objectName() == "Temporal Controller":

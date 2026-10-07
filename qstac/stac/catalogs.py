@@ -26,6 +26,7 @@ class CatalogProvider:
     page_limit: int = 250
     supports_query: bool = False  # STAC query extension (server-side cloud filter)
     supports_sortby: bool = False  # STAC sortby extension
+    supports_fields: bool = False  # STAC fields extension (slimmer responses)
     asset_signer: str | None = None  # "pc_sas" for Planetary Computer, else None
     collections: tuple[CollectionInfo, ...] = ()
     # QGIS authentication config id (QgsAuthManager) applied to every API
@@ -70,6 +71,7 @@ EARTH_SEARCH_CATALOG = CatalogProvider(
     page_limit=100,
     supports_query=True,
     supports_sortby=True,
+    supports_fields=True,
     asset_signer=None,
     collections=tuple(EARTH_SEARCH_COLLECTIONS),
     # Requester-pays: usgs-landsat and naip-analytic answer 403 unsigned.
@@ -92,6 +94,7 @@ PLANETARY_COMPUTER_CATALOG = CatalogProvider(
     page_limit=250,
     supports_query=True,
     supports_sortby=True,
+    supports_fields=True,
     asset_signer="pc_sas",
     collections=tuple(PLANETARY_COMPUTER_COLLECTIONS),
 )
@@ -113,6 +116,7 @@ COPERNICUS_DATA_SPACE_CATALOG = CatalogProvider(
     page_limit=100,
     supports_query=True,
     supports_sortby=True,
+    supports_fields=True,
     # No curated registry: every collection is discovered.
     s3_bucket="eodata",
     s3_endpoint="eodata.dataspace.copernicus.eu",
@@ -215,13 +219,15 @@ def make_user_catalog(
 def with_conformance(
     catalog: CatalogProvider, conforms_to: list[str]
 ) -> CatalogProvider:
-    """*catalog* with ``supports_query``/``supports_sortby`` read from the
-    API root's ``conformsTo`` (``.../item-search#query``, ``#sort``)."""
+    """*catalog* with ``supports_query``/``supports_sortby``/``supports_fields``
+    read from the API root's ``conformsTo`` (``.../item-search#query``,
+    ``#sort``, ``#fields``)."""
     uris = [str(u) for u in conforms_to or ()]
     return replace(
         catalog,
         supports_query=any("item-search#query" in u for u in uris),
         supports_sortby=any("item-search#sort" in u for u in uris),
+        supports_fields=any("item-search#fields" in u for u in uris),
     )
 
 

@@ -225,6 +225,7 @@ def _build_search_body(
     page_limit: int,
     cloud_cover_max: int | None = None,
     sortby: bool = False,
+    fields: dict | None = None,
 ) -> dict:
     """Build the POST body for a STAC search request.
 
@@ -245,6 +246,8 @@ def _build_search_body(
         body["query"] = {"eo:cloud_cover": {"lte": cloud_cover_max}}
     if sortby:
         body["sortby"] = [{"field": "properties.datetime", "direction": "desc"}]
+    if fields:  # the fields extension: only these parts of each item
+        body["fields"] = fields
     return body
 
 
@@ -294,6 +297,7 @@ def search_catalog(
     cancel_check: Callable[[], bool] | None = None,
     server_side_cloud_filter: bool = False,
     server_side_sort: bool = False,
+    fields: dict | None = None,
 ) -> tuple[list[StacItemResult], PageToken | None]:
     """Search a STAC API.
 
@@ -351,6 +355,7 @@ def search_catalog(
             page_limit,
             cloud_cover_max=cloud_cover_max if server_side_cloud_filter else None,
             sortby=server_side_sort,
+            fields=fields,
         )
 
     # Credentials only go to the API that was configured, never to a next

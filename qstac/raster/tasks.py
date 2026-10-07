@@ -103,12 +103,19 @@ class MosaicBuildTask(_EventTask):
         collection_info: CollectionInfo,
         band_override: list[str] | None = None,
         stretch_override: tuple[float, float] | None = None,
+        sign_func: Callable[[str], str] | None = None,
+        prepare: Callable[[], object] | None = None,
+        index_preset: IndexPreset | None = None,
     ) -> None:
         super().__init__(f"Mosaicking {len(parts)} scenes")
+        # Unsigned hrefs: signing may fetch a token, so it happens in run().
         self.parts = parts
+        self.sign_func = sign_func
+        self.prepare = prepare
         self.collection_info = collection_info
         self.band_override = band_override
         self.stretch_override = stretch_override
+        self.index_preset = index_preset  # a composite computed per scene
         # (path, epsg, item ids) per CRS, largest first.
         self.mosaics: list[tuple[str, int | None, list[str]]] = []
         self.dropped: int = len(parts)
@@ -116,13 +123,22 @@ class MosaicBuildTask(_EventTask):
         self.error: str | None = None
 
     def run(self) -> bool:
+        sign = self.sign_func
+        if self.prepare is not None:
+            with contextlib.suppress(Exception):  # anonymous; a 401 says why
+                self.prepare()
         try:
+            parts = [
+                (i, {n: sign(h) for n, h in a.items()} if sign else a, e, p)
+                for i, a, e, p in self.parts
+            ]
             built = _build_mosaic_vrt(
-                self.parts,
+                parts,
                 self.collection_info,
                 self.band_override,
                 self.stretch_override,
                 cancel_check=self._cancel.is_set,
+                index_preset=self.index_preset,
             )
         except Exception as exc:
             self.error = str(exc)

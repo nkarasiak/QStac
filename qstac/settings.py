@@ -46,6 +46,10 @@ DEFAULTS: dict[str, object] = {
     # default: without it a newcomer cannot tell where the layer went.
     "zoom_to_scene": "always",
     "stretch_method": "fixed",  # "fixed", "cumulative_cut", "min_max"
+    # The 9-square button's mosaic (its right-click menu): "tile", each
+    # tile's newest scene going back in time, or "time", every scene of the
+    # dates with the newest on top.
+    "mosaic_kind": "tile",
     # Performance
     "vsi_cache_mb": 512,
     "http_max_connections": 16,
@@ -346,6 +350,10 @@ def zoom_to_scene() -> str:
     return "never" if mode == "never" else "always"  # "ask" was dropped
 
 
+def mosaic_kind() -> str:
+    return "time" if _get("mosaic_kind", str) == "time" else "tile"
+
+
 def stretch_method() -> str:
     return str(_get("stretch_method", str))
 
@@ -382,20 +390,19 @@ def last_search() -> dict[str, object]:
     """Return the last-launched search params (empty strings / -1 if unset)."""
     s = QgsSettings()
     return {
-        "collection": str(s.value(_PREFIX + "last_collection", "")),
         "date_from": str(s.value(_PREFIX + "last_date_from", "")),
         "date_to": str(s.value(_PREFIX + "last_date_to", "")),
     }
 
 
-def save_last_search(collection: str, date_from: str, date_to: str) -> None:
-    """Persist the parameters of the most recent search.
+def save_last_search(date_from: str, date_to: str) -> None:
+    """Persist the dates of the most recent search.
 
     Cloud cover is deliberately excluded — the slider always opens at
     ``default_cloud_cover`` so the settings dialog is the only source of truth.
+    The collection too: the dock always opens on the default one.
     """
     s = QgsSettings()
-    s.setValue(_PREFIX + "last_collection", collection)
     s.setValue(_PREFIX + "last_date_from", date_from)
     s.setValue(_PREFIX + "last_date_to", date_to)
     s.remove(_PREFIX + "last_cloud_cover")

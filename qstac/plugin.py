@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtCore import Qt, QTimer
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction
 
@@ -48,7 +48,12 @@ class QStacPlugin:
         configure_gdal_for_cog()
         settings.add_builtin_connections()
         if settings.auto_open():
-            self._open_dock()
+            # One event-loop tick later: QGIS 4 loads plugins before it applies
+            # the UI theme, so a dock built here takes Qt's default palette
+            # (blue, not Night Mapping's orange). QGIS processes events after
+            # the theme and before restoring the window state, so the dock
+            # still gets its saved place.
+            QTimer.singleShot(0, self._auto_open)
             self.action.setChecked(True)
 
     def unload(self) -> None:
@@ -97,6 +102,10 @@ class QStacPlugin:
             self.dock.ensure_basemap()
         else:
             self._close_dock()
+
+    def _auto_open(self) -> None:
+        if self.action is not None:  # not unloaded in the meantime
+            self._open_dock()
 
     def _open_dock(self) -> None:
         if self.dock is None:

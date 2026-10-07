@@ -381,7 +381,7 @@ def _warm_one_source(url: str) -> None:
         ds = None
 
 
-def _prewarm_sources(sources: list[str]) -> None:
+def _prewarm_sources(sources: list[str], headers_only: bool = False) -> None:
     """Open all COG sources in parallel before constructing QgsRasterLayer.
 
     QgsRasterLayer probes per-band metadata sequentially, costing ~1 s per
@@ -389,12 +389,15 @@ def _prewarm_sources(sources: list[str]) -> None:
     subsequent layer construction hit the VSI cache and finish in ~0 ms,
     saving 3-4 s for an RGB layer.
     """
+    warm = _warm_header if headers_only else _warm_one_source
     if len(sources) <= 1:
         if sources:
-            _warm_one_source(sources[0])
+            warm(sources[0])
         return
-    # Capped: a 40-scene mosaic lists 120 sources.
+    # Capped: a 40-scene mosaic lists 120 sources. A header is one small
+    # request, waiting on latency more than bandwidth: more at once.
+    cap = 64 if headers_only else 16
     with concurrent.futures.ThreadPoolExecutor(
-        max_workers=min(len(sources), 16)
+        max_workers=min(len(sources), cap)
     ) as pool:
-        list(pool.map(_warm_one_source, sources))
+        list(pool.map(warm, sources))

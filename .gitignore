@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 *.pyo
+
+# QGIS writes its default style db to the cwd when tests touch QgsProject
+symbology-style.db

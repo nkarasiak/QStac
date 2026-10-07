@@ -26,7 +26,7 @@ from qgis.PyQt.QtWidgets import QFileDialog, QMessageBox
 from .. import settings
 from ..geo import _transform_to_wgs84
 from ..raster.cog import delete_clips, has_s3_login, set_asset_headers, set_s3_login
-from ..raster.index import build_index_layer
+from ..raster.index import _style_index, build_index_layer
 from ..raster.layers import (
     add_layers_to_project,
     build_layer,
@@ -961,12 +961,20 @@ class LayerLoader(QObject):
         items: list[StacItemResult],
         coll: CollectionInfo,
         catalog: CatalogProvider,
+        stack: bool = False,
     ) -> None:
-        """Mosaic several scenes off the GUI thread: one layer per CRS."""
+        """Mosaic several scenes off the GUI thread: one layer per CRS.
+
+        *stack*: one frame of a time stack, meant to hide outside its date.
+        """
         key = "mosaic:" + ",".join(sorted(it.id for it in items))
         if key in self._loading or key in self._added.values():
             return
-        if self._refuse_unstreamable(items, _default_assets(coll), catalog):
+        # What one of these scenes shows on its own: the collection's default
+        # composite (Sentinel-1 false colour) when every scene has its bands.
+        preset = _load_preset(coll, items, None, None)
+        assets = list(preset.assets) if preset else _default_assets(coll)
+        if self._refuse_unstreamable(items, assets, catalog):
             return
         if not self.ensure_s3_login(catalog):
             return
@@ -980,20 +988,22 @@ class LayerLoader(QObject):
             else (f"{dates[0][:10]}→{dates[-1][:10]}")
         )
         name = f"Mosaic ({_scenes(len(items))}) {span}"
+        if preset:
+            name += f" [{preset.label}]"
 
         # Same assets a single-scene default load would use: the provider's
         # true-color COG (already 0..255) when enabled, else the RGB bands.
         task = MosaicBuildTask(
-            [
-                (it.id, signed_assets(it, catalog), it.epsg, it.asset_proj)
-                for it in items
-            ],
+            [(it.id, it.assets, it.epsg, it.asset_proj) for it in items],
             coll,
-            band_override=_default_assets(coll),
+            band_override=assets,
             stretch_override=_VISUAL_STRETCH if _uses_visual(coll) else None,
+            sign_func=_sign_func(catalog),
+            prepare=_asset_login(items, catalog),
+            index_preset=preset,
         )
         task.taskCompleted.connect(
-            lambda: self._on_mosaic_done(task, key, name, items, catalog, True)
+            lambda: self._on_mosaic_done(task, key, name, items, catalog, True, stack)
         )
         task.taskTerminated.connect(
             lambda: self._on_mosaic_done(task, key, name, items, catalog, False)
@@ -1008,6 +1018,7 @@ class LayerLoader(QObject):
         items: list[StacItemResult],
         catalog: CatalogProvider,
         ok: bool,
+        stack: bool = False,
     ) -> None:
         """Open the finished mosaic VRTs (one per CRS) on the GUI thread, add them."""
         self._loading.discard(key)
@@ -1029,6 +1040,8 @@ class LayerLoader(QObject):
                 stretch_baked=task.stretch_baked,
             )
             if layer is not None:
+                if task.index_preset is not None:
+                    _style_index(layer, task.index_preset)
                 scenes = [it for it in items if it.id in ids]
                 stamp_layer(layer, scenes, task.collection_info, catalog, "Mosaic")
                 layers.append(layer)
@@ -1041,7 +1054,7 @@ class LayerLoader(QObject):
             )
             return
 
-        self._add_to_project(layers, task.collection_info.label)
+        self._add_to_project(layers, task.collection_info.label, stack)
         for layer in layers:
             self._added[layer.id()] = key
         total = len(items)

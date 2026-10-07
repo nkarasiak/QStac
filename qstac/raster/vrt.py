@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import math
 from html import escape
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -63,25 +64,60 @@ def _unmasked_unsigned(src: str) -> bool:
     return unsigned and band.GetMaskFlags() == gdal.GMF_ALL_VALID
 
 
-def _store_statistics(path: str) -> bool:
+def _store_statistics(path: str, fixed: tuple[float, float] | None = None) -> bool:
     """Store approximate band statistics in the VRT at *path*; False if unreadable.
 
     ``QgsRasterLayer``'s constructor asks every band for its min/max (the
     default contrast enhancement, whatever the algorithm), and QGIS's GDAL
     provider answers from stored statistics before computing any. Computing
     them here, off the GUI thread, from the overviews, keeps construction
-    from reading pixels on it.
+    from reading pixels on it. An RGB layer stretched over a *fixed* range
+    never uses them, so that range is stored instead, reading no pixels:
+    computing them read every scene's overview (8 s of a 168-scene mosaic).
+    One band still gets real ones: it stretches from them.
     """
     ds = None
     with contextlib.suppress(RuntimeError):
         ds = gdal.Open(path)
     if ds is None:
         return False
+    if ds.RasterCount < 3:
+        fixed = None
     with contextlib.suppress(RuntimeError):
         for i in range(1, ds.RasterCount + 1):
-            ds.GetRasterBand(i).ComputeStatistics(True)
+            band = ds.GetRasterBand(i)
+            if fixed is None:
+                band.ComputeStatistics(True)
+            else:
+                lo, hi = fixed
+                band.SetStatistics(lo, hi, (lo + hi) / 2, (hi - lo) / 4)
     ds = None  # a VRT writes its new metadata back on close
     return True
+
+
+# QgsRasterLayer's default histogram sample, in pixels.
+_QGIS_SAMPLE_PX = 250_000
+
+
+def _warm_histogram_sample(path: str) -> None:
+    """Read, off the GUI thread, what ``QgsRasterLayer`` reads to stretch *path*.
+
+    Its default contrast for anything but Byte RGB is a cumulative cut: a
+    histogram of a ~250 000-pixel sample, which stored statistics do not
+    answer. On a mosaic that sample reads an overview of every scene (1.1 s
+    for 8 Sentinel-1 composites, on the GUI thread); read here first, the
+    construction finds it in the VSI cache (0.06 s).
+    """
+    with contextlib.suppress(RuntimeError):
+        ds = gdal.Open(path)
+        if ds is None:
+            return
+        band = ds.GetRasterBand(1)
+        if ds.RasterCount >= 3 and band.DataType == gdal.GDT_Byte:
+            return  # QGIS shows Byte RGB unstretched: no histogram
+        xs, ys = ds.RasterXSize, ds.RasterYSize
+        w = max(1, int(math.sqrt(_QGIS_SAMPLE_PX * xs / ys)))
+        ds.ReadRaster(0, 0, xs, ys, w, max(1, _QGIS_SAMPLE_PX // w))
 
 
 # ---------------------------------------------------------------------------

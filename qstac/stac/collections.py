@@ -61,6 +61,11 @@ class CollectionInfo:
     # What a plain load (double-click) shows when it is not the bands as-is:
     # a colour composite of them (Sentinel-1's false colour).
     default_preset: IndexPreset | None = None
+    # Tile mosaic (the 9-square button): the days within which every tile
+    # has a scene at any cloud cover, which says what "every tile" is: its
+    # revisit plus the provider's publishing delay. 0 = no button; set only
+    # for collections a tile mosaic was tried on.
+    mosaic_reach_days: int = 0
 
 
 # ── Sentinel-2 band presets (Earth Search: lowercase names) ──
@@ -193,6 +198,7 @@ EARTH_SEARCH_COLLECTIONS: list[CollectionInfo] = [
         has_cloud_cover=True,
         band_presets=_S2_PRESETS,
         index_presets=_S2_INDICES,
+        mosaic_reach_days=10,  # a 5-day revisit
     ),
     CollectionInfo(
         id="sentinel-2-l2a",
@@ -252,6 +258,7 @@ PLANETARY_COMPUTER_COLLECTIONS: list[CollectionInfo] = [
         has_cloud_cover=True,
         band_presets=_S2_PC_PRESETS,
         index_presets=_S2_PC_INDICES,
+        mosaic_reach_days=10,  # a 5-day revisit
     ),
     CollectionInfo(
         id="landsat-c2-l2",
@@ -262,6 +269,8 @@ PLANETARY_COMPUTER_COLLECTIONS: list[CollectionInfo] = [
         has_cloud_cover=True,
         band_presets=_LANDSAT_PC_PRESETS,
         index_presets=_LANDSAT_PC_INDICES,
+        # 16 days per satellite, and PC publishes days to a week late.
+        mosaic_reach_days=32,
     ),
     CollectionInfo(
         id="naip",

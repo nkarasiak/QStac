@@ -280,7 +280,7 @@ qstac/                   The plugin — the zip is exactly this folder (+ LICENS
     ├── collection_combo.py _CollectionDelegate, _ComboFilter
     ├── area_tool.py     AreaTool: the map tool drawing a search rectangle or polygon
     ├── index_dialog.py  IndexDialog (custom index), custom_index_presets
-    ├── widgets.py       ClickableDateEdit, _ResultCard, _WheelGuard
+    ├── widgets.py       ClickableDateEdit, _ResultCard, _WheelGuard, MosaicButton
     ├── constants.py     Palette, date presets, display helpers (ids, emoji)
     └── theme.py         Palette derived from the running QGIS theme
 
@@ -322,6 +322,10 @@ Cross-module imports of `_private` names inside the package are normal here.
 ### Performance-sensitive paths
 
 - **`QgsRasterLayer` construction reads pixels on the GUI thread**: its default contrast enhancement asks every band for min/max, whatever the algorithm (`loadDefaultStyle = False` does not skip it). Cheap from a COG's overviews; a source without overviews (a warped VRT) is read whole, and an 81-scene mosaic warped into one CRS froze QGIS. So mosaics are one layer per EPSG (QGIS reprojects at render), never warped, and `vrt._store_statistics()` stores their stats in the task, which QGIS's GDAL provider reads before computing any. Never hand the GUI thread a source without overviews.
+- **Result cards are built as their rows scroll into view** (`QStacDock._fill_visible()`), and only those fetch a thumbnail: *Load all* brings 1000 results, and a card each plus 1000 thumbnail replies decoded (and PNG-encoded for the tooltip, now on first hover) on the GUI thread froze QGIS for ~20 s. Anything on the GUI thread must not scale with the result count
+- **A mosaic stretched over a fixed range** (the visual COG's 0-255, a baked RGB) warms headers only, 64 at a time, and stores that range as its statistics (`_store_statistics(fixed=)`): reading every scene's smallest overview for computed ones was 3/4 of a 600-scene build. One band still gets computed statistics, as it stretches from them
+- **A mosaic's histogram sample is read in the worker** (`vrt._warm_histogram_sample()`): QGIS stretches anything but Byte RGB by a cumulative cut, a histogram of a ~250 000-pixel sample that stored statistics do not answer, and on a mosaic that sample reads an overview of every scene (1.1 s on the GUI thread for 8 Sentinel-1 composites; 0.06 s once warm)
+- **Signing runs in the task** (`sign_func=`, as `CogPrefetchTask`, `MosaicBuildTask`): a SAS token past its ~45 min is an HTTP fetch
 - **VRT construction**: Direct XML write saves 1-3s vs GDAL BuildVRT (avoids HTTP per band)
 - **Index VRT overviews**: a derived (pixel-function) band gets no overviews from its sources, so `_write_index_vrt_xml()` writes each halving down to 256 px as an inline `<Overview>` (the same VRT on a coarser grid, read from the COG's overviews). Without them QGIS's stretch histogram at layer construction read a whole Sentinel-1 RTC scene (~24 s on the GUI thread, 2 GB), and so did every zoomed-out render
 - **Default stretch values**: fixed (100, 3500) for Sentinel-2/Mosaics avoids cumulative cut computation
@@ -338,6 +342,11 @@ MGRS tile, WRS path/row, EPSG…) a label and the top of the menu, offered as so
 as their values differ; any other key must also repeat a value and stay under
 `_MAX_FACET_VALUES`, so each collection gets just its own. It filters the loaded
 pages, not the server.
+
+Every start opens on Planetary Computer › Sentinel-2 L2A
+(`DEFAULT_CATALOG`, `_DEFAULT_COLLECTION`; the `catalog` setting is reset to it
+at open): only the last search's dates come back, never its collection — the
+last one searched (a MODIS product, a DEM...) made a poor first view.
 
 First opening: the dock opens at QGIS start only if it was left open
 (`auto_open`, saved by `QStacPlugin._toggle_dock()` and `QStacDock.closeEvent()`,
@@ -363,6 +372,11 @@ one-day frames from the first scene's hour: those left empty frames and pushed
 a scene taken later in the day into the next frame. So a time range left on
 the canvas (a time stack still animating, a Temporal Controller range kept
 after it was switched off) hides every scene of another date with no error.
+What was just added shows on top: `raster.layers._deferred_tree_insert()`
+moves its collection's group to the top of its parent (a clone, as layer tree
+nodes cannot move) and puts the new layers at the top of it, newest first
+within that one load only (a date order across loads hid an older scene, or a
+reused group, under what was already there).
 Every add goes through `LayerLoader._add_to_project()`: when
 `raster.layers.hidden_by_time_filter()` says the new layers are hidden, it
 lifts the filter (`_show_all_dates()`: navigation off *and* an explicit null
@@ -375,7 +389,8 @@ Font sizes are relative to the QGIS application font (`styles.fs()` for
 stylesheets, `styles.pt()` for `QFont`), never px, so the dock follows the
 QGIS font size setting.
 
-The search area is the map view, so the button says *Search this map view*
+The search area is the map view, so the caption over the Search row says
+*Area: this map view*
 and `_show_search_area()` tints the searched box on the map until the search
 ends (`_stop_progress()`). The ▾ beside it (`_show_area_menu()`) swaps in a
 drawn rectangle or polygon (`ui/area_tool.py`, clicks, not a drag)
@@ -394,6 +409,45 @@ found", and *Load more results* / *Load all* sit fixed under the list
 there is more. Card text lines are `ElidedLabel`s (date, satellite,
 tile, one line each): the card is held to the list's width, so a label that
 cannot shrink overlaps the thumbnail in a narrow dock.
+
+The tile mosaic is a 9-square button (`widgets.MosaicButton`, `btn_mosaic`,
+outlined) after *Search* and its area ▾, which stay one filled control, all
+under an "Area: this map view" caption that follows the area menu. Its icon
+is a painted 3x3 patchwork (bright tiles a tile's newest scene, faded older
+fill); its tooltip says the rule in one line (`_sync_mosaic_button()`),
+and hovering it tints the area on the map (`_preview_mosaic_area()`), so the
+tooltip need not name it. Right-click (`_show_mosaic_menu()`) picks what a
+click builds, kept in the `mosaic_kind` setting: *Newest scene per tile*
+(`tile`, the default, below) or *One mosaic per date, with the time slider*
+(`time`, to see the area change: `TileSearchTask(by_time=True)` with
+`_EveryScene` in place of `TileCover` takes every scene of the dates, no
+reach, the newest `_BY_TIME_MAX`; `_mosaic_per_date()` builds one mosaic per
+UTC day, `load_mosaic(stack=True)` so the time filter is not lifted, and
+`_show_time_slider()` steps the Temporal Controller through those days). Tried before: two equal
+Search/Mosaic buttons, a Scenes | Mosaic mode switch, a text link under
+Search. It shows only for collections with `CollectionInfo.mosaic_reach_days`
+(the days within which every tile has a scene at any cloud cover: revisit
+plus publishing delay), set only on collections a tile mosaic was tried on:
+PC Sentinel-2 L2A and Landsat C2 L2 (32: 16-day revisit, published late),
+Earth Search Sentinel-2 C1. It is a search of its own from the same form
+(`_form_run()`, also Search's snapshot), not an action on the results: no
+search is needed first, and the result list is not used. While it runs the
+squares fill in with the progress and a click cancels. It runs one
+`stac.search_task.TileSearchTask`; a collection without MGRS tiles or WRS
+path/rows gets a message-bar note instead. The dates are cut into 2-day windows,
+searched 8 at a time (no next-page token chain: one took 30 s for France and
+Iberia) and trimmed by the fields extension (`supports_fields`, from
+`conformsTo`) to the footprint, properties and the assets the mosaic reads.
+Windows are read newest first, from the end date back to a year before the
+start date, and the search stops once every tile is covered; the last
+`mosaic_reach_days`, searched alongside without the cloud limit, say which
+tiles there are and how far their scenes reach. With none there (Landsat
+published late) the search reads every window rather than stop at once, empty. `geo.TileCover` keeps a tile's newest scene and older ones only where
+the newer show nothing, by footprint: a scene is cut by its orbit's edge *and*
+along its track (one pass, several products), so neither the relative orbit
+nor `s2:nodata_pixel_percentage` says what fills it (`_FILL_GAPS`: tried
+off, most of France showed the basemap). France and Iberia at 20%: 331 tiles,
+587 scenes, 3 s to search, 6 s to build.
 
 Loading several selected scenes from the load bar or Return/Space
 (`_shortcut_load()`) asks every time how: separate layers, mosaic or time
@@ -449,7 +503,15 @@ load (`ui.loading._load_preset()`), used only when every scene has its bands.
 Sentinel-1 RTC and GRD default to Planetary Computer's own "VV, VH
 False-color composite" (its thumbnails; different formulas per collection,
 copied from PC's `mosaic/info` renderOptions); *Band combinations* keeps VV
-and VH as they are. Mosaics and *Save clipped GeoTIFF* still use VV.
+and VH as they are. A mosaic shows what one of its scenes shows: the
+default composite, computed per scene (`_write_index_vrt_xml` parts, with
+their overviews) and mosaicked (`_build_mosaic_vrt(index_preset=)`), when every
+scene has its bands. *Save clipped GeoTIFF* still uses VV. Every mosaic goes
+through `QStacDock._load_mosaic()`, which asks *Which orbit?* when its scenes
+mix `sat:orbit_state` (`_one_orbit()`, the `_choose()` dialog of command links
+also used by *Load N scenes*): radar sees a slope from opposite sides
+ascending and descending, so a mosaic of both shows seams. Only radar scenes
+(`sar:` properties) are asked: Sentinel-2 items state both directions too.
 
 ## Adding a new collection
 
@@ -458,3 +520,4 @@ and VH as they are. Mosaics and *Save clipped GeoTIFF* still use VV.
 3. Optionally add `BandPreset` tuples for right-click band combination options
 4. If collection needs custom stretch, add entry to `_COLLECTION_STRETCH` in `qstac/raster/style.py`
 5. Optionally add `IndexPreset` tuples (`index_presets`) for NDVI/NDWI/NDMI/NBR. The index VRT needs `proj:shape`/`proj:transform` (per asset or on the item) and applies the STAC `raster:bands` scale/offset, so a collection without projection metadata (e.g. MODIS on PC) can't serve indices at all.
+6. Set `mosaic_reach_days` (the 9-square tile mosaic button) only once a tile mosaic has worked on the collection: its scenes need MGRS tiles or WRS path/rows, and the value must cover the revisit plus the provider's publishing delay, or the mosaic finds no tiles.

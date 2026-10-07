@@ -22,7 +22,7 @@ from osgeo import gdal
 from qgis.core import QgsGeometry
 
 import qstac.raster.layers as layers_mod
-from qstac.geo import _filter_by_overlap
+from qstac.geo import TileCover, _filter_by_overlap
 from qstac.raster.clip import _cog_geometry
 from qstac.raster.cog import (
     _vrt_path,
@@ -412,6 +412,155 @@ def test_time_stack_steps_through_acquisition_days() -> None:
 
     assert nav.totalFrameCount() == 3, nav.totalFrameCount()
     assert [shown(f) for f in range(3)] == [[0], [1, 2], [3]]
+
+
+def test_tile_cover_fills_slivers_with_older_scenes() -> None:
+    """Newest first; an older scene only where the newer ones show nothing.
+
+    Each tile is the unit square; a scene is (id, tile, day, x0, y0, x1, y1).
+    """
+
+    def scene(fid: str, tile: str, day: int, x0, y0, x1, y1):
+        ring = [[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]]
+        return SimpleNamespace(
+            id=fid,
+            datetime_str=f"2026-09-{day:02d} 10:56",
+            geometry={"type": "Polygon", "coordinates": [ring]},
+            facets={"s2:mgrs_tile": tile},
+        )
+
+    # How far each tile's scenes reach: 31TDL all of it, 31TEL its west half.
+    cover = TileCover(
+        [
+            scene("r1", "31TDL", 28, 0, 0, 1, 1),
+            scene("r2", "31TEL", 28, 0, 0, 0.5, 1),
+            scene("r3", "31TCJ", 28, 0, 0, 1, 1),
+        ]
+    )
+    cover.add(
+        [
+            scene("south", "31TDL", 25, 0, 0, 1, 0.2),  # newest: a sliver
+            scene("north", "31TDL", 25, 0, 0.2, 1, 1),  # same pass, other product
+            scene("hidden", "31TDL", 23, 0, 0.5, 1, 1),  # under "north"
+            scene("half", "31TEL", 20, 0, 0, 0.5, 1),  # all its scenes reach
+        ]
+    )
+    assert cover.missing() == ["tile 31TCJ"]  # nothing under the limit yet
+    cover.add([scene("deeper", "31TCJ", 2, 0, 0, 1, 1)])  # an older page
+    cover.add([scene("too-old", "31TDL", 1, 0, 0, 1, 1)])  # covered already
+    assert cover.missing() == []
+    # Oldest first: a mosaic paints the newest on top.
+    assert [i.id for i in cover.scenes()] == ["deeper", "half", "south", "north"]
+
+    # Without filling: each tile's newest alone, slivers and all.
+    alone = TileCover([], fill=False)
+    alone.add([scene("south", "31TDL", 25, 0, 0, 1, 0.2)])
+    alone.add([scene("older", "31TDL", 20, 0, 0, 1, 1)])
+    assert [i.id for i in alone.scenes()] == ["south"]
+
+
+def test_tile_mosaic_reads_back_when_the_reach_is_empty() -> None:
+    """No scene in the reach (Landsat published late): read back, not stop.
+
+    The reach says which tiles there are; with none seen, every tile was
+    "covered" at once and the mosaic stopped after its first window, empty.
+    """
+    import datetime
+
+    import qstac.stac.search_task as st
+
+    ring = [[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]
+    old = SimpleNamespace(
+        id="old",
+        datetime_str="2026-08-09 10:30",
+        geometry={"type": "Polygon", "coordinates": [ring]},
+        facets={"landsat:wrs_path": "198", "landsat:wrs_row": "027"},
+    )
+    task = st.TileSearchTask(
+        SimpleNamespace(), "landsat-c2-l2", (0, 0, 1, 1), "2026-09-07",
+        "2026-10-07", 20, ["red"], 30, 10,
+    )  # fmt: skip
+    clear_since = datetime.date(2026, 8, 10)
+    task._window = lambda end, cloud, _h: (
+        [old] if cloud is not None and end <= clear_since else []
+    )
+    headers, st.request_headers = st.request_headers, lambda _cat: {}
+    try:
+        assert task.run(), task.error
+    finally:
+        st.request_headers = headers
+    assert [i.id for i in task.scenes] == ["old"], task.scenes
+
+
+def test_mosaic_by_time_takes_every_scene_of_the_dates() -> None:
+    """By time: every scene of the dates, oldest first, nothing before them."""
+    import qstac.stac.search_task as st
+
+    def scene(fid: str, day: object) -> SimpleNamespace:
+        return SimpleNamespace(id=fid, datetime_str=f"{day} 10:30")
+
+    seen: list[tuple[object, int | None]] = []
+
+    def window(end: object, cloud: int | None, _h: object) -> list:
+        seen.append((end, cloud))
+        return [scene(f"s{end}", end), scene(f"s{end}", end)]  # one twice
+
+    task = st.TileSearchTask(
+        SimpleNamespace(), "landsat-c2-l2", (0, 0, 1, 1), "2026-09-01",
+        "2026-09-06", 20, ["red"], 30, 32, by_time=True,
+    )  # fmt: skip
+    task._window = window
+    headers, st.request_headers = st.request_headers, lambda _cat: {}
+    try:
+        assert task.run(), task.error
+    finally:
+        st.request_headers = headers
+    days = ["2026-09-02", "2026-09-04", "2026-09-06"]
+    assert [i.id for i in task.scenes] == [f"s{d}" for d in days], task.scenes
+    assert all(cloud == 20 for _end, cloud in seen), seen  # no reach search
+    assert not task.capped
+
+
+def test_new_layers_go_on_top() -> None:
+    """What was just added shows: its group on top, it on top of its group.
+
+    Seen: a Sentinel-2 load went into the existing Sentinel-2 group, under
+    the Landsat one, and an older scene under a newer one of its group.
+    """
+    from qgis.core import QgsProject, QgsRasterLayer
+
+    from qstac.raster.layers import _deferred_tree_insert, set_layer_temporal
+
+    project = QgsProject.instance()
+    root = project.layerTreeRoot()
+    tif = _tif(os.path.join(tempfile.mkdtemp(), "a.tif"), np.ones((4, 4)))
+
+    def add(name: str, day: str, group: str) -> QgsRasterLayer:
+        layer = QgsRasterLayer(tif, name)
+        set_layer_temporal(layer, f"2026-09-{day} 10:30")
+        project.addMapLayer(layer, False)
+        return layer
+
+    def tree() -> list[tuple[str, list[str]]]:
+        return [(g.name(), [n.name() for n in g.children()]) for g in root.children()]
+
+    try:
+        s2_new = add("s2 29 Sep", "29", "S2")
+        _deferred_tree_insert([s2_new.id()], "S2")
+        ls = add("landsat", "19", "Landsat")
+        _deferred_tree_insert([ls.id()], "Landsat")
+        s2_old = add("s2 15 Sep", "15", "S2")
+        _deferred_tree_insert([s2_old.id()], "S2")
+        assert tree() == [
+            ("S2", ["s2 15 Sep", "s2 29 Sep"]),
+            ("Landsat", ["landsat"]),
+        ], tree()
+        # One batch (a time stack, several scenes) still reads newest first.
+        batch = [add("ls 03 Sep", "03", "Landsat"), add("ls 25 Sep", "25", "Landsat")]
+        _deferred_tree_insert([b.id() for b in batch], "Landsat")
+        assert tree()[0] == ("Landsat", ["ls 25 Sep", "ls 03 Sep", "landsat"]), tree()
+    finally:
+        project.clear()
 
 
 if __name__ == "__main__":
