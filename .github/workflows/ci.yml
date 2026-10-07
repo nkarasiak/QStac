@@ -103,6 +103,10 @@ jobs:
       # https://plugins.qgis.org/plugins/qstac/tokens/create/ and store it as
       # the QGIS_PLUGIN_TOKEN repository secret. Without it this step is
       # skipped, so the GitHub release still works.
+      #
+      # auto_approve_after_scan only takes effect for uploaders holding the
+      # can_approve permission; for everyone else the version waits for manual
+      # approval after the security scan, which is the normal flow.
       - name: Publish to plugins.qgis.org
         env:
           QGIS_PLUGIN_TOKEN: ${{ secrets.QGIS_PLUGIN_TOKEN }}
@@ -115,7 +119,8 @@ jobs:
           status=$(curl -sS -w '%{http_code}' -o response.txt -X POST \
             "https://plugins.qgis.org/plugins/api/qstac/version/add/" \
             -H "Authorization: Bearer $QGIS_PLUGIN_TOKEN" \
-            -F "package=@${ZIP}")
+            -F "package=@${ZIP}" \
+            -F "auto_approve_after_scan=true")
           echo "HTTP $status"
           cat response.txt
           if [ "$status" -ge 300 ]; then
