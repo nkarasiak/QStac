@@ -24,16 +24,8 @@ jobs:
           python-version: "3.10"
       # Pinned: an unpinned linter turns CI red on untouched code.
       - run: pip install --quiet ruff==0.15.7 flake8==7.3.0
-      - run: ruff check .
-      - run: ruff format --check .
-      # The plugins.qgis.org code-quality check (W503 on, see .flake8)
-      - run: flake8 qstac
-      # Pure-stdlib self-checks (test_index and test_raster need QGIS, so they stay local).
-      - name: Self-checks
-        run: |
-          for t in collections catalogs detect facets search indices; do
-            python -m "tests.test_$t"
-          done
+      # Ruff, flake8 and the pure-stdlib self-checks; also the pre-commit hook
+      - run: PYTHON=python scripts/check.sh
 
   # The scans plugins.qgis.org runs on every upload; a Bandit or detect-secrets
   # hit blocks the version. Bandit: every severity, minus the rules the site
