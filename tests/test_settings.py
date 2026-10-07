@@ -104,6 +104,31 @@ def test_mosaic_cap() -> None:
     assert len(_EveryScene(10).scenes()) == 0
 
 
+def test_mosaic_button_animations_play_once_and_rest() -> None:
+    from qstac.ui.widgets import MosaicButton
+
+    btn = MosaicButton()
+
+    def image():
+        return btn.icon().pixmap(btn.iconSize()).toImage()
+
+    rest = image()
+    btn.animate("off")
+    assert not btn._timer.isActive()
+    for kind in MosaicButton.ANIMATIONS:
+        btn.animate(kind)
+        assert btn._timer.isActive(), kind
+        for _ in range(MosaicButton._FRAMES[kind] // 10):
+            btn._tick()
+        assert image() != rest, kind  # it moves
+        while btn._timer.isActive():
+            btn._tick()
+        assert image() == rest, kind  # and settles back
+    btn.animate("pulse")
+    btn.set_progress(40)  # a build starting stops it
+    assert not btn._timer.isActive()
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

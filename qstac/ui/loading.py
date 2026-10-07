@@ -55,7 +55,7 @@ if TYPE_CHECKING:
     from qgis.PyQt.QtWidgets import QWidget
 
     from ..stac.catalogs import CatalogProvider
-    from ..stac.collections import CollectionInfo, IndexPreset
+    from ..stac.collections import BandPreset, CollectionInfo, IndexPreset
     from ..stac.items import StacItemResult
 
 __all__ = ["LayerLoader", "signed_assets", "viewport_bbox_4326"]
@@ -1037,27 +1037,31 @@ class LayerLoader(QObject):
         catalog: CatalogProvider,
         stack: bool = False,
         index_preset: IndexPreset | None = None,
+        band_preset: BandPreset | None = None,
     ) -> None:
         """Mosaic several scenes off the GUI thread: one layer per CRS.
 
         *stack*: one frame of a time stack, meant to hide outside its date.
-        *index_preset*: the index each scene computes before mosaicking.
+        *index_preset*: the index each scene computes before mosaicking;
+        *band_preset*: the bands it shows instead of the default ones.
         """
         key = "mosaic:" + ",".join(sorted(it.id for it in items))
-        if index_preset is not None:
-            key += f"|{index_preset!r}"  # frozen: a changed formula is a new key
+        if index_preset is not None or band_preset is not None:
+            key += f"|{index_preset or band_preset!r}"  # frozen: changed is new
         if key in self._loading or key in self._added.values():
             return
         # What one of these scenes shows on its own: the index asked for, else
         # the collection's default composite (Sentinel-1 false colour) when
         # every scene has its bands.
-        preset = _load_preset(coll, items, None, index_preset)
+        bands = list(band_preset.assets) if band_preset else None
+        preset = _load_preset(coll, items, bands, index_preset)
         if index_preset is not None and not any(
             all(n in it.assets for n in preset.assets) for it in items
         ):
             self._flash(_missing_index_assets(items[0], preset))
             return
-        assets = list(preset.assets) if preset else _default_assets(coll)
+        assets = list(preset.assets) if preset else bands or _default_assets(coll)
+        assets = assets or _guess_item_asset(items[0])  # none advertised
         if self._refuse_unstreamable(items, assets, catalog):
             return
         if not self.ensure_s3_login(catalog):
@@ -1072,16 +1076,18 @@ class LayerLoader(QObject):
             else (f"{dates[0][:10]}→{dates[-1][:10]}")
         )
         name = f"Mosaic ({_scenes(len(items))}) {span}"
-        if preset:
-            name += f" [{preset.label}]"
+        if preset or band_preset:
+            name += f" [{(preset or band_preset).label}]"
 
         # Same assets a single-scene default load would use: the provider's
         # true-color COG (already 0..255) when enabled, else the RGB bands.
+        visual = _VISUAL_STRETCH if _uses_visual(coll) else None
+        stretch = band_preset.stretch if band_preset else visual
         task = MosaicBuildTask(
             [(it.id, it.assets, it.epsg, it.asset_proj) for it in items],
             coll,
             band_override=assets,
-            stretch_override=_VISUAL_STRETCH if _uses_visual(coll) else None,
+            stretch_override=stretch,
             sign_func=_sign_func(catalog),
             prepare=_asset_login(items, catalog),
             index_preset=preset,

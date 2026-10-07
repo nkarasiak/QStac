@@ -91,4 +91,5 @@ ascending and descending, so a mosaic of both shows seams. Only radar scenes
 3. Optionally add `BandPreset` tuples for right-click band combination options
 4. If collection needs custom stretch, add entry to `_COLLECTION_STRETCH` in `qstac/raster/style.py`
 5. Optionally add `IndexPreset` tuples (`index_presets`) for NDVI/NDWI/NDMI/NBR. The index VRT needs `proj:shape`/`proj:transform` (per asset or on the item) and applies the STAC `raster:bands` scale/offset, so a collection without projection metadata (e.g. MODIS on PC) can't serve indices at all.
-6. Set `mosaic_reach_days` (the 9-square tile mosaic button) only once a tile mosaic has worked on the collection: its scenes need MGRS tiles or WRS path/rows, and the value must cover the revisit plus the provider's publishing delay, or the mosaic finds no tiles.
+6. Set `mosaic_reach_days` (the 9-square mosaic button's tile mosaic; without it, the button covers the area newest first) only once a tile mosaic has worked on the collection: its scenes need MGRS or MODIS tiles (property or id token) or WRS path/rows, and the value must cover the revisit plus the provider's publishing delay, or the mosaic finds no tiles.
+7. Set `timeless` for a fixed-epoch or yearly product (DEM, annual land cover): the search sends no dates, and the mosaic button covers the area newest first, so takes its newest year.

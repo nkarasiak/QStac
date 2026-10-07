@@ -64,6 +64,36 @@ def _unmasked_unsigned(src: str) -> bool:
     return unsigned and band.GetMaskFlags() == gdal.GMF_ALL_VALID
 
 
+def _add_virtual_overviews(path: str) -> None:
+    """Declare overviews on the VRT at *path* when GDAL derived none.
+
+    GDAL derives a VRT's overviews from its sources' only when every source
+    is at the VRT's resolution. Copernicus DEM tiles are 2400 px wide north
+    of 50°N and 3600 south, so a mosaic across that line had none: its
+    statistics and QGIS's histogram read every pixel (137 tiles: 72 s off
+    and 42 s on the GUI thread). Virtual overviews are only an
+    ``<OverviewList>``, read from each source's own overviews.
+    """
+    ds = None
+    with contextlib.suppress(RuntimeError):
+        ds = gdal.Open(path, gdal.GA_Update)
+    if ds is None or ds.GetRasterBand(1).GetOverviewCount():
+        return
+    factors, f = [], 2
+    while max(ds.RasterXSize, ds.RasterYSize) // f >= 512:
+        factors.append(f)
+        f *= 2
+    if not factors:
+        return
+    gdal.SetThreadLocalConfigOption("VRT_VIRTUAL_OVERVIEWS", "YES")
+    try:
+        with contextlib.suppress(RuntimeError):
+            ds.BuildOverviews("NEAREST", factors)
+    finally:
+        gdal.SetThreadLocalConfigOption("VRT_VIRTUAL_OVERVIEWS", None)
+    ds = None  # written back on close
+
+
 def _store_statistics(path: str, fixed: tuple[float, float] | None = None) -> bool:
     """Store approximate band statistics in the VRT at *path*; False if unreadable.
 

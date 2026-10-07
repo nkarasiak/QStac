@@ -77,7 +77,11 @@ def _has_cloud_cover(coll: dict) -> bool:
 def _collection_to_info(coll: dict) -> CollectionInfo:
     """Convert a raw STAC collection document to a :class:`CollectionInfo`."""
     coll_id = str(coll.get("id", ""))
-    rgb_assets, single = _pick_rgb_assets(coll.get("item_assets") or {})
+    item_assets = coll.get("item_assets") or {}
+    rgb_assets, single = _pick_rgb_assets(item_assets)
+    # Of 478 collections of PC, Earth Search and CDSE, those whose
+    # item_assets name a GeoTIFF are exactly those whose items serve one.
+    types = " ".join(str(a.get("type") or "") for a in item_assets.values())
     return CollectionInfo(
         id=coll_id,
         label=str(coll.get("title") or coll_id),
@@ -85,6 +89,7 @@ def _collection_to_info(coll: dict) -> CollectionInfo:
         rgb_assets=rgb_assets,
         has_cloud_cover=_has_cloud_cover(coll),
         is_single_asset=single,
+        can_mosaic="tiff" in types.lower(),
         # A guessed single band is not "True Color (RGB)" (SAR, DEM...).
         default_action_label=(
             "True Color (RGB)"
@@ -236,9 +241,10 @@ def _build_search_body(
     body: dict = {
         "collections": [collection],
         "bbox": list(bbox),
-        "datetime": datetime_range,
         "limit": min(max_items, page_limit),
     }
+    if datetime_range:  # "": any date (CollectionInfo.timeless)
+        body["datetime"] = datetime_range
     # 100% means "no cloud filtering", so no query is sent: the query extension
     # also excludes items that lack eo:cloud_cover entirely — an accepted
     # tradeoff below 100, but not when the user asked to filter nothing.

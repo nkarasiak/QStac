@@ -17,6 +17,7 @@ from qgis.PyQt.QtCore import (
     QRectF,
     QSize,
     Qt,
+    QTimer,
     pyqtSignal,
 )
 from qgis.PyQt.QtGui import (
@@ -487,23 +488,82 @@ class MosaicButton(QPushButton):
 
     The patchwork says "a mosaic" without a word (bright tiles a tile's
     newest scene, faded ones older fill), and while it builds the tiles
-    fill in with its progress: the icon is the progress bar.
+    fill in with its progress: the icon is the progress bar. :meth:`animate`
+    plays one of ANIMATIONS once, to say a collection mosaics well.
     """
 
     hovered = pyqtSignal(bool)  # True on enter, False on leave
 
+    # The ``mosaic_animation`` setting's values, "off" aside.
+    ANIMATIONS = ("sweep", "build", "pulse")
     # 3x3 tile opacities at rest: full = a tile's newest scene, faded = older.
     _REST = (1.0, 1.0, 0.4, 0.4, 1.0, 1.0, 1.0, 0.4, 1.0)
+    _FRAME_MS = 33
+    # Unhurried: a hint that a mosaic is there, not an alert. 2.1 s, 2 s, 2.4 s.
+    _FRAMES = {"sweep": 64, "build": 60, "pulse": 72}  # noqa: RUF012 (read only)
+    _SWEEPS = 2  # passes of the light
+    _BUILD_ORDER = (4, 0, 8, 2, 6, 1, 7, 3, 5)  # centre, corners, edges
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setFixedSize(34, 34)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setIconSize(QSize(20, 20))
+        self._kind = ""
+        self._frame = 0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
         self.set_progress(None)
+
+    def animate(self, kind: str) -> None:
+        """Play *kind* (one of ANIMATIONS; anything else: nothing) once."""
+        if kind in self.ANIMATIONS:
+            self._kind, self._frame = kind, 0
+            self._timer.start(self._FRAME_MS)
+
+    def _tick(self) -> None:
+        self._frame += 1
+        frames = self._FRAMES[self._kind]
+        if self._frame >= frames:
+            self.set_progress(None)
+            return
+        t = self._frame / frames
+        self._paint([self._tile(i, t) for i in range(9)])
+
+    def _tile(self, i: int, t: float) -> tuple[QColor, float]:
+        """Tile *i*'s colour and scale at *t* (0-1) of the animation."""
+        rest, colour = self._REST[i], QColor(P.accent)
+        if self._kind == "sweep":  # a light crosses on the diagonal, _SWEEPS times
+            front = (
+                t * self._SWEEPS % 1
+            ) * 8 - 2  # -2..6: in and out of the 0..4 diagonals
+            glow = max(0.0, 1 - abs(front - (i % 3 + i // 3)) / 1.5)
+            colour = colour.lighter(100 + round(90 * glow))
+            colour.setAlphaF(rest + (1 - rest) * glow)
+            return colour, 1.0
+        if self._kind == "build":  # one after another, each growing in
+            start = 0.7 * self._BUILD_ORDER.index(i) / 9
+            grown = min(1.0, max(0.0, (t - start) / 0.3))
+            colour.setAlphaF(rest * grown)
+            return colour, 0.4 + 0.6 * grown
+        breath = math.sin(2 * math.pi * t) ** 2  # pulse: twice
+        colour.setAlphaF(rest + (1 - rest) * breath)
+        return colour, 1 - 0.25 * breath
 
     def set_progress(self, progress: float | None) -> None:
         """At rest (None), or *progress* % of the tiles filled in."""
+        self._timer.stop()
+        filled = 9 if progress is None else round(9 * progress / 100)
+        tiles = []
+        for i, alpha in enumerate(self._REST):
+            colour = QColor(P.accent if i < filled else P.border)
+            if progress is None:
+                colour.setAlphaF(alpha)
+            tiles.append((colour, 1.0))
+        self._paint(tiles)
+
+    def _paint(self, tiles: list[tuple[QColor, float]]) -> None:
+        """The 3x3 icon: each tile a colour and a scale (1: full size)."""
         side = self.iconSize().width()
         dpr = self.devicePixelRatioF()
         pm = QPixmap(round(side * dpr), round(side * dpr))
@@ -514,14 +574,12 @@ class MosaicButton(QPushButton):
         painter.setPen(Qt.PenStyle.NoPen)
         gap = max(1.0, side / 12)
         cell = (side - 2 * gap) / 3
-        filled = 9 if progress is None else round(9 * progress / 100)
-        for i, alpha in enumerate(self._REST):
-            colour = QColor(P.accent if i < filled else P.border)
-            if progress is None:
-                colour.setAlphaF(alpha)
+        for i, (colour, scale) in enumerate(tiles):
             painter.setBrush(colour)
-            x, y = (i % 3) * (cell + gap), (i // 3) * (cell + gap)
-            painter.drawRoundedRect(QRectF(x, y, cell, cell), gap, gap)
+            size = cell * scale
+            x = (i % 3) * (cell + gap) + (cell - size) / 2
+            y = (i // 3) * (cell + gap) + (cell - size) / 2
+            painter.drawRoundedRect(QRectF(x, y, size, size), gap, gap)
         painter.end()
         self.setIcon(QIcon(pm))
 

@@ -29,6 +29,11 @@ bands declare nothing) gets the STAC one, else 0 (`_build_vrt(default_nodata=)`,
 `vrt._stac_nodata()`), so its black edge is transparent and a mosaic's empty
 corners never paint over a neighbour. Never a signed or float file: a DEM's
 0 (Cop-DEM, ALOS) is sea level.
+A mosaic VRT GDAL derives no overviews for (sources at different
+resolutions: Cop-DEM tiles are 2400 px wide north of 50°N, 3600 south) gets
+virtual ones (`vrt._add_virtual_overviews()`, read from the sources' own):
+without, its statistics and QGIS's histogram read every pixel (137 tiles:
+72 s in the task, then 42 s frozen on the GUI thread; with, 6 s and 0.3 s).
 When `item_assets` names no raster the guess is left empty and the scene's first
 `.tif` loads; right-click > *Load asset* loads any of its rasters instead. Asset
 names may hold a `/`, so temp files are always named through `raster.cog._vrt_path()`.

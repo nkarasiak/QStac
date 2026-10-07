@@ -62,6 +62,9 @@ DEFAULTS: dict[str, object] = {
     "mosaic_lookback_days": 365,
     # A mosaic per date keeps the newest this many scenes of its dates.
     "mosaic_max_scenes": 1000,
+    # Played by the 9 squares when a collection that mosaics well is picked:
+    # "sweep", "build", "pulse" (widgets.MosaicButton.ANIMATIONS) or "off".
+    "mosaic_animation": "sweep",
     # Performance
     "vsi_cache_mb": 512,
     "http_max_connections": 16,
@@ -417,6 +420,10 @@ def mosaic_lookback_days() -> int:
 
 def mosaic_max_scenes() -> int:
     return int(_get("mosaic_max_scenes", int))
+
+
+def mosaic_animation() -> str:
+    return str(_get("mosaic_animation", str))
 
 
 def stretch_method() -> str:

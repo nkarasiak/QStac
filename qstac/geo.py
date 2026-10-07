@@ -16,6 +16,8 @@ from qgis.core import (
 from .stac.items import _tile
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from .stac.items import StacItemResult
 
 _WGS84 = "EPSG:4326"
@@ -79,14 +81,21 @@ class TileCover:
     where they show something the newer ones do not, until the tile is
     covered as far as *reach_items* (its recent scenes at any cloud cover)
     reach it; a scene the newer ones already cover is left out. Without
-    *fill*, a tile takes its newest scene alone, slivers and all.
+    *fill*, a tile takes its newest scene alone, slivers and all. *key*
+    says which tile a scene is of (:func:`area_cover`: one for them all).
     """
 
-    def __init__(self, reach_items: list[StacItemResult], fill: bool = True) -> None:
+    def __init__(
+        self,
+        reach_items: list[StacItemResult],
+        fill: bool = True,
+        key: Callable[[StacItemResult], str] = _tile,
+    ) -> None:
         self.fill = fill
+        self.key = key
         self.goal: dict[str, QgsGeometry] = {}
         for item in reach_items:
-            tile, shape = _tile(item), _footprint(item)
+            tile, shape = key(item), _footprint(item)
             if tile and shape is not None:
                 goal = self.goal.get(tile)
                 self.goal[tile] = shape if goal is None else goal.combine(shape)
@@ -97,7 +106,7 @@ class TileCover:
     def add(self, items: list[StacItemResult]) -> None:
         """Take what *items* (older than any added before) add."""
         for item in sorted(items, key=lambda i: i.datetime_str, reverse=True):
-            tile = _tile(item)
+            tile = self.key(item)
             if not tile or tile in self.done:
                 continue
             if not self.fill:
@@ -127,6 +136,19 @@ class TileCover:
     def scenes(self) -> list[StacItemResult]:
         """The picked scenes, oldest first: a mosaic paints the later on top."""
         return sorted(self.picked, key=lambda i: i.datetime_str)
+
+
+def area_cover(
+    bbox: tuple[float, float, float, float], area: QgsGeometry | None = None
+) -> TileCover:
+    """A :class:`TileCover` whose one tile is the search area (*area*, WGS84,
+    else *bbox*): a collection with no tile grid, its scenes fed newest first.
+    """
+    cover = TileCover([], key=lambda _item: "area")
+    cover.goal["area"] = (
+        area if area is not None else QgsGeometry.fromRect(QgsRectangle(*bbox))
+    )
+    return cover
 
 
 def day_cover(

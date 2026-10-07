@@ -26,6 +26,7 @@ from .cog import (
 )
 from .style import _apply_rgb_renderer, _apply_singleband_renderer, resolve_bake_stretch
 from .vrt import (
+    _add_virtual_overviews,
     _band_type,
     _build_vrt,
     _stac_nodata,
@@ -559,7 +560,10 @@ def _build_mosaic_vrt(
             [src for _, src, e in built if e == epsg],
             default_nodata=_stac_nodata(groups[epsg][0][2].get(band_names[0])),
         )
-        if path is not None and _store_statistics(path, fixed):
+        if path is None:
+            continue
+        _add_virtual_overviews(path)
+        if _store_statistics(path, fixed):
             _warm_histogram_sample(path)
             mosaics.append((path, epsg, ids))
     if not mosaics:

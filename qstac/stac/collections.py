@@ -66,6 +66,13 @@ class CollectionInfo:
     # revisit plus the provider's publishing delay. 0 = no button; set only
     # for collections a tile mosaic was tried on.
     mosaic_reach_days: int = 0
+    # One epoch or one per year (DEM, annual land cover): searched without
+    # dates, the date fields greyed out; the mosaic button takes the newest
+    # year (any collection without a reach: newest first until covered).
+    timeless: bool = False
+    # Its scenes are GeoTIFFs (a discovered collection: its item_assets say
+    # so): the mosaic button shows. Not NetCDF, Zarr, JPEG 2000 or SAFE.
+    can_mosaic: bool = True
 
 
 # ── Sentinel-2 band presets (Earth Search: lowercase names) ──
@@ -210,6 +217,7 @@ EARTH_SEARCH_COLLECTIONS: list[CollectionInfo] = [
         has_cloud_cover=True,
         band_presets=_S2_PRESETS,
         index_presets=_S2_INDICES,
+        mosaic_reach_days=10,  # a 5-day revisit
     ),
     CollectionInfo(
         id="sentinel-2-l1c",
@@ -221,6 +229,7 @@ EARTH_SEARCH_COLLECTIONS: list[CollectionInfo] = [
         has_cloud_cover=True,
         band_presets=_S2_PRESETS,
         index_presets=_S2_INDICES,
+        can_mosaic=False,  # JPEG 2000: every redraw of a mosaic decodes them
     ),
     CollectionInfo(
         id="cop-dem-glo-30",
@@ -230,6 +239,7 @@ EARTH_SEARCH_COLLECTIONS: list[CollectionInfo] = [
         category="Elevation",
         is_single_asset=True,
         default_action_label="Elevation",
+        timeless=True,
     ),
     CollectionInfo(
         id="cop-dem-glo-90",
@@ -239,6 +249,7 @@ EARTH_SEARCH_COLLECTIONS: list[CollectionInfo] = [
         category="Elevation",
         is_single_asset=True,
         default_action_label="Elevation",
+        timeless=True,
     ),
 ]
 
@@ -288,6 +299,7 @@ PLANETARY_COMPUTER_COLLECTIONS: list[CollectionInfo] = [
         category="Optical",
         is_single_asset=True,
         default_action_label="Red Reflectance",
+        mosaic_reach_days=40,  # 8-day composites, published ~3 weeks late
     ),
     # ── SAR ──
     CollectionInfo(
@@ -321,6 +333,7 @@ PLANETARY_COMPUTER_COLLECTIONS: list[CollectionInfo] = [
         category="Elevation",
         is_single_asset=True,
         default_action_label="Elevation",
+        timeless=True,
     ),
     # ── Land Cover ──
     # Categorical products: the COGs carry an embedded palette, so the
@@ -333,6 +346,7 @@ PLANETARY_COMPUTER_COLLECTIONS: list[CollectionInfo] = [
         category="Land Cover",
         is_single_asset=True,
         default_action_label="Land Cover",
+        timeless=True,
     ),
     CollectionInfo(
         id="io-lulc-annual-v02",
@@ -342,6 +356,7 @@ PLANETARY_COMPUTER_COLLECTIONS: list[CollectionInfo] = [
         category="Land Cover",
         is_single_asset=True,
         default_action_label="Land Cover",
+        timeless=True,
     ),
     # ── HLS ──
     CollectionInfo(
@@ -353,6 +368,7 @@ PLANETARY_COMPUTER_COLLECTIONS: list[CollectionInfo] = [
         has_cloud_cover=True,
         band_presets=_HLS_PC_S30_PRESETS,
         index_presets=_HLS_PC_S30_INDICES,
+        mosaic_reach_days=14,  # a 2-3 day revisit, published ~6 days late
     ),
     CollectionInfo(
         id="hls2-l30",
@@ -363,6 +379,8 @@ PLANETARY_COMPUTER_COLLECTIONS: list[CollectionInfo] = [
         has_cloud_cover=True,
         band_presets=_HLS_PC_L30_PRESETS,
         index_presets=_HLS_PC_L30_INDICES,
+        # As Landsat: 16 days per satellite, published days to a week late.
+        mosaic_reach_days=32,
     ),
 ]
 
@@ -403,6 +421,7 @@ _SAVED_FIELDS = (
     "has_cloud_cover",
     "is_single_asset",
     "default_action_label",
+    "can_mosaic",
 )
 
 
@@ -422,7 +441,7 @@ def collections_from_json(text: str) -> tuple[CollectionInfo, ...]:
     for row in rows if isinstance(rows, list) else ():
         if not (isinstance(row, list) and len(row) == len(_SAVED_FIELDS) and row[0]):
             continue
-        cid, label, desc, rgb, cloud, single, action = row
+        cid, label, desc, rgb, cloud, single, action, mosaic = row
         if not isinstance(rgb, list):
             continue
         out.append(
@@ -434,6 +453,7 @@ def collections_from_json(text: str) -> tuple[CollectionInfo, ...]:
                 has_cloud_cover=bool(cloud),
                 is_single_asset=bool(single),
                 default_action_label=str(action),
+                can_mosaic=bool(mosaic),
             )
         )
     return tuple(out)

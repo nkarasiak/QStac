@@ -601,6 +601,20 @@ class SettingsDialog(QDialog):
             self._spin(50, 5000, " scenes", 50),
             "One mosaic per date keeps the newest this many scenes of the dates.",
         )
+        self._row(
+            form,
+            "Animate on picking a collection:",
+            "mosaic_animation",
+            self._combo(
+                [
+                    ("Sweep: a light crosses the squares", "sweep"),
+                    ("Build: the squares land one by one", "build"),
+                    ("Pulse: the squares breathe twice", "pulse"),
+                    ("Off", "off"),
+                ]
+            ),
+            "Played once when you pick a collection the 9 squares can mosaic.",
+        )
         page.addStretch()
 
     def _build_network_page(self) -> None:

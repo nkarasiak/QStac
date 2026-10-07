@@ -13,13 +13,13 @@ from typing import TYPE_CHECKING
 
 from qgis.core import QgsTask
 
-from ..geo import TileCover, day_cover
+from ..geo import TileCover, area_cover, day_cover
 from .auth import request_headers
 from .net import StacError
 from .search import search_catalog, server_cloud_filter
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
     from qgis.core import QgsGeometry
 
@@ -129,6 +129,13 @@ class TileSearchTask(QgsTask):
     windows need no token, so they run side by side. Items are trimmed to
     what is used (the fields extension): *assets*, the footprint and the
     properties.
+
+    A collection with no *reach_days* (no tile grid known, or none) takes
+    none of that: its scenes up to *date_to* (*timeless*, a DEM or yearly
+    product: today), newest first, into :func:`geo.area_cover` until the
+    area is covered, reading at most *max_scenes*. A DEM or yearly product
+    so takes its newest year (older ones only where it has no tile),
+    Sentinel-1 or NAIP each place's newest pass.
     """
 
     def __init__(
@@ -146,6 +153,7 @@ class TileSearchTask(QgsTask):
         area: QgsGeometry | None = None,
         lookback_days: int = 365,
         max_scenes: int = 1000,
+        timeless: bool = False,
     ) -> None:
         super().__init__(f"Finding a scene for every tile of {collection}")
         self.catalog = catalog
@@ -162,7 +170,8 @@ class TileSearchTask(QgsTask):
         # By time: the newest this many scenes, as "Load all" does its
         # results (a mosaic layer's scenes are read at build).
         self.max_scenes = max_scenes
-        self.capped = False  # by time: more than max_scenes scenes
+        self.timeless = timeless
+        self.capped = False  # more than max_scenes scenes to read
         self.area = area  # by time: a drawn or selected area (WGS84)
         self.day_cover: dict[str, float] = {}  # by time: geo.day_cover()
         self.scenes: list[StacItemResult] = []
@@ -172,15 +181,24 @@ class TileSearchTask(QgsTask):
     def _window(
         self, end: datetime.date, cloud: int | None, headers: dict | None
     ) -> list[StacItemResult]:
-        """Every scene of the _WINDOW_DAYS ending on *end*, page by page."""
-        cat = self.catalog
+        """Every scene of the _WINDOW_DAYS ending on *end*."""
         start = end - datetime.timedelta(days=_WINDOW_DAYS - 1)
+        when = f"{start}T00:00:00Z/{end}T23:59:59Z"
+        return [i for page in self._pages(when, cloud, headers) for i in page]
+
+    def _pages(
+        self, when: str, cloud: int | None, headers: dict | None, newest: bool = False
+    ) -> Iterator[list[StacItemResult]]:
+        """The scenes of *when*, a page at a time (*newest*: newest first)."""
+        cat = self.catalog
         fields = None
         if cat.supports_fields:
             parts = ["id", "collection", "geometry", "bbox", "properties"]
-            fields = {"include": parts + [f"assets.{a}" for a in self.assets]}
+            # No asset named (a discovered collection without item_assets):
+            # all of them, for the mosaic to guess from.
+            assets = [f"assets.{a}" for a in self.assets] or ["assets"]
+            fields = {"include": parts + assets}
         server_cloud = cat.supports_query and server_cloud_filter(cat, self.collection)
-        found: list[StacItemResult] = []
         token = None
         while not self.isCanceled():
             for attempt in range(_RETRIES + 1):
@@ -188,7 +206,7 @@ class TileSearchTask(QgsTask):
                     items, token = search_catalog(
                         self.collection,
                         self.bbox,
-                        f"{start}T00:00:00Z/{end}T23:59:59Z",
+                        when,
                         max_items=cat.page_limit,  # one full page per request
                         cloud_cover_max=cloud,
                         catalog_url=cat.search_url,
@@ -198,6 +216,7 @@ class TileSearchTask(QgsTask):
                         page_token=token,
                         cancel_check=self.isCanceled,
                         server_side_cloud_filter=server_cloud,
+                        server_side_sort=newest and cat.supports_sortby,
                         fields=fields,
                     )
                     break
@@ -206,12 +225,37 @@ class TileSearchTask(QgsTask):
                     if e.kind not in _TRANSIENT or attempt == _RETRIES:
                         raise
                     time.sleep(1 + attempt)
-            found += items
+            yield items
             if token is None:
                 break
-        return found
+
+    def _cover_area(self) -> bool:
+        """No tile grid: newest first until the area is covered (class doc)."""
+        end = datetime.date.today() if self.timeless else self.date_to
+        # Not "../end": the Copernicus Data Space API refuses open ranges.
+        when = f"1900-01-01T00:00:00Z/{end}T23:59:59Z"
+        cover = area_cover(self.bbox, self.area)
+        headers = request_headers(self.catalog) or None
+        read = 0
+        for page in self._pages(when, self.cloud, headers, newest=True):
+            cover.add(page)
+            read += len(page)
+            if not cover.missing():
+                break
+            if read >= self.max_scenes:
+                self.capped = True
+                break
+            self.setProgress(100 * read / self.max_scenes)
+        self.scenes = cover.scenes()
+        return not self.isCanceled()
 
     def run(self) -> bool:
+        if not self.reach_days and not self.by_time:
+            try:
+                return self._cover_area()
+            except Exception as e:
+                self.error = f"{e}\n{traceback.format_exc()}"
+                return False
         day = datetime.date.fromisoformat
         step = datetime.timedelta(days=_WINDOW_DAYS)
         last, deepest = day(self.date_to), day(self.date_from)

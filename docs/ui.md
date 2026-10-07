@@ -98,7 +98,12 @@ under an "Area: this map view" caption that follows the area menu. Its icon
 is a painted 3x3 patchwork (bright tiles a tile's newest scene, faded older
 fill); its tooltip says the rule in one line (`_sync_mosaic_button()`),
 and hovering it tints the area on the map (`_preview_mosaic_area()`), so the
-tooltip need not name it. Right-click (`_show_mosaic_menu()`) picks what a
+tooltip need not name it. Picking a collection it can mosaic (`can_mosaic`, as it
+shows) plays one animation of the squares
+(`_invite_mosaic()`, `MosaicButton.animate()`): the `mosaic_animation` setting
+(Settings > Mosaic), *sweep* (a light crosses them diagonally twice, 2.1 s, the default),
+*build* (they land one by one, centre first, 2 s), *pulse* (they breathe twice, 2.4 s) or
+*off*. Not at dock start (it restores a collection), not while a mosaic runs. Right-click (`_show_mosaic_menu()`) picks what a
 click builds, kept in the `mosaic_kind` setting: *Newest scene per tile*
 (`tile`, the default, below) or *One mosaic per date, with the time slider*
 (`time`, to see the area change: `TileSearchTask(by_time=True)` with
@@ -108,18 +113,41 @@ UTC day, `load_mosaic(stack=True)` so the time filter is not lifted, and
 `_show_time_slider()` steps the Temporal Controller through those days;
 over `_DATES_ASKED` (12) dates it asks first, via `_choose()`, whether to build
 only the 12 covering most of the area — `geo.day_cover()`, computed in the
-task — or all: over a wide area most dates are one orbit's strip of it). Tried before: two equal
+task — or all: over a wide area most dates are one orbit's strip of it).
+A pick builds that mosaic at once (not while one builds: no menu then), and
+later clicks build it again. Below that it picks what the mosaic shows, per collection for the session
+(`_mosaic_render`): the default, a band combination, or an index (the
+curated ones, then the templates of its kind, radar or not, and saved ones:
+`_mosaic_index_labels()`). No scene is known yet, so a template is resolved
+on the scenes found (`_on_tiles_found()`; refused if they lack its bands) and
+the search keeps every asset for it (`_mosaic_assets()`). Tried before: two equal
 Search/Mosaic buttons, a Scenes | Mosaic mode switch, a text link under
-Search. It shows only for collections with `CollectionInfo.mosaic_reach_days`
-(the days within which every tile has a scene at any cloud cover: revisit
-plus publishing delay), set only on collections a tile mosaic was tried on:
-PC Sentinel-2 L2A and Landsat C2 L2 (32: 16-day revisit, published late),
-Earth Search Sentinel-2 C1. It is a search of its own from the same form
-(`_form_run()`, also Search's snapshot), not an action on the results: no
-search is needed first, and the result list is not used. While it runs the
-squares fill in with the progress and a click cancels. It runs one
-`stac.search_task.TileSearchTask`; a collection without MGRS tiles or WRS
-path/rows gets a message-bar note instead. The dates are cut into 2-day windows,
+Search. It shows for collections whose scenes are GeoTIFFs
+(`CollectionInfo.can_mosaic`; a discovered one: its `item_assets` name a
+GeoTIFF, which matched what the items serve for all 478 collections of PC,
+Earth Search and CDSE; not Earth Search's JPEG 2000 Sentinel-2 L1C). A tile
+mosaic needs
+`CollectionInfo.mosaic_reach_days` (the days within which every tile has a
+scene at any cloud cover: revisit plus publishing delay), set only on
+collections one was tried on: PC Sentinel-2 L2A, Earth Search Sentinel-2 C1
+and L2A (10), HLS S30 (14), Landsat C2 L2 and HLS L30 (32: 16-day revisit,
+published late), MODIS 09Q1 (40: 8-day composites, ~3 weeks late). Any
+other collection (no tile grid, or none tried) is covered by area instead
+(`geo.area_cover()`: `TileCover` with the search area as its one tile): its
+scenes up to the end date (from 1900: the Copernicus Data Space API refuses
+`../end`), newest first (`sortby`), a scene kept only where it adds ground,
+until the area is covered or `mosaic_max_scenes` are read. A DEM or yearly
+product so takes its newest year, older ones only where it has no tile (CDSE's
+DGED DEM keeps every tile: each has its own acquisition date), Sentinel-1 or
+NAIP each place's newest pass. `CollectionInfo.timeless` ones (DEMs,
+WorldCover, annual land cover) grey the dates out, are searched without them,
+and their mosaic is always this one, up to today (the right-click menu only
+picks what it shows). It is
+a search of its own from the same form (`_form_run()`, also Search's
+snapshot), not an action on the results: no search is needed first, and the
+result list is not used. While it runs the squares fill in with the progress
+and a click cancels. It runs one `stac.search_task.TileSearchTask`. For a
+tile mosaic the dates are cut into 2-day windows,
 searched 8 at a time (no next-page token chain: one took 30 s for France and
 Iberia) and trimmed by the fields extension (`supports_fields`, from
 `conformsTo`) to the footprint, properties and the assets the mosaic reads.

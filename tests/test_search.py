@@ -141,6 +141,18 @@ def test_fetch_collections_follows_next_and_skips_unloadable() -> None:
     assert [c.id for c in es] == ["sentinel-2-l2a"]
 
 
+def test_mosaic_only_for_collections_of_geotiffs() -> None:
+    cog = "image/tiff; application=geotiff; profile=cloud-optimized"
+    for assets, can in (
+        ({"data": {"type": cog, "roles": ["data"]}}, True),
+        ({"data": {"type": "application/netcdf"}}, False),
+        ({"zarr": {"type": "application/vnd+zarr"}}, False),
+        ({}, False),  # nothing declared: no CDSE collection of them serves one
+    ):
+        info = search._collection_to_info({"id": "x", "item_assets": assets})
+        assert info.can_mosaic is can, assets
+
+
 def test_cloud_query_only_for_curated_collections() -> None:
     pc = PLANETARY_COMPUTER_CATALOG
     assert search.server_cloud_filter(pc, "sentinel-2-l2a")
@@ -206,6 +218,14 @@ def test_redirects_drop_credentials_off_origin() -> None:
         raise AssertionError("downgrade must be refused")
     except urllib.error.HTTPError:
         pass
+
+
+def test_timeless_search_sends_no_dates() -> None:
+    """DEM, annual land cover: a date filter would find nothing."""
+    body = search._build_search_body("cop-dem-glo-30", (0, 0, 1, 1), "", 10, 250)
+    assert "datetime" not in body
+    body = search._build_search_body("x", (0, 0, 1, 1), "2020/2021", 10, 250)
+    assert body["datetime"] == "2020/2021"
 
 
 if __name__ == "__main__":

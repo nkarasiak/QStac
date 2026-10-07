@@ -64,6 +64,7 @@ def test_saved_listing_round_trips() -> None:
             rgb_assets=("data",),
             is_single_asset=True,
             default_action_label="Load scene",
+            can_mosaic=False,  # a NetCDF listing: no mosaic button after restart
         ),
     )
     assert collections_from_json(collections_to_json(listing)) == listing
@@ -75,7 +76,7 @@ def test_garbled_saved_listing_reads_as_empty() -> None:
     assert collections_from_json('{"a": 1}') == ()
     assert collections_from_json("[" * 100000) == ()
     # A bad row is skipped, the good one kept.
-    good = '["x","X","",["red"],false,false,"Load scene"]'
+    good = '["x","X","",["red"],false,false,"Load scene",true]'
     assert [c.id for c in collections_from_json(f'[[1,2],"s",{good}]')] == ["x"]
 
 

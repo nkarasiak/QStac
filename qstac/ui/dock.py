@@ -86,6 +86,7 @@ from ..stac.catalogs import (
     with_conformance,
 )
 from ..stac.collections import merge_collections
+from ..stac.indices import INDEX_TEMPLATES
 from ..stac.items import facet_counts, facet_label
 from ..stac.net import StacError
 from ..stac.search import PageToken, fetch_collections, fetch_root
@@ -100,7 +101,7 @@ from .constants import (
     _scenes,
     _shorten_id,
 )
-from .index_dialog import IndexDialog, custom_index_presets, index_key
+from .index_dialog import IndexDialog, _saved, custom_index_presets, index_key
 from .loading import (
     _NO_META,
     LayerLoader,
@@ -109,6 +110,7 @@ from .loading import (
     _guess_item_asset,
     _natural_key,
     _raster_assets,
+    _uses_visual,
     viewport_bbox_4326,
 )
 from .styles import fs
@@ -145,10 +147,32 @@ _EMPTY_HINT = (
 )
 
 
-def _mosaic_assets(coll: CollectionInfo) -> list[str]:
-    """The assets a mosaic of *coll* may read: its default composite's too."""
+def _mosaic_assets(coll: CollectionInfo, render: str = "") -> list[str]:
+    """The assets a mosaic of *coll* may read: its default composite's too,
+    or those of *render* (a band combination or index label); [] is all."""
+    if render:
+        presets = (*coll.band_presets, *coll.index_presets)
+        # ponytail: a template index resolves on the scenes, so they come
+        # with every asset; trim to its common names if responses get heavy.
+        return next((list(p.assets) for p in presets if p.label == render), [])
     extra = list(coll.default_preset.assets) if coll.default_preset else []
     return list(dict.fromkeys(_default_assets(coll) + extra))
+
+
+def _default_label(coll: CollectionInfo) -> str:
+    """What a default load of *coll* is called: its TCI when that is used."""
+    return "True Color (TCI)" if _uses_visual(coll) else coll.default_action_label
+
+
+def _mosaic_index_labels(coll: CollectionInfo) -> list[str]:
+    """The indices the mosaic button offers for *coll*, before any scene:
+    its curated ones, then the templates and saved ones of its kind (radar
+    or not); the scenes found say whether they resolve."""
+    sar = coll.category == "SAR"
+    labels = [p.label for p in coll.index_presets]
+    labels += [t[0] for t in INDEX_TEMPLATES if (t[2] == "sar") == sar]
+    labels += [t[0] for t in _saved()]
+    return list(dict.fromkeys(labels))
 
 
 # Start of the "All" date preset — older than any imagery a STAC API serves.
@@ -310,6 +334,9 @@ class QStacDock(QDockWidget):
         self._results: list[StacItemResult] = []
         self._facet_filter: dict[str, str] = {}  # FACETS key → chosen value
         self._tile_task: TileSearchTask | None = None  # Tile mosaic's search
+        # What the mosaic button shows, per collection id: a band combination
+        # or index label, "" (absent) the default. For the session only.
+        self._mosaic_render: dict[str, str] = {}
         self._next_page: PageToken | None = None
         self._rubber_band: QgsRubberBand | None = None  # hovered footprint
         self._search_band: QgsRubberBand | None = None  # area being searched
@@ -871,6 +898,8 @@ class QStacDock(QDockWidget):
         self.combo_collection.blockSignals(False)
         if hasattr(self, "cloud_slider"):
             self._update_cloud_visibility()
+        if hasattr(self, "btn_mosaic"):  # signals were blocked: no index change
+            self._sync_mosaic_button()
 
     def _build_date_range(self, layout: QVBoxLayout) -> None:
         """Build the date from/to row and preset buttons."""
@@ -1270,6 +1299,9 @@ class QStacDock(QDockWidget):
         self.combo_collection.currentIndexChanged.connect(
             lambda _: self._sync_mosaic_button()
         )
+        self.combo_collection.currentIndexChanged.connect(
+            lambda _: self._invite_mosaic()
+        )
         self._sync_mosaic_button()
         self.list_results.itemDoubleClicked.connect(self._on_item_double_clicked)
         self.list_results.customContextMenuRequested.connect(self._on_context_menu)
@@ -1621,6 +1653,12 @@ class QStacDock(QDockWidget):
         self.cloud_label.setVisible(visible)
         self.cloud_icon.setVisible(visible)
         self.cloud_value_label.setVisible(visible)
+        dated = coll is None or not coll.timeless
+        for edit in (self.date_from, self.date_to):
+            edit.setEnabled(dated)
+            edit.setToolTip(
+                "" if dated else "Any date: this collection has no dates to pick"
+            )
 
     def _update_cloud_label(self, value: int) -> None:
         self.cloud_value_label.setText(f"{value}%")
@@ -1970,7 +2008,9 @@ class QStacDock(QDockWidget):
             else lambda items: _filter_by_overlap(items, bbox, pct, area),
             collection=coll.id,
             bbox=run.bbox,
-            datetime_range=f"{run.date_from}T00:00:00Z/{run.date_to}T23:59:59Z",
+            datetime_range=""
+            if coll.timeless
+            else f"{run.date_from}T00:00:00Z/{run.date_to}T23:59:59Z",
             max_items=max_items or settings.page_size(),
             cloud_cover_max=run.cloud,
             catalog_url=catalog.search_url,
@@ -2248,12 +2288,15 @@ class QStacDock(QDockWidget):
         coll: CollectionInfo,
         catalog: CatalogProvider,
         index_preset: IndexPreset | None = None,
+        band_preset: BandPreset | None = None,
     ) -> None:
         items = self._one_orbit(items)
         if not items:
             return
         self._zoom_on_open(items)
-        self._loader.load_mosaic(items, coll, catalog, index_preset=index_preset)
+        self._loader.load_mosaic(
+            items, coll, catalog, index_preset=index_preset, band_preset=band_preset
+        )
 
     def _sync_mosaic_button(self, progress: float = 0.0) -> None:
         """The area caption, and the 9-square button: its rule, or progress.
@@ -2272,28 +2315,82 @@ class QStacDock(QDockWidget):
             return
         btn.set_progress(None)
         coll = self._current_collection()
-        btn.setVisible(coll is not None and coll.mosaic_reach_days > 0)
+        btn.setVisible(coll is not None and coll.can_mosaic)
+        if coll is None:
+            return
         cloud = self.cloud_slider.value()
-        has_limit = coll is not None and coll.has_cloud_cover and cloud < 100
+        has_limit = coll.has_cloud_cover and cloud < 100
         limit = f" under {cloud}% clouds" if has_limit else ""
         rule = (
             f"one per date{limit}, with the time slider"
-            if settings.mosaic_kind() == "time"
+            if settings.mosaic_kind() == "time" and not coll.timeless
             else f"each tile's newest scene{limit}"
+            if coll.mosaic_reach_days
+            else f"the newest scene of each place{limit}"
         )
         # Short: hovering also tints the area it covers on the map.
-        btn.setToolTip(f"Mosaic: {rule}\nRight-click: options")
+        render = self._mosaic_render.get(coll.id)
+        shows = f" of {render}" if render else ""
+        btn.setToolTip(f"Mosaic{shows}: {rule}\nRight-click: options")
+
+    def _invite_mosaic(self) -> None:
+        """A collection the 9 squares can mosaic was picked: they animate.
+
+        Not while the dock is still being built (it restores a collection).
+        """
+        coll = self._current_collection()
+        can = coll is not None and coll.can_mosaic
+        if can and self.isVisible() and self._tile_task is None:
+            self.btn_mosaic.animate(settings.mosaic_animation())
 
     def _show_mosaic_menu(self, pos: QPoint) -> None:
-        """Right-click on the 9 squares: which mosaic a click builds."""
+        """Right-click on the 9 squares: which mosaic a click builds, and
+        what it shows (the default, a band combination or an index)."""
+        coll = self._current_collection()
+        if coll is None or self._tile_task is not None:
+            return  # building: a click cancels, a pick would start another
         menu = QMenu(self)
+        if not coll.timeless:  # else no dates: the newest is the one mosaic
+            self._add_mosaic_kinds(menu, coll)
+            menu.addSeparator()
+        render = self._mosaic_render.get(coll.id, "")
+        # The TCI preset is the default already when the TCI is used.
+        tci = (coll.visual_asset,) if _uses_visual(coll) else None
+        bands = ["", *(b.label for b in coll.band_presets if b.assets != tci)]
+        for group in (bands, _mosaic_index_labels(coll)):
+            for label in group:
+                action = menu.addAction(label or _default_label(coll))
+                action.setCheckable(True)
+                action.setChecked(label == render)
+                action.triggered.connect(
+                    lambda _=False, r=label: self._set_mosaic_render(coll.id, r)
+                )
+            menu.addSeparator()
+        menu.setToolTipsVisible(True)
+        menu.exec(self.btn_mosaic.mapToGlobal(pos))
+
+    def _set_mosaic_render(self, coll_id: str, render: str) -> None:
+        """A pick builds that mosaic now; a later click builds it again."""
+        self._mosaic_render[coll_id] = render
+        self._sync_mosaic_button()
+        self._tile_mosaic()
+
+    def _add_mosaic_kinds(self, menu: QMenu, coll: CollectionInfo) -> None:
+        """The mosaic menu's first choice: newest scenes, or one per date."""
         kind = settings.mosaic_kind()
-        for key, text, tip in (
+        newest = (
             (
-                "tile",
                 "Newest scene per tile",
                 _lookback_text(settings.mosaic_lookback_days()),
-            ),
+            )
+            if coll.mosaic_reach_days
+            else (
+                "Newest scene of each place",
+                "Newest first, until the area is covered",
+            )
+        )
+        for key, text, tip in (
+            ("tile", *newest),
             (
                 "time",
                 "One mosaic per date, with the time slider",
@@ -2306,12 +2403,11 @@ class QStacDock(QDockWidget):
             action.setChecked(key == kind)
             action.setToolTip(tip)
             action.triggered.connect(lambda _=False, k=key: self._set_mosaic_kind(k))
-        menu.setToolTipsVisible(True)
-        menu.exec(self.btn_mosaic.mapToGlobal(pos))
 
     def _set_mosaic_kind(self, kind: str) -> None:
         settings.save_all({"mosaic_kind": kind})
         self._sync_mosaic_button()
+        self._tile_mosaic()
 
     def _on_mosaic_clicked(self) -> None:
         if self._tile_task is not None:
@@ -2348,13 +2444,15 @@ class QStacDock(QDockWidget):
             run.date_from,
             run.date_to,
             run.cloud,
-            _mosaic_assets(run.collection),  # what the mosaic reads
+            # What the mosaic reads.
+            _mosaic_assets(run.collection, self._mosaic_render.get(run.collection.id)),
             settings.http_timeout(),
             run.collection.mosaic_reach_days,
-            by_time=settings.mosaic_kind() == "time",
+            by_time=settings.mosaic_kind() == "time" and not run.collection.timeless,
             area=run.area,
             lookback_days=settings.mosaic_lookback_days(),
             max_scenes=settings.mosaic_max_scenes(),
+            timeless=run.collection.timeless,
         )
         self._tile_task = task
         # A bound method: the signal comes from the worker thread.
@@ -2379,9 +2477,13 @@ class QStacDock(QDockWidget):
             else:
                 limit = f" under {run.cloud}% clouds" if run.cloud is not None else ""
                 when = (
-                    f"from {run.date_from} to {run.date_to}"
+                    "here"
+                    if task.timeless
+                    else f"from {run.date_from} to {run.date_to}"
                     if task.by_time
                     else f"in the year before {run.date_from}"
+                    if task.reach_days
+                    else f"up to {run.date_to}"
                 )
                 self._notify(
                     f"No {run.collection.label} scene of this area{limit} {when}.",
@@ -2398,23 +2500,41 @@ class QStacDock(QDockWidget):
             [("mIconRaster.svg", "Build anyway", "One mosaic of them all.", True)],
         ):
             return
-        self._note_mosaic(task, run)
         # Its own snapshot's collection: there may have been no search at all.
+        coll = run.collection
+        render = self._mosaic_render.get(coll.id, "")
+        band = next((b for b in coll.band_presets if b.label == render), None)
+        index = None
+        if render and band is None:
+            found = (*coll.index_presets, *custom_index_presets(task.scenes[0], set()))
+            index = next((p for p in found if p.label == render), None)
+            if index is None:
+                self._notify(
+                    f"{render}: these {coll.label} scenes lack its bands.",
+                    Qgis.MessageLevel.Warning,
+                    10,
+                )
+                return
+        self._note_mosaic(task, run)
         if task.by_time:
             self._mosaic_per_date(
-                task.scenes, run.collection, run.catalog, task.day_cover
+                task.scenes, coll, run.catalog, task.day_cover, index, band
             )
         else:
-            self._load_mosaic(task.scenes, run.collection, run.catalog)
+            self._load_mosaic(task.scenes, coll, run.catalog, index, band)
 
     def _note_mosaic(self, task: TileSearchTask, run: _SearchRun) -> None:
         """What the mosaic's scenes leave out or reach for, in the message bar."""
         notes = []
         oldest = task.scenes[0].datetime_str[:10]
-        if oldest < run.date_from:
-            notes.append(f"some tiles go back to {oldest}")
+        if oldest < run.date_from and not task.timeless:
+            notes.append(f"some of it goes back to {oldest}")
         if task.capped:
-            notes.append(f"the newest {len(task.scenes)} scenes of the dates only")
+            notes.append(
+                f"the newest {len(task.scenes)} scenes of the dates only"
+                if task.by_time
+                else f"read the newest {task.max_scenes} scenes only"
+            )
         if task.missing:
             names = ", ".join(t.split()[-1] for t in task.missing[:6])
             more = "\u2026" if len(task.missing) > 6 else ""
@@ -2431,6 +2551,8 @@ class QStacDock(QDockWidget):
         coll: CollectionInfo,
         catalog: CatalogProvider,
         cover: dict[str, float],
+        index_preset: IndexPreset | None = None,
+        band_preset: BandPreset | None = None,
     ) -> None:
         """One mosaic per (UTC) day, stepped through by the time slider.
 
@@ -2471,7 +2593,9 @@ class QStacDock(QDockWidget):
                 scenes = [it for day in days.values() for it in day]
         self._zoom_on_open(scenes)
         for day in days.values():
-            self._loader.load_mosaic(day, coll, catalog, stack=True)
+            self._loader.load_mosaic(
+                day, coll, catalog, True, index_preset, band_preset
+            )
         self._show_time_slider(scenes)
 
     def _on_item_double_clicked(self, list_item: QListWidgetItem) -> None:
@@ -2537,7 +2661,7 @@ class QStacDock(QDockWidget):
             zoom_action.triggered.connect(add_and_zoom)
             menu.addSeparator()
 
-        rgb_action = menu.addAction(coll.default_action_label + suffix)
+        rgb_action = menu.addAction(_default_label(coll) + suffix)
         rgb_action.triggered.connect(lambda: self._add_items(list(targets)))
 
         if many:

@@ -22,7 +22,7 @@ from osgeo import gdal
 from qgis.core import QgsGeometry
 
 import qstac.raster.layers as layers_mod
-from qstac.geo import TileCover, _filter_by_overlap, day_cover
+from qstac.geo import TileCover, _filter_by_overlap, area_cover, day_cover
 from qstac.raster.clip import _cog_geometry
 from qstac.raster.cog import (
     _vrt_path,
@@ -32,7 +32,7 @@ from qstac.raster.cog import (
     restore_gdal_config,
     set_s3_login,
 )
-from qstac.raster.vrt import _build_vrt, _write_vrt_xml
+from qstac.raster.vrt import _add_virtual_overviews, _build_vrt, _write_vrt_xml
 from qstac.stac.items import AssetProj
 
 gdal.UseExceptions()
@@ -193,6 +193,31 @@ def test_mosaic_is_one_layer_per_crs_with_stored_statistics() -> None:
         # What QGIS's GDAL provider asks first: stored stats, never computed.
         stats = ds.GetRasterBand(1).GetStatistics(True, False)
         assert stats[:2] == [9.0, 9.0], stats
+
+
+def test_mixed_resolution_mosaic_gets_overviews() -> None:
+    """DEM tiles 2400 px wide north of 50°N, 3600 south: GDAL derives no
+    overviews for their mosaic, so statistics read every pixel."""
+    with tempfile.TemporaryDirectory() as tmp:
+        srcs = []
+        for i, w in enumerate((3600, 2400)):
+            path = f"{tmp}/{w}.tif"
+            ds = gdal.GetDriverByName("GTiff").Create(path, w, 3600, 1, gdal.GDT_Byte)
+            ds.SetGeoTransform([i, 1 / w, 0, 51, 0, -1 / 3600])
+            ds.SetProjection("EPSG:4326")
+            ds.BuildOverviews("NEAREST", [2, 4, 8])
+            ds = None
+            srcs.append(path)
+        vrt = _build_vrt(f"{tmp}/m.vrt", srcs)
+
+        def overviews() -> int:
+            ds = gdal.Open(vrt)
+            return ds.GetRasterBand(1).GetOverviewCount()
+
+        assert overviews() == 0
+        _add_virtual_overviews(vrt)
+        assert overviews() == 3
+        assert gdal.GetConfigOption("VRT_VIRTUAL_OVERVIEWS") is None
 
 
 def test_invalid_footprint_is_kept() -> None:
@@ -529,6 +554,27 @@ def test_tile_cover_fills_slivers_with_older_scenes() -> None:
     alone.add([scene("south", "31TDL", 25, 0, 0, 1, 0.2)])
     alone.add([scene("older", "31TDL", 20, 0, 0, 1, 1)])
     assert [i.id for i in alone.scenes()] == ["south"]
+
+
+def test_area_cover_takes_the_newest_year_and_fills_its_holes() -> None:
+    """No tile grid (DEM, yearly land cover): one cover for the whole area."""
+
+    def scene(fid: str, year: int, x0: float, x1: float):
+        ring = [[x0, 0], [x1, 0], [x1, 1], [x0, 1], [x0, 0]]
+        return SimpleNamespace(
+            id=fid,
+            datetime_str=f"{year}-01-01",
+            geometry={"type": "Polygon", "coordinates": [ring]},
+            facets={},
+        )
+
+    cover = area_cover((0, 0, 3, 1))
+    # Newest first, as the server sorts: 2023 lacks the east tile.
+    cover.add([scene("w23", 2023, 0, 1), scene("m23", 2023, 1, 2)])
+    assert cover.missing() == ["area"]
+    cover.add([scene("w22", 2022, 0, 1), scene("e22", 2022, 2, 3)])
+    assert cover.missing() == []
+    assert [i.id for i in cover.scenes()] == ["e22", "w23", "m23"]
 
 
 def test_tile_mosaic_reads_back_when_the_reach_is_empty() -> None:
