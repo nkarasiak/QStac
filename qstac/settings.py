@@ -60,8 +60,9 @@ DEFAULTS: dict[str, object] = {
     # How far before the start date a tile mosaic looks for a tile the dates
     # leave empty; 0 keeps it to the search dates.
     "mosaic_lookback_days": 365,
-    # A mosaic per date keeps the newest this many scenes of its dates.
-    "mosaic_max_scenes": 1000,
+    # A mosaic per date keeps the newest this many scenes of its dates; one
+    # with no tile grid (a DEM) reads at most this many to cover the area.
+    "mosaic_max_scenes": 500,
     # Played by the 9 squares when a collection that mosaics well is picked:
     # "sweep", "build", "pulse" (widgets.MosaicButton.ANIMATIONS) or "off".
     "mosaic_animation": "sweep",

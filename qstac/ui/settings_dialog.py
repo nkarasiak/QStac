@@ -592,14 +592,17 @@ class SettingsDialog(QDialog):
             lookback,
             "Newest scene per tile: how far back to look for a tile the dates "
             "leave empty. Only the search dates leaves it empty (the basemap "
-            "shows).",
+            "shows), and keeps a mosaic with no tile grid to the dates too. Also "
+            "in the mosaic button's right-click menu.",
         )
         self._row(
             form,
-            "Most scenes per date mosaic:",
+            "Most scenes per mosaic:",
             "mosaic_max_scenes",
             self._spin(50, 5000, " scenes", 50),
-            "One mosaic per date keeps the newest this many scenes of the dates.",
+            "One mosaic per date keeps the newest this many scenes of the dates. "
+            "A collection with no tile grid (a DEM, a yearly product) reads at "
+            "most this many to cover the area, and asks before building part of it.",
         )
         self._row(
             form,

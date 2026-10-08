@@ -135,7 +135,8 @@ class TileSearchTask(QgsTask):
     product: today), newest first, into :func:`geo.area_cover` until the
     area is covered, reading at most *max_scenes*. A DEM or yearly product
     so takes its newest year (older ones only where it has no tile),
-    Sentinel-1 or NAIP each place's newest pass.
+    Sentinel-1 or NAIP each place's newest pass. A *lookback_days* of 0
+    keeps it to the search dates instead (not *timeless*: it has none).
     """
 
     def __init__(
@@ -232,8 +233,10 @@ class TileSearchTask(QgsTask):
     def _cover_area(self) -> bool:
         """No tile grid: newest first until the area is covered (class doc)."""
         end = datetime.date.today() if self.timeless else self.date_to
+        only_dates = self.lookback_days == 0 and not self.timeless
         # Not "../end": the Copernicus Data Space API refuses open ranges.
-        when = f"1900-01-01T00:00:00Z/{end}T23:59:59Z"
+        start = self.date_from if only_dates else "1900-01-01"
+        when = f"{start}T00:00:00Z/{end}T23:59:59Z"
         cover = area_cover(self.bbox, self.area)
         headers = request_headers(self.catalog) or None
         read = 0

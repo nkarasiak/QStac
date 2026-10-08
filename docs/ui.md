@@ -108,12 +108,15 @@ click builds, kept in the `mosaic_kind` setting: *Newest scene per tile*
 (`tile`, the default, below) or *One mosaic per date, with the time slider*
 (`time`, to see the area change: `TileSearchTask(by_time=True)` with
 `_EveryScene` in place of `TileCover` takes every scene of the dates, no
-reach, the newest `mosaic_max_scenes` (1000, Settings > Mosaic); `_mosaic_per_date()` builds one mosaic per
+reach, the newest `mosaic_max_scenes` (500, Settings > Mosaic); `_mosaic_per_date()` builds one mosaic per
 UTC day, `load_mosaic(stack=True)` so the time filter is not lifted, and
 `_show_time_slider()` steps the Temporal Controller through those days;
 over `_DATES_ASKED` (12) dates it asks first, via `_choose()`, whether to build
 only the 12 covering most of the area — `geo.day_cover()`, computed in the
 task — or all: over a wide area most dates are one orbit's strip of it).
+Under them *Only the search dates* (enabled for the newest-scenes kind) sets
+`mosaic_lookback_days` to 0, or back to its default when unchecked: no scene
+from before the start date, for a tile mosaic or an area cover alike.
 A pick builds that mosaic at once (not while one builds: no menu then), and
 later clicks build it again. Below that it picks what the mosaic shows, per collection for the session
 (`_mosaic_render`): the default, a band combination, or an index (the
@@ -135,8 +138,10 @@ published late), MODIS 09Q1 (40: 8-day composites, ~3 weeks late). Any
 other collection (no tile grid, or none tried) is covered by area instead
 (`geo.area_cover()`: `TileCover` with the search area as its one tile): its
 scenes up to the end date (from 1900: the Copernicus Data Space API refuses
-`../end`), newest first (`sortby`), a scene kept only where it adds ground,
-until the area is covered or `mosaic_max_scenes` are read. A DEM or yearly
+`../end`; from the start date when `mosaic_lookback_days` is 0), newest first (`sortby`), a scene kept only where it adds ground,
+until the area is covered or `mosaic_max_scenes` are read; then it asks
+before building the part they cover (a world-wide view of CDSE's 30 m DEM
+is thousands of 1° tiles, the newest 1000 a strip of it). A DEM or yearly
 product so takes its newest year, older ones only where it has no tile (CDSE's
 DGED DEM keeps every tile: each has its own acquisition date), Sentinel-1 or
 NAIP each place's newest pass. `CollectionInfo.timeless` ones (DEMs,

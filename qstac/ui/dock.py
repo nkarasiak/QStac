@@ -2328,6 +2328,9 @@ class QStacDock(QDockWidget):
             if coll.mosaic_reach_days
             else f"the newest scene of each place{limit}"
         )
+        if settings.mosaic_kind() == "tile" and settings.mosaic_lookback_days() == 0:
+            rule += ", search dates only"
+
         # Short: hovering also tints the area it covers on the map.
         render = self._mosaic_render.get(coll.id)
         shows = f" of {render}" if render else ""
@@ -2352,6 +2355,15 @@ class QStacDock(QDockWidget):
         menu = QMenu(self)
         if not coll.timeless:  # else no dates: the newest is the one mosaic
             self._add_mosaic_kinds(menu, coll)
+            only = menu.addAction("Only the search dates")
+            only.setCheckable(True)
+            only.setChecked(settings.mosaic_lookback_days() == 0)
+            only.setEnabled(settings.mosaic_kind() == "tile")  # by date: always
+            only.setToolTip(
+                "Newest scenes: none from before the start date, an area the"
+                " dates leave empty stays empty"
+            )
+            only.toggled.connect(self._set_only_dates)
             menu.addSeparator()
         render = self._mosaic_render.get(coll.id, "")
         # The TCI preset is the default already when the TCI is used.
@@ -2406,6 +2418,13 @@ class QStacDock(QDockWidget):
 
     def _set_mosaic_kind(self, kind: str) -> None:
         settings.save_all({"mosaic_kind": kind})
+        self._sync_mosaic_button()
+        self._tile_mosaic()
+
+    def _set_only_dates(self, on: bool) -> None:
+        """Off: back to the default look back (Settings > Mosaic sets others)."""
+        days = 0 if on else settings.DEFAULTS["mosaic_lookback_days"]
+        settings.save_all({"mosaic_lookback_days": days})
         self._sync_mosaic_button()
         self._tile_mosaic()
 
@@ -2480,7 +2499,7 @@ class QStacDock(QDockWidget):
                     "here"
                     if task.timeless
                     else f"from {run.date_from} to {run.date_to}"
-                    if task.by_time
+                    if task.by_time or task.lookback_days == 0
                     else f"in the year before {run.date_from}"
                     if task.reach_days
                     else f"up to {run.date_to}"
@@ -2491,7 +2510,18 @@ class QStacDock(QDockWidget):
                     10,
                 )
             return
-        big = not task.by_time and len(task.scenes) > _MOSAIC_ASKED
+        # No tile grid, and the cap read before the area was covered: a
+        # world-wide DEM is thousands of tiles, and the newest of them a strip.
+        part = task.capped and not task.by_time
+        if part and not self._choose(
+            "Build part of this mosaic?",
+            f"This area has more than {_scenes(task.max_scenes)}: the mosaic"
+            " leaves the rest of it empty. Zoom in to cover all of it, or raise"
+            " Settings > Mosaic > Most scenes per mosaic.",
+            [("mIconRaster.svg", "Build anyway", "The part they cover.", True)],
+        ):
+            return
+        big = not part and not task.by_time and len(task.scenes) > _MOSAIC_ASKED
         if big and not self._choose(
             "Build this mosaic?",
             f"It takes {_scenes(len(task.scenes))}: one long build, and every"
@@ -2533,7 +2563,7 @@ class QStacDock(QDockWidget):
             notes.append(
                 f"the newest {len(task.scenes)} scenes of the dates only"
                 if task.by_time
-                else f"read the newest {task.max_scenes} scenes only"
+                else "part of the area only"
             )
         if task.missing:
             names = ", ".join(t.split()[-1] for t in task.missing[:6])
