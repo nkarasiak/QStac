@@ -2262,7 +2262,6 @@ class QStacDock(QDockWidget):
         coll = self._item_collection(items[0]) if items else None
         if coll is None or self._run is None:
             return
-        self._zoom_on_open(items)
         self._loader.load(
             items,
             coll,
@@ -2273,15 +2272,6 @@ class QStacDock(QDockWidget):
             index_preset=index_preset,
         )
 
-    def _zoom_on_open(self, items: list[StacItemResult]) -> None:
-        """Zoom to the scenes being opened, when Settings > Display says so.
-
-        Before the load: it clips what the map shows, so it then covers them.
-        """
-        boxes = [it.bbox for it in items if it.bbox and len(it.bbox) == 4]
-        if settings.zoom_to_scene() == "always" and boxes:
-            self._zoom_to_bbox(_union(boxes))
-
     def _load_mosaic(
         self,
         items: list[StacItemResult],
@@ -2289,13 +2279,10 @@ class QStacDock(QDockWidget):
         catalog: CatalogProvider,
         index_preset: IndexPreset | None = None,
         band_preset: BandPreset | None = None,
-        zoom: bool = True,
     ) -> None:
         items = self._one_orbit(items)
         if not items:
             return
-        if zoom:
-            self._zoom_on_open(items)
         self._loader.load_mosaic(
             items, coll, catalog, index_preset=index_preset, band_preset=band_preset
         )
@@ -2553,9 +2540,7 @@ class QStacDock(QDockWidget):
                 task.scenes, coll, run.catalog, task.day_cover, index, band
             )
         else:
-            # No zoom: the area is the one framed (or drawn); its scenes'
-            # bbox is wider (whole tiles), the view would move off it.
-            self._load_mosaic(task.scenes, coll, run.catalog, index, band, zoom=False)
+            self._load_mosaic(task.scenes, coll, run.catalog, index, band)
 
     def _note_mosaic(self, task: TileSearchTask, run: _SearchRun) -> None:
         """What the mosaic's scenes leave out or reach for, in the message bar."""
@@ -2679,8 +2664,8 @@ class QStacDock(QDockWidget):
 
         menu = QMenu(self)
 
-        # First: load and go there, whatever the zoom setting says. Zooming
-        # first, as _zoom_on_open does: a load clips what the map shows.
+        # First: load and go there (a load never zooms). Zooming first: a
+        # load clips what the map shows.
         # (Zoom alone is the list's Z key.) "&&": a single & is a mnemonic.
         boxes = [t.bbox for t in targets if t.bbox and len(t.bbox) == 4]
         if boxes:

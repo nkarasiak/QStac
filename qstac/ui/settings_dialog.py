@@ -549,17 +549,6 @@ class SettingsDialog(QDialog):
         )
         self._row(
             form,
-            "Map:",
-            "zoom_to_scene",
-            self._combo(
-                [
-                    ("Zoom to each scene opened", "always"),
-                    ("Leave the map where it is", "never"),
-                ]
-            ),
-        )
-        self._row(
-            form,
             "Contrast:",
             "stretch_method",
             self._combo(_STRETCH_METHODS),

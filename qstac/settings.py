@@ -49,9 +49,6 @@ DEFAULTS: dict[str, object] = {
     # Prefer the provider-rendered true-color asset (Sentinel-2 TCI) for
     # default loads: one 8-bit COG instead of a 3-band 16-bit VRT.
     "use_visual_asset": True,
-    # Zoom the map to a scene when opening it: "always" or "never". Always by
-    # default: without it a newcomer cannot tell where the layer went.
-    "zoom_to_scene": "always",
     "stretch_method": "fixed",  # "fixed", "cumulative_cut", "min_max"
     # The 9-square button's mosaic (its right-click menu): "tile", each
     # tile's newest scene going back in time, or "time", every scene of the
@@ -404,11 +401,6 @@ def date_presets() -> list[int | str]:
 
 def use_visual_asset() -> bool:
     return bool(_get("use_visual_asset", bool))
-
-
-def zoom_to_scene() -> str:
-    mode = str(_get("zoom_to_scene", str))
-    return "never" if mode == "never" else "always"  # "ask" was dropped
 
 
 def mosaic_kind() -> str:

@@ -38,12 +38,9 @@ layer, `world_map.gpkg` as fallback) — not at QGIS start, where the project is
 always empty and a basemap would mark it dirty. A search on an empty project
 does the same and stops there, the whole world being in view.
 
-Opening a scene (`_add_items()`, mosaic) first runs `_zoom_on_open()`: unless
-the `zoom_to_scene` setting is `never` (Settings > Display; `always` by default,
-as without it a newcomer cannot tell where the layer went). It zooms *before*
-the load, since a load clips what the map shows. Not a tile mosaic (the
-9 squares): its area is the one framed or drawn, and its scenes' bbox, whole
-tiles, would move the view off it.
+Opening a scene or a mosaic never moves the map: the results come from the
+view, so it is on screen already. Going there is the result menu's *Add & zoom
+to scene* or the list's Z key.
 
 The form's blocks have captions (*Catalog*, *Collection*, *Dates*,
 `_add_caption()`) whose tooltips explain the STAC terms: two bare dropdowns
@@ -186,7 +183,7 @@ has a layer in the project get an *On map* badge (`LayerLoader.addedChanged`,
 `is_on_map()`); the sort button opens a menu.
 
 The result menu starts with *Add & zoom to scene* (*… to N scenes* for a
-selection: zooms, then loads, whatever `zoom_to_scene` says; zoom alone is
+selection: zooms, then loads, since a load clips what the map shows; zoom alone is
 the list's Z key), then the default load, mosaic and time stack, then submenus:
 *Band combinations*, *Spectral indices* (with *Custom index…*; for several
 scenes also *Spectral index mosaic*, one mosaic of each scene's index), *Load asset*,
