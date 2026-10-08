@@ -24,7 +24,12 @@ from .cog import (
     _vsicurl,
     configure_gdal_for_cog,
 )
-from .style import _apply_rgb_renderer, _apply_singleband_renderer, resolve_bake_stretch
+from .style import (
+    _apply_rgb_renderer,
+    _apply_singleband_renderer,
+    label_classes,
+    resolve_bake_stretch,
+)
 from .vrt import (
     _add_virtual_overviews,
     _band_type,
@@ -445,6 +450,10 @@ def stamp_layer(
         ]
     )
     layer.setMetadata(md)
+    # Only when one asset has classes: which asset the layer shows is not known.
+    named = [m.classes for m in items[0].asset_meta.values() if m.classes]
+    if len(named) == 1:
+        label_classes(layer, named[0])
 
     layer.setCustomProperty("qstac/catalog", catalog.id)
     layer.setCustomProperty("qstac/collection", coll.id)

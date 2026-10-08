@@ -81,6 +81,8 @@ class AssetMeta:
     # Only for a single-band asset: a 3-band "visual" is not "red".
     common_name: str = ""
     media_type: str = ""
+    # STAC classification: value → name (ESA WorldCover's land cover classes).
+    classes: dict[int, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -345,7 +347,25 @@ def _asset_meta(info: dict) -> AssetMeta:
         else (),
         common_name=str(common),
         media_type=str(info.get("type") or ""),
+        classes=_classes(info),
     )
+
+
+def _classes(info: dict) -> dict[int, str]:
+    """An asset's ``classification:classes`` (or its one band's), value → name."""
+    raw = info.get("classification:classes")
+    bands = info.get("raster:bands") or info.get("bands") or []
+    if raw is None and isinstance(bands, list) and len(bands) == 1:
+        raw = (
+            bands[0].get("classification:classes")
+            if isinstance(bands[0], dict)
+            else None
+        )
+    out = {}
+    for c in raw if isinstance(raw, list) else []:
+        if isinstance(c, dict) and isinstance(c.get("value"), int):
+            out[c["value"]] = str(c.get("description") or c.get("name") or c["value"])
+    return out
 
 
 def _feature_to_result(feature: dict, collection: str) -> StacItemResult:

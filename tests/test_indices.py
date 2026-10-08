@@ -102,6 +102,29 @@ def test_asset_meta_parsed() -> None:
     assert meta["nir"].common_name == "nir"  # STAC 1.1 spelling
 
 
+def test_classification_classes_parsed() -> None:
+    classes = [
+        {"value": 10, "description": "Tree cover"},
+        {"value": 80, "name": "water"},
+    ]
+    feature = {
+        "id": "WC",
+        "properties": {"datetime": "2021-01-01T00:00:00Z"},
+        "assets": {
+            "map": {"href": "https://x/m.tif", "classification:classes": classes},
+            "band": {
+                "href": "https://x/b.tif",
+                "raster:bands": [{"classification:classes": classes}],
+            },
+            "plain": {"href": "https://x/p.tif"},
+        },
+    }
+    meta = _feature_to_result(feature, "wc").asset_meta
+    assert meta["map"].classes == {10: "Tree cover", 80: "water"}
+    assert meta["band"].classes == meta["map"].classes  # on its one band
+    assert meta["plain"].classes == {}
+
+
 def test_templates_parse() -> None:
     for label, expr, ramp, _vrange in INDEX_TEMPLATES:
         assert parse_expression(expr), label

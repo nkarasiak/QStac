@@ -14,6 +14,7 @@ from qgis.core import (
     Qgis,
     QgsApplication,
     QgsDateTimeRange,
+    QgsPalettedRasterRenderer,
     QgsProject,
     QgsProviderRegistry,
     QgsProviderSublayerDetails,
@@ -840,12 +841,16 @@ class LayerLoader(QObject):
         The new layer's renderer is cloned rather than re-applied: a baked VRT
         is already Byte 0..255, and a DN-space stretch would clip it to blank.
         An index keeps the one it has: an auto range read from the first
-        clip's statistics, or set by the user, must survive the swaps.
+        clip's statistics, or set by the user, must survive the swaps; so does
+        a palette, its classes named by ``stamp_layer`` (same COG, same colours).
         """
         new = self._build_item_layer(it, ld, local_clips)
         if new is None or not new.isValid() or new.renderer() is None:
             return False
-        keep = ld.index_preset is not None and layer.renderer() is not None
+        paletted = isinstance(layer.renderer(), QgsPalettedRasterRenderer)
+        keep = (
+            ld.index_preset is not None or paletted
+        ) and layer.renderer() is not None
         old = (layer if keep else new).renderer()
         renderer = old.clone()
         if hasattr(renderer, "setClassificationMin"):

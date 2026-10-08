@@ -172,6 +172,28 @@ def test_default_nodata_only_fills_unmasked_sources() -> None:
         assert band.ReadAsArray().tolist() == [[0, 3, gap, gap, 0, 4]]
 
 
+def test_palette_keeps_the_stac_classes_named() -> None:
+    """ESA WorldCover: 256 colours in the COG, 11 classes named in STAC."""
+    from qgis.core import QgsRasterLayer
+
+    from qstac.raster.style import _apply_singleband_renderer, label_classes
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src = _tif(f"{tmp}/c.tif", np.array([[10, 80]], np.uint8), gdal.GDT_Byte)
+        ds = gdal.Open(src, gdal.GA_Update)
+        table = gdal.ColorTable()
+        for v in range(256):
+            table.SetColorEntry(v, (0, 100, 0, 255) if v == 10 else (0, 0, v, 255))
+        ds.GetRasterBand(1).SetRasterColorTable(table)
+        ds = None
+        layer = QgsRasterLayer(src, "c", "gdal")
+        _apply_singleband_renderer(layer)
+        assert len(layer.renderer().classes()) == 256
+        label_classes(layer, {10: "Tree cover", 80: "Water"})
+        got = [(c.value, c.label, c.color.name()) for c in layer.renderer().classes()]
+        assert got == [(10, "Tree cover", "#006400"), (80, "Water", "#000050")], got
+
+
 def test_mosaic_is_one_layer_per_crs_with_stored_statistics() -> None:
     """Scenes either side of a UTM zone line all load, each zone its own VRT.
 

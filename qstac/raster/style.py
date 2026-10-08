@@ -203,6 +203,23 @@ def _apply_singleband_renderer(layer: QgsRasterLayer) -> None:
     )
 
 
+def label_classes(layer: QgsRasterLayer, classes: dict[int, str]) -> None:
+    """Keep the palette's *classes* alone, named: a COG's colour table holds
+    colours only, 256 of them (ESA WorldCover), so the legend listed 0..255.
+    """
+    renderer = layer.renderer()
+    if not classes or not isinstance(renderer, QgsPalettedRasterRenderer):
+        return
+    colours = {int(c.value): c.color for c in renderer.classes()}
+    if not set(classes) <= set(colours):
+        return  # another asset's classes
+    kept = [
+        QgsPalettedRasterRenderer.Class(v, colours[v], name)
+        for v, name in sorted(classes.items())
+    ]
+    layer.setRenderer(QgsPalettedRasterRenderer(layer.dataProvider(), 1, kept))
+
+
 # Color ramp stops (value, hex) on -1..1, stretched to the index's own range.
 _INDEX_RAMPS: dict[str, list[tuple[float, str]]] = {
     # Brown (bare) → yellow → greens (dense vegetation).

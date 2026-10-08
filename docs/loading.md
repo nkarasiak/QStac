@@ -31,6 +31,11 @@ corners never paint over a neighbour. Never a signed or float file: a DEM's
 0 (Cop-DEM, ALOS) is sea level; a mosaic of those gets a nodata of the VRT
 alone (`vrt._GAP`, -32768), so where no tile is (open sea) is transparent,
 not 0, black, and the tiles' own 0 stays a value.
+A single-band COG with a colour table (ESA WorldCover, IO LULC) renders
+paletted (`style._apply_singleband_renderer()`); `stamp_layer()` then keeps
+only the classes of the scene's one asset with STAC `classification:classes`
+(`AssetMeta.classes`), named (`style.label_classes()`): the table alone is 256
+unnamed colours. A source swap keeps a paletted renderer, as it does an index's.
 A mosaic VRT GDAL derives no overviews for (sources at different
 resolutions: Cop-DEM tiles are 2400 px wide north of 50°N, 3600 south) gets
 virtual ones (`vrt._add_virtual_overviews()`, read from the sources' own):
