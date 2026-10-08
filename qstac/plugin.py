@@ -38,7 +38,7 @@ class QStacPlugin:
         self.settings_action = QAction("Settings…", self.iface.mainWindow())
         self.settings_action.triggered.connect(self._open_settings)
 
-        self.iface.addWebToolBarIcon(self.action)
+        self.iface.addToolBarIcon(self.action)
         self.iface.addPluginToWebMenu(_PLUGIN_NAME, self.action)
         self.iface.addPluginToWebMenu(_PLUGIN_NAME, self.settings_action)
 
@@ -84,7 +84,7 @@ class QStacPlugin:
         restore_gdal_config()
 
         if self.action is not None:
-            self.iface.removeWebToolBarIcon(self.action)
+            self.iface.removeToolBarIcon(self.action)
             self.iface.removePluginWebMenu(_PLUGIN_NAME, self.action)
             self.action = None
 
