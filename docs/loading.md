@@ -28,7 +28,9 @@ Byte/UInt16 file with no nodata, mask or alpha (PC's Sentinel-2 TCI and
 bands declare nothing) gets the STAC one, else 0 (`_build_vrt(default_nodata=)`,
 `vrt._stac_nodata()`), so its black edge is transparent and a mosaic's empty
 corners never paint over a neighbour. Never a signed or float file: a DEM's
-0 (Cop-DEM, ALOS) is sea level.
+0 (Cop-DEM, ALOS) is sea level; a mosaic of those gets a nodata of the VRT
+alone (`vrt._GAP`, -32768), so where no tile is (open sea) is transparent,
+not 0, black, and the tiles' own 0 stays a value.
 A mosaic VRT GDAL derives no overviews for (sources at different
 resolutions: Cop-DEM tiles are 2400 px wide north of 50°N, 3600 south) gets
 virtual ones (`vrt._add_virtual_overviews()`, read from the sources' own):

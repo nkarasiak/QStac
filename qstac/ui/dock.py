@@ -2289,11 +2289,13 @@ class QStacDock(QDockWidget):
         catalog: CatalogProvider,
         index_preset: IndexPreset | None = None,
         band_preset: BandPreset | None = None,
+        zoom: bool = True,
     ) -> None:
         items = self._one_orbit(items)
         if not items:
             return
-        self._zoom_on_open(items)
+        if zoom:
+            self._zoom_on_open(items)
         self._loader.load_mosaic(
             items, coll, catalog, index_preset=index_preset, band_preset=band_preset
         )
@@ -2551,7 +2553,9 @@ class QStacDock(QDockWidget):
                 task.scenes, coll, run.catalog, task.day_cover, index, band
             )
         else:
-            self._load_mosaic(task.scenes, coll, run.catalog, index, band)
+            # No zoom: the area is the one framed (or drawn); its scenes'
+            # bbox is wider (whole tiles), the view would move off it.
+            self._load_mosaic(task.scenes, coll, run.catalog, index, band, zoom=False)
 
     def _note_mosaic(self, task: TileSearchTask, run: _SearchRun) -> None:
         """What the mosaic's scenes leave out or reach for, in the message bar."""
@@ -2621,7 +2625,6 @@ class QStacDock(QDockWidget):
             if picked == most:
                 days = {d: days[d] for d in sorted(best)}
                 scenes = [it for day in days.values() for it in day]
-        self._zoom_on_open(scenes)
         for day in days.values():
             self._loader.load_mosaic(
                 day, coll, catalog, True, index_preset, band_preset

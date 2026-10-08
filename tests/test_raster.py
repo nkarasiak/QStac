@@ -160,6 +160,16 @@ def test_default_nodata_only_fills_unmasked_sources() -> None:
         dem = _tif(f"{tmp}/d.tif", np.array([[0, 3]], np.int16), gdal.GDT_Int16)
         dem_vrt = gdal.Open(_build_vrt("", [dem], default_nodata=0))
         assert dem_vrt.GetRasterBand(1).GetNoDataValue() is None
+        # A DEM mosaic: where no tile is (open sea) is nodata, not 0 (black).
+        far = _tif(f"{tmp}/e.tif", np.array([[0, 4]], np.int16), gdal.GDT_Int16)
+        ds = gdal.Open(far, gdal.GA_Update)
+        ds.SetGeoTransform([_GRID[0] + 40, *_GRID[1:]])  # a 2-pixel gap
+        ds = None
+        sea = gdal.Open(_build_vrt("", [dem, far]))
+        band = sea.GetRasterBand(1)
+        gap = band.GetNoDataValue()
+        assert gap is not None and gap < -1000, gap
+        assert band.ReadAsArray().tolist() == [[0, 3, gap, gap, 0, 4]]
 
 
 def test_mosaic_is_one_layer_per_crs_with_stored_statistics() -> None:

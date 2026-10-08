@@ -28,17 +28,25 @@ def _build_vrt(
     sources' own; *default_nodata* applies only to an unsigned-integer first
     source with no nodata or mask at all (PC's Sentinel-2 TCI: black edges,
     nothing declared), so a mosaic's empty corners stop painting over the
-    other scenes — never to a signed or float file (a DEM's 0 is sea level). None
+    other scenes — never to a signed or float file (a DEM's 0 is sea level):
+    a mosaic of those gets a VRT-only nodata instead, so the places no source
+    covers (open sea) are transparent rather than 0, black. None
     when GDAL could not build it, in either GDAL exception mode (a plugin may
     have switched them on process-wide): exceptions on, it raises
     RuntimeError; off, a failed open reaches Translate as a NULL (TypeError).
     """
-    if nodata is None and default_nodata is not None and _unmasked_unsigned(sources[0]):
+    mosaic = len(sources) > 1 and not separate
+    asks = nodata is None and (default_nodata is not None or mosaic)
+    dtype = _unmasked_type(sources[0]) if asks else None
+    if dtype in _UNSIGNED and default_nodata is not None:
         nodata = default_nodata
+    gap = nodata
+    if dtype in _SIGNED and mosaic:
+        gap = _GAP  # the VRT's alone: a source's 0 stays a value
     ds = None
     with contextlib.suppress(RuntimeError, TypeError):
         ds = gdal.BuildVRT(
-            path, sources, separate=separate, srcNodata=nodata, VRTNodata=nodata
+            path, sources, separate=separate, srcNodata=nodata, VRTNodata=gap
         )
     if ds is None and len(sources) == 1:
         # BuildVRT silently skips a source georeferenced by GCPs only (raw
@@ -52,16 +60,20 @@ def _build_vrt(
     return path or ds.GetMetadata("xml:VRT")[0]
 
 
-def _unmasked_unsigned(src: str) -> bool:
-    """Whether *src* is Byte/UInt16 with every pixel valid (no nodata, mask, alpha)."""
+_UNSIGNED = (gdal.GDT_Byte, gdal.GDT_UInt16)
+_SIGNED = (gdal.GDT_Int16, gdal.GDT_Int32, gdal.GDT_Float32, gdal.GDT_Float64)
+_GAP = -32768  # below any elevation, and Int16's own nodata by habit
+
+
+def _unmasked_type(src: str) -> int | None:
+    """*src*'s GDAL data type when every pixel is valid (no nodata, mask, alpha)."""
     ds = None
     with contextlib.suppress(RuntimeError):
         ds = gdal.Open(src)
     if ds is None:
-        return False
+        return None
     band = ds.GetRasterBand(1)
-    unsigned = band.DataType in (gdal.GDT_Byte, gdal.GDT_UInt16)
-    return unsigned and band.GetMaskFlags() == gdal.GMF_ALL_VALID
+    return band.DataType if band.GetMaskFlags() == gdal.GMF_ALL_VALID else None
 
 
 def _add_virtual_overviews(path: str) -> None:

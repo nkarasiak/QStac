@@ -41,7 +41,9 @@ does the same and stops there, the whole world being in view.
 Opening a scene (`_add_items()`, mosaic) first runs `_zoom_on_open()`: unless
 the `zoom_to_scene` setting is `never` (Settings > Display; `always` by default,
 as without it a newcomer cannot tell where the layer went). It zooms *before*
-the load, since a load clips what the map shows.
+the load, since a load clips what the map shows. Not a tile mosaic (the
+9 squares): its area is the one framed or drawn, and its scenes' bbox, whole
+tiles, would move the view off it.
 
 The form's blocks have captions (*Catalog*, *Collection*, *Dates*,
 `_add_caption()`) whose tooltips explain the STAC terms: two bare dropdowns
