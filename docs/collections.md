@@ -75,7 +75,9 @@ copied from PC's `mosaic/info` renderOptions); *Band combinations* keeps VV
 and VH as they are. A mosaic shows what one of its scenes shows: the
 default composite, computed per scene (`_write_index_vrt_xml` parts, with
 their overviews) and mosaicked (`_build_mosaic_vrt(index_preset=)`), when every
-scene has its bands. Several selected scenes' *Spectral index mosaic* menu
+scene has its bands. A band composite of scenes without projection
+metadata (PC's MODIS) stacks each scene's bands with BuildVRT, reading
+their headers. Several selected scenes' *Spectral index mosaic* menu
 mosaics an index the same way (`load_mosaic(index_preset=)`), from scenes
 with projection metadata only (so never MODIS on PC). It is drawn over
 its ramp's range, so neither the build nor the opening reads statistics

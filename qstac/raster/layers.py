@@ -541,9 +541,10 @@ def _build_mosaic_vrt(
     min/max at layer construction warped every pixel of the scenes on the
     GUI thread (81 scenes froze QGIS). Each mosaic's statistics are stored
     here instead (``_store_statistics``) so that construction reads none.
-    Multi-band composites additionally need STAC projection metadata and
-    band types it can declare (the ``_write_vrt_xml`` fast path); items
-    without them are reported as dropped.
+    Indices additionally need STAC projection metadata and band types they
+    can declare (``_write_index_vrt_xml``); items without them are reported
+    as dropped. A composite without them stacks its bands with BuildVRT,
+    reading their headers (PC's MODIS).
     Parts and mosaic are temp files, so a saved project's mosaic does not
     outlive the session.
 
@@ -559,7 +560,7 @@ def _build_mosaic_vrt(
         # true and would otherwise write a zero-band VRT.
         return None
 
-    groups = _mosaic_groups(parts, band_names, len(band_names) > 1 or index_preset)
+    groups = _mosaic_groups(parts, band_names, index_preset is not None)
     if not groups:
         return None
 
@@ -743,20 +744,23 @@ def _ready_to_open(path: str, fixed: tuple[float, float] | None, index: bool) ->
     return True
 
 
+def _has_grid(epsg: int | None, proj: dict, band_names: list[str]) -> bool:
+    """Whether STAC ``proj:`` metadata alone can write the scene's VRT."""
+    return bool(epsg) and all(n in proj and _band_type(proj[n])[0] for n in band_names)
+
+
 def _mosaic_groups(
     parts: list[tuple[str, dict[str, str], int | None, dict[str, AssetProj]]],
     band_names: list[str],
     needs_grid: bool,
 ) -> dict[int | None, list[tuple[str, dict[str, str], dict]]]:
     """The usable *parts* by EPSG: every band there, and (when *needs_grid*,
-    for a per-item VRT) the STAC grid and band types it is written from."""
+    for an index VRT) the STAC grid and band types it is written from."""
     groups: dict[int | None, list[tuple[str, dict[str, str], dict]]] = {}
     for item_id, assets, epsg, proj in parts:
         if not all(n in assets for n in band_names):
             continue
-        if needs_grid and not (
-            epsg and all(n in proj and _band_type(proj[n])[0] for n in band_names)
-        ):
+        if needs_grid and not _has_grid(epsg, proj, band_names):
             continue
         groups.setdefault(epsg, []).append((item_id, assets, proj))
     return groups
@@ -791,10 +795,14 @@ def _mosaic_parts(
                 _write_index_vrt_xml(
                     part, srcs, band_names, part_epsg, proj, index_preset
                 )
-            else:
+            elif _has_grid(part_epsg, proj, band_names):
                 _write_vrt_xml(
                     part, srcs, band_names, part_epsg, proj, bake_stretch=bake
                 )
+            # ponytail: no stretch baked here, a baked mosaic's other parts are
+            # Byte; none of the baked collections lacks proj: metadata
+            elif not _build_vrt(part, srcs, separate=True):
+                continue
             built.append((item_id, part, part_epsg))
     return built, sources
 

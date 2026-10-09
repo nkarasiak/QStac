@@ -490,6 +490,37 @@ def test_mosaic_is_one_layer_per_crs_with_stored_statistics() -> None:
         assert stats[:2] == [9.0, 9.0], stats
 
 
+def test_rgb_mosaic_without_stac_grid_reads_headers() -> None:
+    """PC's MODIS items have no ``proj:``: their bands stack with BuildVRT."""
+    coll = SimpleNamespace(rgb_assets=("r", "g", "b"), id="x")
+    with tempfile.TemporaryDirectory() as tmp:
+        parts = []
+        for x0 in (0, 10000):
+            assets = {}
+            for i, band in enumerate("rgb"):
+                path = f"{tmp}/{x0}_{band}.tif"
+                ds = gdal.GetDriverByName("GTiff").Create(path, 10, 10, 1)
+                ds.SetGeoTransform([x0, 1000, 0, 4820000, 0, -1000])
+                ds.SetProjection("EPSG:32631")
+                ds.GetRasterBand(1).Fill(i + 1)
+                ds = None
+                assets[band] = path
+            parts.append((str(x0), assets, None, {}))
+        vsicurl, layers_mod._vsicurl = layers_mod._vsicurl, lambda href: href
+        try:
+            mosaics, dropped, _ = layers_mod._build_mosaic_vrt(parts, coll)
+        finally:
+            layers_mod._vsicurl = vsicurl
+        assert dropped == 0, dropped
+        ds = gdal.Open(mosaics[0][0])
+        assert (ds.RasterCount, ds.RasterXSize) == (3, 20)
+        assert [ds.GetRasterBand(b).ReadAsArray()[0, 15] for b in (1, 2, 3)] == [
+            1,
+            2,
+            3,
+        ]
+
+
 def test_mixed_resolution_mosaic_gets_overviews() -> None:
     """DEM tiles 2400 px wide north of 50°N, 3600 south: GDAL derives no
     overviews for their mosaic, so statistics read every pixel."""
