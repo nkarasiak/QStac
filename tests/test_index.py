@@ -106,6 +106,37 @@ def test_index_mosaic_computes_each_scene() -> None:
     assert stats[:2] == [-1.0, 1.0], stats
 
 
+def test_index_mosaic_of_the_view_computes_each_scene_locally() -> None:
+    """The view's index mosaic: each scene's bands clipped, its NDVI computed
+    from them; a scene lacking a band is left out (the remote one drew 20 s)."""
+    import qstac.raster.tasks as tasks_mod
+
+    ndvi = IndexPreset("NDVI", ("nir", "red"), "ndvi")
+    parts = []
+    with tempfile.TemporaryDirectory() as tmp:
+        for i, (nir, red) in enumerate(((3000, 1000), (2000, 2000), (1, 1))):
+            for name, v in (("nir", nir), ("red", red)):
+                path = f"{tmp}/{name}{i}.tif"
+                _tif(path, np.array([[v]], dtype=np.int16))
+                ds = gdal.Open(path, gdal.GA_Update)
+                ds.SetGeoTransform([500000 + 30 * i, 30, 0, 4000000, 0, -30])
+                ds = None
+            p = AssetProj([1, 1], [30, 0, 500000 + 30 * i, 0, -30, 4000000])
+            assets = {"nir": f"{tmp}/nir{i}.tif", "red": f"{tmp}/red{i}.tif"}
+            if i == 2:
+                del assets["red"]
+            parts.append((f"s{i}", assets, 32631, {"nir": p, "red": p}))
+        clip, tasks_mod.view_clip = tasks_mod.view_clip, lambda _i, href, *_a: href
+        try:
+            view = ((0.0, 0.0, 1.0, 1.0), (10, 10))
+            built = tasks_mod._build_local_index_mosaic(parts, ndvi, view, lambda: 0)
+        finally:
+            tasks_mod.view_clip = clip
+        assert [ids for _, _, ids in built] == [["s0", "s1"]], built
+        got = gdal.Open(built[0][0]).ReadAsArray()
+    assert np.allclose(got, [[0.5, 0.0]]), got
+
+
 def test_item_level_proj_feeds_every_asset() -> None:
     """Landsat/HLS put proj on the item, not the assets — NDVI needs it there."""
     feature = {

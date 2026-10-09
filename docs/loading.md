@@ -63,7 +63,11 @@ No remote VRT is built: the layers follow the view
 clipped anew by a task of its own (`_MosaicLoad.make(remote=False)`) while
 the last image stays on screen — swapping in the remote VRT on the first
 pan blanked the mosaic for the 30 s of its serial reads. A hidden mosaic
-waits; a time stack's dates, a band composite or an index are remote
+waits. An index mosaic follows the view too: each scene's bands clipped
+at once, its index computed from them (`tasks._build_local_index_mosaic()`,
+the single-scene `_bake_index`), on the map in 6 s for 7 Sentinel-2 NDVI
+scenes cold, 1 s to draw, where its remote mosaic took 8 s to build and 20 s
+to draw, blank. A time stack's dates and a band composite are remote
 mosaics as before. Measured on Planetary Computer's Sentinel-2 over 30
 days: a regional view (7-15 scenes), first image 1.4-1.6 s, whole 1.8-3.1
 s; zoom or pan, 0.8-1 s; France (427 scenes in 5 UTM zones), first image

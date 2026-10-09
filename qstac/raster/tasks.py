@@ -35,7 +35,7 @@ from .cog import (
     delete_clips,
     explain_read_error,
 )
-from .index import _bake_index, _index_source
+from .index import _INDEX_NODATA, _bake_index, _index_source
 from .layers import (
     BAKED_INDEX,
     BAKED_RGB,
@@ -43,8 +43,10 @@ from .layers import (
     REMOTE_VRT,
     _build_local_mosaic,
     _build_mosaic_vrt,
+    _local_mosaics,
     _remote_source,
     scene_clip,
+    view_clip,
 )
 from .vrt import _band_type, _build_vrt
 
@@ -183,13 +185,21 @@ class MosaicBuildTask(_EventTask):
         """The view from local clips: a preview, then sharp (class doc);
         whether it made the sharp one."""
         bands = self.band_override or list(self.collection_info.rgb_assets)
-        if self.view is None or self.index_preset is not None or len(bands) != 1:
-            # ponytail: one asset per scene (TCI, DEM); a band composite or
-            # an index waits for the remote mosaic as before.
+        if self.view is None:
+            return False
+        cancel = self._cancel.is_set
+        if self.index_preset is not None:  # computed here from the view's bands
+            sharp = _build_local_index_mosaic(
+                parts, self.index_preset, self.view, cancel
+            )
+            self._show(sharp, True)
+            return bool(sharp)
+        if len(bands) != 1:
+            # ponytail: a band composite waits for the remote mosaic as before;
+            # stack its bands' clips per scene as the index does if it drags.
             return False
         viewport, (w, h) = self.view
         half = (viewport, (w // 2, h // 2))
-        cancel = self._cancel.is_set
         if self.render is not None:  # rendered at the canvas resolution: final
             return self._show_rendered(parts, bands[0])
         if self.preview_clips is None:  # no tile search made them: here
@@ -260,6 +270,40 @@ class MosaicBuildTask(_EventTask):
                 shown = ready
             if done or self._cancel.wait(0.05):
                 return
+
+
+def _build_local_index_mosaic(
+    parts: list[tuple[str, dict[str, str], int | None, dict[str, AssetProj]]],
+    index_preset: IndexPreset,
+    view: tuple[tuple[float, float, float, float], tuple[int, int]],
+    cancel: Callable[[], bool],
+) -> list[tuple[str, int | None, list[str]]]:
+    """*index_preset* of *parts* over *view*: each scene's bands clipped (all
+    at once), its index computed from them (``_bake_index``), then mosaicked.
+    Its remote mosaic drew 7 Sentinel-2 NDVI scenes in 20 s, blank meanwhile."""
+    names = list(index_preset.assets)
+    jobs = [
+        (part, n) for part in parts if all(part[1].get(n) for n in names) for n in names
+    ]
+
+    def clip(job: tuple) -> str | None:
+        (item_id, assets, epsg, proj), name = job
+        tag = f"index_{name}"
+        return view_clip(item_id, assets[name], proj.get(name), epsg, view, tag, cancel)
+
+    if not jobs:
+        return []
+    with concurrent.futures.ThreadPoolExecutor(min(len(jobs), 32)) as pool:
+        keys = [(p[0], n) for p, n in jobs]
+        clips = dict(zip(keys, pool.map(clip, jobs), strict=True))
+    baked = []
+    for item_id, _, epsg, proj in parts:
+        got = [clips.get((item_id, n)) for n in names]
+        if all(got) and not cancel():
+            prefix = _vrt_path(f"{item_id}_index")
+            tif = _bake_index(prefix, got, [proj.get(n) for n in names], index_preset)
+            baked.append((item_id, epsg, tif))
+    return _local_mosaics(baked, _INDEX_NODATA, "index")
 
 
 # ---------------------------------------------------------------------------
