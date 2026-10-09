@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 from typing import TYPE_CHECKING
 
@@ -18,6 +19,7 @@ from qgis.core import (
 )
 from qgis.PyQt.QtCore import QDateTime, Qt, QTime
 
+from .clip import _HEDGE_COARSE_S, _HEDGE_SHARP_S, _materialize_window_tiles
 from .cog import (
     _prewarm_sources,
     _vrt_path,
@@ -578,6 +580,87 @@ def _build_mosaic_vrt(
         return None
     dropped = len(parts) - sum(len(ids) for _, _, ids in mosaics)
     return mosaics, dropped, bake is not None
+
+
+def view_clip(
+    item_id: str,
+    href: str,
+    proj: AssetProj | None,
+    epsg: int | None,
+    view: tuple[tuple[float, float, float, float], tuple[int, int]],
+    tag: str,
+    cancel_check: Callable[[], bool] | None = None,
+) -> str | None:
+    """A local clip of the asset at signed *href* over *view* (the canvas
+    extent in WGS84, its size in pixels): read tile by tile in parallel,
+    from STAC ``proj:`` with no header round trip."""
+    return _materialize_window_tiles(
+        _vsicurl(href),
+        view[0],
+        view[1],
+        _vrt_path(f"{item_id}_{tag}"),
+        proj,
+        epsg,
+        hedge_after=_HEDGE_COARSE_S if tag == "preview" else _HEDGE_SHARP_S,
+        cancel=cancel_check,
+    )
+
+
+def _local_mosaics(
+    clips: list[tuple[str, int | None, str | None]], nodata: float | None, tag: str
+) -> list[tuple[str, int | None, list[str]]]:
+    """(path, epsg, ids) per CRS, largest first, from (item id, epsg, clip)
+    oldest first: the newest paints on top."""
+    groups: dict[int | None, list[tuple[str, str]]] = {}
+    for item_id, epsg, path in clips:
+        if path:
+            groups.setdefault(epsg, []).append((item_id, path))
+    mosaics = []
+    for epsg, got in sorted(groups.items(), key=lambda g: -len(g[1])):
+        ids = [i for i, _ in got]
+        name = f"mosaic_{tag}_{abs(hash('_'.join(sorted(ids)))):x}.vrt"
+        path = _build_vrt(_vrt_path(name), [p for _, p in got], default_nodata=nodata)
+        if path is not None:
+            mosaics.append((path, epsg, ids))
+    return mosaics
+
+
+def _build_local_mosaic(
+    parts: list[tuple[str, dict[str, str], int | None, dict[str, AssetProj]]],
+    band: str,
+    view: tuple[tuple[float, float, float, float], tuple[int, int]],
+    tag: str,
+    cancel_check: Callable[[], bool] | None = None,
+    clips: dict[str, str | None] | None = None,
+) -> list[tuple[str, int | None, list[str]]]:
+    """*parts*' *band* over *view*, from local clips: (path, epsg, ids) per CRS.
+
+    What a mosaic shows first. Its remote VRT reads overlapping sources one
+    after another (GDAL's VRT threads skip them): 12 Sentinel-2 scenes took
+    30 s to draw. Here each scene's view is read tile by tile, all scenes at
+    once (:func:`view_clip`), and the map draws local files. *clips*: the
+    ones made already, used alone (the tile search makes the preview's as it
+    picks scenes; one still coming is left out of it).
+    """
+
+    def clip(part: tuple) -> str | None:
+        item_id, assets, epsg, proj = part
+        if clips is not None:  # those ready: a late one is left out
+            return clips.get(item_id)
+        href = assets.get(band)
+        if not href:
+            return None
+        return view_clip(item_id, href, proj.get(band), epsg, view, tag, cancel_check)
+
+    if not parts:
+        return []
+    with concurrent.futures.ThreadPoolExecutor(min(len(parts), 16)) as pool:
+        paths = list(pool.map(clip, parts))
+    return _local_mosaics(
+        [(p[0], p[2], path) for p, path in zip(parts, paths, strict=True)],
+        _stac_nodata(parts[0][3].get(band)),
+        tag,
+    )
 
 
 def _ready_to_open(path: str, fixed: tuple[float, float] | None, index: bool) -> bool:

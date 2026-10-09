@@ -559,7 +559,7 @@ class SettingsDialog(QDialog):
 
     def _build_mosaic_page(self) -> None:
         page = self._page("Mosaic", "mIconRaster.svg")
-        form = self._group(page, "The 9-square button")
+        form = self._group(page, "The Mosaic button")
         self._row(
             form,
             "A click builds:",
@@ -651,7 +651,8 @@ class SettingsDialog(QDialog):
             "Parallel reads per image:",
             "clip_workers",
             self._spin(1, 64),
-            "Range requests in flight when a scene is clipped to the map view.",
+            "Range requests in flight when a scene is clipped to the map view;"
+            " a mosaic reads about four scenes at once.",
         )
         page.addStretch()
 

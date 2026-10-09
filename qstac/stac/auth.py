@@ -245,6 +245,7 @@ def planetary_computer_auth_config() -> str:
 # ---------------------------------------------------------------------------
 
 _PC_SAS_URL = "https://planetarycomputer.microsoft.com/api/sas/v1/token"
+_PC_DATA_API = "https://planetarycomputer.microsoft.com/api/data/v1"
 _PC_BLOB_DOMAIN = ".blob.core.windows.net"
 _pc_sas_cache: dict[str, tuple[str, float]] = {}  # key → (token, expiry)
 _pc_sas_lock = threading.Lock()
@@ -340,3 +341,36 @@ def pc_sign_url(href: str) -> str:
     token = _pc_get_sas_token(*blob)
     sep = "&" if parsed.query else "?"
     return f"{href}{sep}{token}"
+
+
+def pc_render(
+    collection: str,
+    item_id: str,
+    asset: str,
+    epsg: int,
+    bounds: tuple[float, float, float, float],
+    size: tuple[int, int],
+    timeout: int,
+) -> bytes:
+    """A PNG of a 3-band Byte *asset* (Sentinel-2's TCI) over *bounds* (minx,
+    miny, maxx, maxy in EPSG:*epsg*, returned exactly) at *size* pixels,
+    rendered by the Planetary Computer data API beside its COGs.
+
+    About 50 KB in 0.5 s, where reading the COGs' smallest overview moved
+    megabytes at 1 MB/s a connection: a mosaic's first look. Lossless, its
+    no-data stays 0 (no mask band), as in the COG.
+    """
+    query = urllib.parse.urlencode(
+        {
+            "collection": collection,
+            "item": item_id,
+            "assets": asset,
+            "asset_bidx": f"{asset}|1,2,3",
+            "nodata": 0,
+            "return_mask": "false",
+            "coord_crs": f"epsg:{epsg}",
+        }
+    )
+    box = ",".join(f"{v:.3f}" for v in bounds)
+    url = f"{_PC_DATA_API}/item/bbox/{box}/{size[0]}x{size[1]}.png?{query}"
+    return _urlopen_safe(urllib.request.Request(url), timeout, "PC preview")

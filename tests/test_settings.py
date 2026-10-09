@@ -56,17 +56,17 @@ def test_dialog_round_trip() -> None:
     # Reset page touches only that page's widgets.
     lookback, mosaic_page = dlg._fields["mosaic_lookback_days"]
     timeout, _ = dlg._fields["http_timeout"]
-    lookback.setValue(0)
+    lookback.setValue(365)
     timeout.setValue(99)
     dlg._pages.setCurrentIndex(mosaic_page)
     dlg._reset_page()
-    assert lookback.value() == 365
+    assert lookback.value() == 0
     assert timeout.value() == 99
     dlg._restore_defaults()
     assert timeout.value() == settings.DEFAULTS["http_timeout"]
 
     # Saved values come back in a new dialog.
-    lookback.setValue(0)
+    lookback.setValue(365)
     editor = dlg._fields["date_buttons"][0]
     editor._add()  # a 90-day button at the end
     editor._table.selectRow(0)
@@ -87,7 +87,7 @@ def test_dialog_round_trip() -> None:
     assert settings.date_presets() == [14, "this_year", "all", "last_year", 90]
     assert settings.start_on() == "last"
     again = SettingsDialog().collect_values()
-    assert again["mosaic_lookback_days"] == 0
+    assert again["mosaic_lookback_days"] == 365
     assert again["date_buttons"] == "14, this_year, all, last_year, 90"
 
 

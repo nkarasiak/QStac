@@ -19,11 +19,11 @@ os.environ.setdefault("PROJ_DATA", str(Path(sys.prefix) / "share" / "proj"))
 
 import numpy as np
 from osgeo import gdal
-from qgis.core import QgsGeometry
+from qgis.core import QgsGeometry, QgsRectangle
 
 import qstac.raster.layers as layers_mod
 from qstac.geo import TileCover, _filter_by_overlap, area_cover, day_cover
-from qstac.raster.clip import _cog_geometry
+from qstac.raster.clip import _cog_geometry, _hedge_url, render_clip
 from qstac.raster.cog import (
     _vrt_path,
     _vsicurl,
@@ -587,6 +587,18 @@ def test_tile_cover_fills_slivers_with_older_scenes() -> None:
     alone.add([scene("older", "31TDL", 20, 0, 0, 1, 1)])
     assert [i.id for i in alone.scenes()] == ["south"]
 
+    # A view on the tile's south: the newest sliver covers it, no older one
+    # is needed, and a scene outside the view is not taken at all.
+    view = TileCover(
+        [scene("r1", "31TDL", 28, 0, 0, 1, 1)],
+        within=QgsGeometry.fromRect(QgsRectangle(0, 0, 1, 0.1)),
+    )
+    view.add([scene("north", "31TDL", 25, 0, 0.2, 1, 1)])
+    view.add([scene("south", "31TDL", 24, 0, 0, 1, 0.2)])
+    assert view.missing() == []
+    view.add([scene("older", "31TDL", 20, 0, 0, 1, 1)])
+    assert [i.id for i in view.scenes()] == ["south"]
+
 
 def test_area_cover_takes_the_newest_year_and_fills_its_holes() -> None:
     """No tile grid (DEM, yearly land cover): one cover for the whole area."""
@@ -628,7 +640,7 @@ def test_tile_mosaic_reads_back_when_the_reach_is_empty() -> None:
     )
     task = st.TileSearchTask(
         SimpleNamespace(), "landsat-c2-l2", (0, 0, 1, 1), "2026-09-07",
-        "2026-10-07", 20, ["red"], 30, 10,
+        "2026-10-07", 20, ["red"], 30, 10, lookback_days=365,
     )  # fmt: skip
     clear_since = datetime.date(2026, 8, 10)
     task._window = lambda end, cloud, _h: (
@@ -712,6 +724,49 @@ def test_new_layers_go_on_top() -> None:
         assert tree()[0] == ("Landsat", ["ls 25 Sep", "ls 03 Sep", "landsat"]), tree()
     finally:
         project.clear()
+
+
+def test_render_clip_places_the_scene_part_of_the_view() -> None:
+    """A server-rendered preview: asked for the view cut to the scene, at the
+    canvas resolution, and georeferenced to exactly what was asked."""
+    # A 1000x1000 scene at 0.001 deg (EPSG:4326 keeps the arithmetic plain).
+    proj = AssetProj([1000, 1000], [0.001, 0, 10.0, 0, -0.001, 45.0])
+    asked = []
+
+    def render(bounds, size):
+        asked.append((bounds, size))
+        mem = gdal.GetDriverByName("MEM").Create("", size[0], size[1], 3)
+        for b in range(1, 4):
+            mem.GetRasterBand(b).Fill(100)
+        gdal.GetDriverByName("PNG").CreateCopy("/vsimem/r.png", mem)
+        f = gdal.VSIFOpenL("/vsimem/r.png", "rb")
+        data = gdal.VSIFReadL(1, 10_000_000, f)
+        gdal.VSIFCloseL(f)
+        return data
+
+    # The view spills west and north of the scene; 400 px over 0.8 deg.
+    view = ((9.6, 44.5, 10.4, 45.3), (400, 400))
+    out = render_clip(render, proj, 4326, view, _vrt_path("render_test"))
+    assert out is not None
+    (bounds, size) = asked[0]
+    x0, y0, x1, y1 = bounds
+    assert abs(x0 - 10.0) < 1e-6 and abs(x1 - 10.4) < 1e-6, bounds  # cut west
+    assert abs(y1 - 45.0) < 1e-6 and abs(y0 - 44.5) < 1e-6, bounds  # cut north
+    assert size == (200, 250), size  # 0.002 deg a pixel, as the canvas
+    ds = gdal.Open(out)
+    gt = ds.GetGeoTransform()
+    assert abs(gt[0] - 10.0) < 1e-9 and abs(gt[3] - 45.0) < 1e-9, gt
+    assert abs(gt[1] - 0.002) < 1e-9 and abs(gt[5] + 0.002) < 1e-9, gt
+    assert ds.GetRasterBand(1).GetNoDataValue() == 0
+    # Outside the view: nothing asked.
+    far = ((20.0, 20.0, 21.0, 21.0), (400, 400))
+    assert render_clip(render, proj, 4326, far, _vrt_path("render_far")) is None
+    assert len(asked) == 1
+
+    # A hedged copy reads another URL to GDAL; S3 paths take no query.
+    assert _hedge_url("/vsicurl/https://h/a.tif?sig=1").endswith("&qstac_hedge=1")
+    assert _hedge_url("/vsicurl/https://h/a.tif").endswith("?qstac_hedge=1")
+    assert _hedge_url("/vsis3/b/a.tif") == "/vsis3/b/a.tif"
 
 
 if __name__ == "__main__":

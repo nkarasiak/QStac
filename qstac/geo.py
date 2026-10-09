@@ -83,6 +83,8 @@ class TileCover:
     reach it; a scene the newer ones already cover is left out. Without
     *fill*, a tile takes its newest scene alone, slivers and all. *key*
     says which tile a scene is of (:func:`area_cover`: one for them all).
+    *within* (WGS84, the search area) cuts every footprint: a tile is
+    covered once the part of it in the area is, not all 110 km of it.
     """
 
     def __init__(
@@ -90,18 +92,27 @@ class TileCover:
         reach_items: list[StacItemResult],
         fill: bool = True,
         key: Callable[[StacItemResult], str] = _tile,
+        within: QgsGeometry | None = None,
     ) -> None:
         self.fill = fill
         self.key = key
+        self.within = within
         self.goal: dict[str, QgsGeometry] = {}
         for item in reach_items:
-            tile, shape = key(item), _footprint(item)
-            if tile and shape is not None:
+            tile, shape = key(item), self._shape(item)
+            if tile and shape is not None and not shape.isEmpty():
                 goal = self.goal.get(tile)
                 self.goal[tile] = shape if goal is None else goal.combine(shape)
         self.covered: dict[str, QgsGeometry] = {}
         self.done: set[str] = set()
         self.picked: list[StacItemResult] = []
+
+    def _shape(self, item: StacItemResult) -> QgsGeometry | None:
+        """Its footprint within *within* (empty: outside), None without one."""
+        shape = _footprint(item)
+        if shape is not None and self.within is not None:
+            shape = shape.intersection(self.within)
+        return shape
 
     def add(self, items: list[StacItemResult]) -> None:
         """Take what *items* (older than any added before) add."""
@@ -109,11 +120,14 @@ class TileCover:
             tile = self.key(item)
             if not tile or tile in self.done:
                 continue
+            shape = self._shape(item)
+            if shape is not None and shape.isEmpty():
+                continue  # outside the search area
             if not self.fill:
                 self.picked.append(item)
                 self.done.add(tile)
                 continue
-            shape, have = _footprint(item), self.covered.get(tile)
+            have = self.covered.get(tile)
             if shape is None:  # nothing to reason with: it alone
                 if have is None:
                     self.picked.append(item)
@@ -145,10 +159,15 @@ def area_cover(
     else *bbox*): a collection with no tile grid, its scenes fed newest first.
     """
     cover = TileCover([], key=lambda _item: "area")
-    cover.goal["area"] = (
-        area if area is not None else QgsGeometry.fromRect(QgsRectangle(*bbox))
-    )
+    cover.goal["area"] = search_area(bbox, area)
     return cover
+
+
+def search_area(
+    bbox: tuple[float, float, float, float], area: QgsGeometry | None = None
+) -> QgsGeometry:
+    """The area a search covers (WGS84): *area* when drawn, else *bbox*."""
+    return area if area is not None else QgsGeometry.fromRect(QgsRectangle(*bbox))
 
 
 def day_cover(

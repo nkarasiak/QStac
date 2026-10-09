@@ -41,6 +41,28 @@ resolutions: Cop-DEM tiles are 2400 px wide north of 50°N, 3600 south) gets
 virtual ones (`vrt._add_virtual_overviews()`, read from the sources' own):
 without, its statistics and QGIS's histogram read every pixel (137 tiles:
 72 s in the task, then 42 s frozen on the GUI thread; with, 6 s and 0.3 s).
+A mosaic's remote VRT draws its sources one after another (overlapping
+sources: GDAL's VRT threads skip them; 12 Sentinel-2 scenes took 30 s), and
+warming them first only moved the wait (15 s for 7 scenes: one connection
+to Azure moves ~1 MB/s, eight ~5 MB/s). So a mosaic shows the view first,
+from local files (`MosaicBuildTask`, one asset per scene: a TCI, a DEM):
+a **preview** at half the canvas resolution, made while the tile search
+still runs — each scene it picks (`TileSearchTask(on_pick=)`, final: a pick
+is never undone) is clipped at once in the search's threads, on Planetary
+Computer rendered by its data API (`stac.auth.pc_render()`, ~50 KB PNG of
+the scene's part of the view, georeferenced by `clip.render_clip()`), else
+read from the COG (`layers.view_clip()`). The search waits for them until
+`_PICKS_DEADLINE_S` (1.4 s) after it starts; the build shows those ready
+(`previewReady`), the first late one if none was, then all once in
+(`_PREVIEW_REST_S`). Then a **sharp** mosaic at the canvas resolution
+(`previewReady(sharp=True)`) repoints the same layers, and the remote VRT
+is their source from the first pan (`LayerLoader._mosaic_to_remote()`).
+Click to first image: 1.5-1.7 s over five views of the south of France.
+Tile reads run on kept threads (`clip._fetch_pool()`: GDAL keeps a
+connection per thread, a fresh one costs a TLS handshake, 0.5 s an open),
+and a hedged copy reads through another URL (`clip._hedge_url()`): GDAL
+makes a thread wait for another's download of the same range, so a copy of
+a stalled read stalled with it, 30 s.
 When `item_assets` names no raster the guess is left empty and the scene's first
 `.tif` loads; right-click > *Load asset* loads any of its rasters instead. Asset
 names may hold a `/`, so temp files are always named through `raster.cog._vrt_path()`.

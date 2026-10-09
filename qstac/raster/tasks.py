@@ -5,6 +5,7 @@ from __future__ import annotations
 import concurrent.futures
 import contextlib
 import threading
+import time
 from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -40,6 +41,7 @@ from .layers import (
     BAKED_RGB,
     REMOTE_BAKED,
     REMOTE_VRT,
+    _build_local_mosaic,
     _build_mosaic_vrt,
     _remote_source,
 )
@@ -69,6 +71,9 @@ __all__ = [
 # Multi-asset loads (separate R/G/B COGs) divide by n so the slowest band
 # still fits the budget.
 _COARSE_MAX_DIM = 256
+# How long a mosaic's build waits for the preview clips its tile search left
+# coming (a slow render or range request), to complete its first look.
+_PREVIEW_REST_S = 1.5
 
 
 class _EventTask(QgsTask):
@@ -95,7 +100,17 @@ class MosaicBuildTask(_EventTask):
     ``gdal.BuildVRT``, statistics — happens here; the caller opens each of
     ``mosaics`` with :func:`open_mosaic_layer` on the GUI thread once the
     task completes.
+
+    With *view* (the canvas extent in WGS84, its size in pixels) and one
+    asset per scene, the view comes first, from local clips
+    (``_build_local_mosaic``): ``previewReady`` at half the canvas
+    resolution, then at the canvas', before the remote ``mosaics`` the
+    layers take on the first pan.
     """
+
+    #: Emitted with local mosaics of the view, (path, epsg, ids) per CRS, and
+    #: whether they are the sharp ones (else a half-resolution preview).
+    previewReady = pyqtSignal(list, bool)  # noqa: N815 — Qt signal naming convention
 
     def __init__(
         self,
@@ -106,8 +121,12 @@ class MosaicBuildTask(_EventTask):
         sign_func: Callable[[str], str] | None = None,
         prepare: Callable[[], object] | None = None,
         index_preset: IndexPreset | None = None,
+        view: tuple[tuple[float, float, float, float], tuple[int, int]] | None = None,
+        preview_clips: dict[str, str | None] | None = None,
     ) -> None:
         super().__init__(f"Mosaicking {len(parts)} scenes")
+        self.view = view
+        self.preview_clips = preview_clips  # item id → its preview clip, made
         # Unsigned hrefs: signing may fetch a token, so it happens in run().
         self.parts = parts
         self.sign_func = sign_func
@@ -132,6 +151,7 @@ class MosaicBuildTask(_EventTask):
                 (i, {n: sign(h) for n, h in a.items()} if sign else a, e, p)
                 for i, a, e, p in self.parts
             ]
+            self._build_local(parts)
             built = _build_mosaic_vrt(
                 parts,
                 self.collection_info,
@@ -147,6 +167,46 @@ class MosaicBuildTask(_EventTask):
             return False
         self.mosaics, self.dropped, self.stretch_baked = built
         return True
+
+    def _build_local(self, parts: list) -> None:
+        """The view first, from local clips: a preview, then sharp (class doc)."""
+        bands = self.band_override or list(self.collection_info.rgb_assets)
+        if self.view is None or self.index_preset is not None or len(bands) != 1:
+            # ponytail: one asset per scene (TCI, DEM); a band composite or
+            # an index waits for the remote mosaic as before.
+            return
+        viewport, (w, h) = self.view
+        half = (viewport, (w // 2, h // 2))
+        if self.preview_clips is None:  # no tile search made them: here
+            self._show(_build_local_mosaic(parts, bands[0], half, "preview"), False)
+        else:
+            self._show_preview(parts, bands[0], half)
+        cancel = self._cancel.is_set
+        sharp = _build_local_mosaic(parts, bands[0], self.view, "sharp", cancel)
+        self._show(sharp, True)  # as soon as it is ready: the remote may stall
+
+    def _show(self, mosaics: list, sharp: bool) -> None:
+        if mosaics and not self._cancel.is_set():
+            self.previewReady.emit(mosaics, sharp)
+
+    def _show_preview(self, parts: list, band: str, half: tuple) -> None:
+        """The tile search's preview clips: those ready now, else the first
+        to come, then all once in (up to _PREVIEW_REST_S for the late ones)."""
+        clips = self.preview_clips
+        deadline = time.monotonic() + _PREVIEW_REST_S
+        shown = turn = 0
+        while True:
+            ready = sum(1 for path in list(clips.values()) if path)
+            done = len(clips) >= len(parts) or time.monotonic() >= deadline
+            if ready > shown and (not shown or done):
+                turn += 1
+                tag = f"preview{turn}"
+                self._show(
+                    _build_local_mosaic(parts, band, half, tag, None, clips), False
+                )
+                shown = ready
+            if done or self._cancel.wait(0.05):
+                return
 
 
 # ---------------------------------------------------------------------------

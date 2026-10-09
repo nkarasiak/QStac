@@ -38,7 +38,7 @@ DEFAULTS: dict[str, object] = {
     # the user's S3 keys for its assets (CatalogProvider.s3_bucket).
     "s3_login": "{}",
     # Search
-    "default_date_range": 90,
+    "default_date_range": 30,
     "page_size": 10,
     "default_cloud_cover": 20,
     "min_overlap_pct": 1,
@@ -50,17 +50,17 @@ DEFAULTS: dict[str, object] = {
     # default loads: one 8-bit COG instead of a 3-band 16-bit VRT.
     "use_visual_asset": True,
     "stretch_method": "fixed",  # "fixed", "cumulative_cut", "min_max"
-    # The 9-square button's mosaic (its right-click menu): "tile", each
+    # The Mosaic button's mosaic (its right-click menu): "tile", each
     # tile's newest scene going back in time, or "time", every scene of the
     # dates with the newest on top.
     "mosaic_kind": "tile",
     # How far before the start date a tile mosaic looks for a tile the dates
-    # leave empty; 0 keeps it to the search dates.
-    "mosaic_lookback_days": 365,
+    # leave empty; 0 (the default) keeps it to the search dates.
+    "mosaic_lookback_days": 0,
     # A mosaic per date keeps the newest this many scenes of its dates; one
     # with no tile grid (a DEM) reads at most this many to cover the area.
     "mosaic_max_scenes": 500,
-    # Played by the 9 squares when a collection that mosaics well is picked:
+    # Played by its 9 squares when a collection that mosaics well is picked:
     # "sweep", "build", "pulse" (widgets.MosaicButton.ANIMATIONS) or "off".
     "mosaic_animation": "sweep",
     # Performance

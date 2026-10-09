@@ -10,6 +10,7 @@ import urllib.parse
 from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import date, timedelta
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
@@ -73,10 +74,11 @@ from ..geo import (
     _transform_from_wgs84,
 )
 from ..log import log
-from ..raster.cog import _HAS_PATH_OPTIONS, clear_asset_headers
-from ..raster.layers import enable_time_stack
+from ..raster.clip import render_clip
+from ..raster.cog import _HAS_PATH_OPTIONS, _vrt_path, clear_asset_headers
+from ..raster.layers import enable_time_stack, view_clip
 from ..raster.tasks import ExportClipTask
-from ..stac.auth import request_headers
+from ..stac.auth import pc_render, request_headers
 from ..stac.catalogs import (
     CATALOG_BY_ID,
     CATALOGS,
@@ -100,12 +102,14 @@ from .constants import (
     P,
     _scenes,
     _shorten_id,
+    _sign_func,
 )
 from .index_dialog import IndexDialog, _saved, custom_index_presets, index_key
 from .loading import (
     _NO_META,
     LayerLoader,
     _asset_label,
+    _canvas_pixel_size,
     _default_assets,
     _guess_item_asset,
     _natural_key,
@@ -119,6 +123,7 @@ from .widgets import (
     _CARD_H,
     ClickableDateEdit,
     ElidedLabel,
+    MenuCombo,
     MosaicButton,
     RefreshingCombo,
     _WheelGuard,
@@ -141,8 +146,8 @@ __all__ = ["QStacDock"]
 _EMPTY_HINT = (
     "Pan and zoom the map to the area you want, then click Search to list"
     " matching scenes.\n\nDouble-click a result to load it, or right-click it"
-    " for band combinations, spectral indices and export.\n\nOr click the"
-    " 9 squares beside Search (Sentinel-2, Landsat) for one image of the"
+    " for band combinations, spectral indices and export.\n\nOr click"
+    " Mosaic beside Search (Sentinel-2, Landsat) for one image of the"
     " whole area: each tile's newest clear scene."
 )
 
@@ -694,9 +699,7 @@ class QStacDock(QDockWidget):
         """A small label above a block of the form, explained on hover."""
         caption = QLabel(text)
         caption.setToolTip(tooltip)
-        caption.setStyleSheet(
-            f"color: {P.text_dim}; font-size: {fs(0.85)}; font-weight: bold;"
-        )
+        caption.setStyleSheet(f"color: {P.text_dim}; font-size: {fs(0.85)};")
         layout.addWidget(caption)
         layout.addSpacing(2)
 
@@ -1022,10 +1025,8 @@ class QStacDock(QDockWidget):
         cloud_row.addWidget(self.cloud_slider, 1)
 
         self.cloud_value_label = QLabel(f"{_default_cc}%")
-        self.cloud_value_label.setStyleSheet(
-            f"color: {P.text}; font-size: {fs(0.85)}; font-weight: bold;"
-        )
-        # Wide enough for a bold "100%" at any font size.
+        self.cloud_value_label.setStyleSheet(f"color: {P.text}; font-size: {fs(0.85)};")
+        # Wide enough for "100%" at any font size.
         self.cloud_value_label.setMinimumWidth(
             self.cloud_value_label.fontMetrics().horizontalAdvance("100%") + 8
         )
@@ -1037,24 +1038,28 @@ class QStacDock(QDockWidget):
         layout.addLayout(cloud_row)
 
     def _build_search_button(self, layout: QVBoxLayout) -> None:
-        """The area caption, Search and the area ▾, then the mosaic link.
+        """The Area field, then Search and the outlined Mosaic beside it.
 
-        Search is the one primary action; the mosaic is a link under it, in
-        words that say what it does (two equal buttons, then a mode switch,
-        made a newcomer pick before understanding either).
+        The area is a field like the ones above it, not an arrow glued to
+        Search: what to cover, then what to do. Search is the one filled
+        action; Mosaic is outlined, so a newcomer is not asked to pick
+        between two equal buttons (tried, as was a mode switch).
         """
         # "This map view": the search area is the map extent, which nothing
         # else on the dock says.
-        self.label_area = QLabel()
-        self.label_area.setToolTip(
-            "What Search and the mosaic cover: the map view, or a drawn area"
-            " or selected features picked from ▾"
+        self._add_caption(
+            layout,
+            "Area",
+            "What Search and the mosaic cover: the map view, a drawn\n"
+            "rectangle or polygon, or the selected features.",
         )
-        self.label_area.setStyleSheet(
-            f"color: {P.text_dim}; font-size: {fs(0.85)}; font-weight: bold;"
-        )
-        layout.addWidget(self.label_area)
-        layout.addSpacing(2)
+        self.combo_area = MenuCombo(self._show_area_menu)
+        self.combo_area.setStyleSheet(styles.combo_style(P))
+        self.combo_area.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._area_wheel_guard = _WheelGuard(self.combo_area)
+        self.combo_area.installEventFilter(self._area_wheel_guard)
+        layout.addWidget(self.combo_area)
+        layout.addSpacing(6)
         self.btn_search = QPushButton("Search")
         self.btn_search.setFixedHeight(34)
         self.btn_search.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1063,25 +1068,16 @@ class QStacDock(QDockWidget):
             " cloud limit above (Ctrl+Return)"
         )
         self.btn_search.setStyleSheet(styles.search_btn_style(P))
-        # ▾: search a drawn area or selected features instead of the view.
-        self.btn_area = QPushButton("▾")
-        self.btn_area.setFixedSize(34, 34)
-        self.btn_area.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_area.setToolTip(
-            "Search another area: draw a rectangle or polygon, or use the"
-            " selected features"
-        )
-        self.btn_area.setStyleSheet(styles.search_btn_style(P))
-        self.btn_area.clicked.connect(self._show_area_menu)
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(4)
+        row.setSpacing(6)
         row.addWidget(self.btn_search, 1)
-        # Last, after Search and its ▾ (one control): its own search from the
-        # same form, shown for the collections a tile mosaic was tried on.
+        # Its own search from the same form, shown for the collections that
+        # can mosaic; hidden, Search takes the row.
         self.btn_mosaic = MosaicButton()
-        self.btn_mosaic.setStyleSheet(styles.outline_btn_style(P))
-        row.addWidget(self.btn_area)
+        self.btn_mosaic.setStyleSheet(
+            styles.outline_btn_style(P) + "QPushButton { padding: 0 12px; }"
+        )
         row.addWidget(self.btn_mosaic)
         layout.addLayout(row)
 
@@ -1403,7 +1399,7 @@ class QStacDock(QDockWidget):
         self._search_band.setToGeometry(area, QgsCoordinateReferenceSystem(_WGS84))
 
     def _show_area_menu(self) -> None:
-        """The Search button's ▾: which area the next searches cover."""
+        """The Area field's menu: which area the next searches cover."""
         menu = QMenu(self)
         view = menu.addAction(_SEARCH_TEXT.replace("Search this", "This"))
         view.setCheckable(True)
@@ -1423,8 +1419,9 @@ class QStacDock(QDockWidget):
             sel.setToolTip("Select features on a vector layer first.")
             menu.setToolTipsVisible(True)
         sel.triggered.connect(self._use_selected_features)
-        btn = self.btn_area
-        menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
+        combo = self.combo_area
+        menu.setMinimumWidth(combo.width())
+        menu.exec(combo.mapToGlobal(combo.rect().bottomLeft()))
 
     def _set_area(self, area: QgsGeometry | None, text: str) -> None:
         """Search *area* (WGS84) from now on, or the map view when None."""
@@ -1906,7 +1903,7 @@ class QStacDock(QDockWidget):
         self.btn_search.setEnabled(True)
         self.btn_search.setText("Cancel search")
         self.btn_search.setStyleSheet(styles.outline_btn_style(P))
-        self.btn_area.setEnabled(False)
+        self.combo_area.setEnabled(False)
         self._sync_more_bar()
 
     def _restore_search_button(self) -> None:
@@ -1914,7 +1911,7 @@ class QStacDock(QDockWidget):
         self.btn_search.setEnabled(True)
         self.btn_search.setText("Search")
         self.btn_search.setStyleSheet(styles.search_btn_style(P))
-        self.btn_area.setEnabled(True)
+        self.combo_area.setEnabled(True)
 
     def _cancel_search(self) -> None:
         """Cancel the in-flight search task, if any, and reset the UI."""
@@ -2279,21 +2276,27 @@ class QStacDock(QDockWidget):
         catalog: CatalogProvider,
         index_preset: IndexPreset | None = None,
         band_preset: BandPreset | None = None,
+        preview: tuple | None = None,
     ) -> None:
         items = self._one_orbit(items)
         if not items:
             return
         self._loader.load_mosaic(
-            items, coll, catalog, index_preset=index_preset, band_preset=band_preset
+            items,
+            coll,
+            catalog,
+            index_preset=index_preset,
+            band_preset=band_preset,
+            preview=preview,
         )
 
     def _sync_mosaic_button(self, progress: float = 0.0) -> None:
-        """The area caption, and the 9-square button: its rule, or progress.
+        """The Area field, and the Mosaic button: its rule, or progress.
 
         *progress* comes from the tile mosaic's task (a worker signal).
         """
         where = self._area_text.removeprefix("Search ")
-        self.label_area.setText(f"Area: {where}")
+        self.combo_area.set_value(where[:1].upper() + where[1:])
         btn = self.btn_mosaic
         if self._tile_task is not None:
             btn.set_progress(progress)
@@ -2411,8 +2414,8 @@ class QStacDock(QDockWidget):
         self._tile_mosaic()
 
     def _set_only_dates(self, on: bool) -> None:
-        """Off: back to the default look back (Settings > Mosaic sets others)."""
-        days = 0 if on else settings.DEFAULTS["mosaic_lookback_days"]
+        """Off: a year's look back (Settings > Mosaic sets others)."""
+        days = 0 if on else 365
         settings.save_all({"mosaic_lookback_days": days})
         self._sync_mosaic_button()
         self._tile_mosaic()
@@ -2445,6 +2448,45 @@ class QStacDock(QDockWidget):
         run = self._form_run()
         if run is None or self._tile_task is not None:
             return
+        assets = _mosaic_assets(
+            run.collection, self._mosaic_render.get(run.collection.id)
+        )
+        sign = _sign_func(run.catalog)
+        canvas = self.iface.mapCanvas()
+        view = (viewport_bbox_4326(canvas), _canvas_pixel_size(canvas))
+        half = (view[0], (view[1][0] // 2, view[1][1] // 2))
+        clips: dict[str, str | None] = {}
+
+        # Planetary Computer renders a true-colour asset itself: 50 KB a
+        # scene, not the megabytes of its COGs' smallest overview.
+        rendered = run.catalog.asset_signer == "pc_sas" and assets == [
+            run.collection.visual_asset
+        ]
+        timeout = settings.http_timeout()
+
+        def clip(item: StacItemResult) -> None:
+            """A picked scene's preview clip, made as the search goes on (in
+            its threads): the mosaic's first look, from one asset per scene."""
+            href = item.assets.get(assets[0]) if len(assets) == 1 else None
+            proj = item.asset_proj.get(assets[0]) if href else None
+            prefix = _vrt_path(f"{item.id}_preview")
+            if rendered and proj is not None and item.epsg:
+                fetch = partial(
+                    pc_render, run.collection.id, item.id, assets[0], item.epsg
+                )
+                clips[item.id] = render_clip(
+                    lambda box, size: fetch(box, size, timeout),
+                    proj,
+                    item.epsg,
+                    half,
+                    prefix,
+                )
+            elif href:
+                url = sign(href) if sign else href
+                clips[item.id] = view_clip(
+                    item.id, url, proj, item.epsg, half, "preview"
+                )
+
         task = TileSearchTask(
             run.catalog,
             run.collection.id,
@@ -2452,8 +2494,7 @@ class QStacDock(QDockWidget):
             run.date_from,
             run.date_to,
             run.cloud,
-            # What the mosaic reads.
-            _mosaic_assets(run.collection, self._mosaic_render.get(run.collection.id)),
+            assets,  # what the mosaic reads
             settings.http_timeout(),
             run.collection.mosaic_reach_days,
             by_time=settings.mosaic_kind() == "time" and not run.collection.timeless,
@@ -2461,16 +2502,22 @@ class QStacDock(QDockWidget):
             lookback_days=settings.mosaic_lookback_days(),
             max_scenes=settings.mosaic_max_scenes(),
             timeless=run.collection.timeless,
+            on_pick=clip,
         )
         self._tile_task = task
         # A bound method: the signal comes from the worker thread.
         task.progressChanged.connect(self._sync_mosaic_button)
-        task.taskCompleted.connect(lambda: self._on_tiles_found(task, run))
-        task.taskTerminated.connect(lambda: self._on_tiles_found(task, run))
+        preview = (view, clips)
+        task.taskCompleted.connect(lambda: self._on_tiles_found(task, run, preview))
+        task.taskTerminated.connect(lambda: self._on_tiles_found(task, run, preview))
         self._sync_mosaic_button()
         self._loader.run_task(task)
 
-    def _on_tiles_found(self, task: TileSearchTask, run: _SearchRun) -> None:
+    def _on_tiles_found(
+        self, task: TileSearchTask, run: _SearchRun, preview: tuple | None = None
+    ) -> None:
+        """The tile search ended: build its mosaic. *preview*: the view at the
+        click and the preview clips made of it (``MosaicBuildTask``)."""
         if self._closed or task is not self._tile_task:
             return
         self._tile_task = None
@@ -2540,7 +2587,7 @@ class QStacDock(QDockWidget):
                 task.scenes, coll, run.catalog, task.day_cover, index, band
             )
         else:
-            self._load_mosaic(task.scenes, coll, run.catalog, index, band)
+            self._load_mosaic(task.scenes, coll, run.catalog, index, band, preview)
 
     def _note_mosaic(self, task: TileSearchTask, run: _SearchRun) -> None:
         """What the mosaic's scenes leave out or reach for, in the message bar."""

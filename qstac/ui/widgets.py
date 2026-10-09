@@ -484,11 +484,11 @@ class _ResultCard(QWidget):
 
 
 class MosaicButton(QPushButton):
-    """The tile mosaic button between Search and the area ▾: 9 squares.
+    """The "Mosaic" button beside Search, its icon 9 squares.
 
-    The patchwork says "a mosaic" without a word (bright tiles a tile's
-    newest scene, faded ones older fill), and while it builds the tiles
-    fill in with its progress: the icon is the progress bar. :meth:`animate`
+    The patchwork shows what a mosaic is (bright tiles a tile's newest
+    scene, faded ones older fill), and while it builds the tiles fill in
+    with its progress: the icon is the progress bar. :meth:`animate`
     plays one of ANIMATIONS once, to say a collection mosaics well.
     """
 
@@ -505,10 +505,10 @@ class MosaicButton(QPushButton):
     _BUILD_ORDER = (4, 0, 8, 2, 6, 1, 7, 3, 5)  # centre, corners, edges
 
     def __init__(self, parent: QWidget | None = None):
-        super().__init__(parent)
-        self.setFixedSize(34, 34)
+        super().__init__(" Mosaic", parent)
+        self.setFixedHeight(34)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setIconSize(QSize(20, 20))
+        self.setIconSize(QSize(18, 18))
         self._kind = ""
         self._frame = 0
         self._timer = QTimer(self)
@@ -607,6 +607,25 @@ class RefreshingCombo(QComboBox):
     def showPopup(self) -> None:  # noqa: N802 (Qt override)
         self._on_open()
         super().showPopup()
+
+
+class MenuCombo(QComboBox):
+    """A combo that shows one value and opens *on_open*'s menu, not a list.
+
+    The search area: its choices are actions (draw a rectangle…) whose Esc
+    keeps the area it had, which a combo's own list cannot express.
+    """
+
+    def __init__(self, on_open: Callable[[], None], parent: QWidget | None = None):
+        super().__init__(parent)
+        self._on_open = on_open
+
+    def set_value(self, text: str) -> None:
+        self.clear()
+        self.addItem(text)
+
+    def showPopup(self) -> None:  # noqa: N802 (Qt override)
+        self._on_open()
 
 
 class ElidedLabel(QLabel):

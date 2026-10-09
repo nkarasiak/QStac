@@ -8,12 +8,12 @@ from __future__ import annotations
 import datetime
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from typing import TYPE_CHECKING
 
 from qgis.core import QgsTask
 
-from ..geo import TileCover, area_cover, day_cover
+from ..geo import TileCover, area_cover, day_cover, search_area
 from .auth import request_headers
 from .net import StacError
 from .search import search_catalog, server_cloud_filter
@@ -35,6 +35,12 @@ _IN_FLIGHT = 8  # windows searched at once
 # and Iberia take 587 scenes instead of 331, but tried without, most of
 # France showed the basemap: Sentinel-2's newest scene there is a strip.
 _FILL_GAPS = True
+
+# How long after it starts a tile search waits for its picks' work (the
+# mosaic's preview clips): most are in by then, and a slow one (a stalled
+# range request held one for 30 s) is left out of the first look, not
+# waited for. Then the mosaic's first image is on the map in about 2 s.
+_PICKS_DEADLINE_S = 1.4
 _TRANSIENT = frozenset({"rate_limit", "timeout", "network", "server"})
 _RETRIES = 2  # per page, after search.py's own one retry on 429/5xx
 
@@ -122,9 +128,10 @@ class TileSearchTask(QgsTask):
     time and read newest first into a :class:`TileCover`, from *date_to*
     back to *lookback_days* before *date_from* (the ``mosaic_lookback_days``
     setting; 0 stays within the dates), stopping once every tile is
-    covered. The last *reach_days* (the collection's revisit and publishing
-    delay: ``CollectionInfo.mosaic_reach_days``), searched alongside without
-    the cloud limit, say which tiles there are and how far their scenes
+    covered within the search area. The last *reach_days* (the
+    collection's revisit and publishing delay:
+    ``CollectionInfo.mosaic_reach_days``), searched alongside without the
+    cloud limit, say which tiles there are and how far their scenes
     reach. One chain of next-page tokens took 30 s for France and Iberia;
     windows need no token, so they run side by side. Items are trimmed to
     what is used (the fields extension): *assets*, the footprint and the
@@ -152,9 +159,10 @@ class TileSearchTask(QgsTask):
         reach_days: int = 10,
         by_time: bool = False,
         area: QgsGeometry | None = None,
-        lookback_days: int = 365,
+        lookback_days: int = 0,
         max_scenes: int = 1000,
         timeless: bool = False,
+        on_pick: Callable[[StacItemResult], object] | None = None,
     ) -> None:
         super().__init__(f"Finding a scene for every tile of {collection}")
         self.catalog = catalog
@@ -173,10 +181,17 @@ class TileSearchTask(QgsTask):
         self.max_scenes = max_scenes
         self.timeless = timeless
         self.capped = False  # more than max_scenes scenes to read
-        self.area = area  # by time: a drawn or selected area (WGS84)
+        self.area = area  # a drawn or selected area (WGS84)
         self.day_cover: dict[str, float] = {}  # by time: geo.day_cover()
         self.scenes: list[StacItemResult] = []
         self.missing: list[str] = []  # tiles never covered
+        # Run (in threads) on each scene the cover takes, as it takes it: a
+        # pick is never undone, so the build's reads can start while the
+        # search still runs (the mosaic's first image, 1.5 s sooner).
+        self.on_pick = on_pick
+        self._handed = 0
+        self._picks: list = []
+        self._started = 0.0
         self.error: str | None = None
 
     def _window(
@@ -230,6 +245,25 @@ class TileSearchTask(QgsTask):
             if token is None:
                 break
 
+    def _hand_picks(
+        self, cover: TileCover | _EveryScene, pool: ThreadPoolExecutor
+    ) -> None:
+        """Hand *on_pick* the scenes *cover* took since the last call (not by
+        time: every scene of the dates)."""
+        if self.on_pick is None or self.by_time:
+            return
+        start = self._handed
+        for item in cover.picked[start:]:
+            self._picks.append(pool.submit(self.on_pick, item))
+        self._handed = len(cover.picked)
+
+    def _end_picks(self, pool: ThreadPoolExecutor) -> None:
+        """Give the picks' work until _PICKS_DEADLINE_S: the build reads it next."""
+        left = self._started + _PICKS_DEADLINE_S - time.monotonic()
+        if not self.isCanceled() and left > 0:
+            wait(self._picks, timeout=left)
+        pool.shutdown(wait=False, cancel_futures=True)
+
     def _cover_area(self) -> bool:
         """No tile grid: newest first until the area is covered (class doc)."""
         end = datetime.date.today() if self.timeless else self.date_to
@@ -240,19 +274,25 @@ class TileSearchTask(QgsTask):
         cover = area_cover(self.bbox, self.area)
         headers = request_headers(self.catalog) or None
         read = 0
-        for page in self._pages(when, self.cloud, headers, newest=True):
-            cover.add(page)
-            read += len(page)
-            if not cover.missing():
-                break
-            if read >= self.max_scenes:
-                self.capped = True
-                break
-            self.setProgress(100 * read / self.max_scenes)
+        picks = ThreadPoolExecutor(_IN_FLIGHT)
+        try:
+            for page in self._pages(when, self.cloud, headers, newest=True):
+                cover.add(page)
+                self._hand_picks(cover, picks)
+                read += len(page)
+                if not cover.missing():
+                    break
+                if read >= self.max_scenes:
+                    self.capped = True
+                    break
+                self.setProgress(100 * read / self.max_scenes)
+        finally:
+            self._end_picks(picks)
         self.scenes = cover.scenes()
         return not self.isCanceled()
 
     def run(self) -> bool:
+        self._started = time.monotonic()
         if not self.reach_days and not self.by_time:
             try:
                 return self._cover_area()
@@ -270,6 +310,7 @@ class TileSearchTask(QgsTask):
             last -= step
         reach_ends = [] if self.by_time else ends[: -(-self.reach_days // _WINDOW_DAYS)]
         pool = ThreadPoolExecutor(_IN_FLIGHT)
+        picks = ThreadPoolExecutor(_IN_FLIGHT)
         try:
             headers = request_headers(self.catalog) or None
             reach = [pool.submit(self._window, e, None, headers) for e in reach_ends]
@@ -277,12 +318,17 @@ class TileSearchTask(QgsTask):
             cover = (
                 _EveryScene(self.max_scenes)
                 if self.by_time
-                else TileCover([i for f in reach for i in f.result()], _FILL_GAPS)
+                else TileCover(
+                    [i for f in reach for i in f.result()],
+                    _FILL_GAPS,
+                    within=search_area(self.bbox, self.area),
+                )
             )
             for n, future in enumerate(window):
                 if self.isCanceled():
                     return False
                 cover.add(future.result())
+                self._hand_picks(cover, picks)
                 # No tile seen in the reach (none published lately): no goal
                 # to meet, so every window is read rather than none.
                 if cover.goal and not cover.missing():
@@ -300,3 +346,4 @@ class TileSearchTask(QgsTask):
         finally:
             # Windows not started yet are dropped; running ones end unread.
             pool.shutdown(wait=False, cancel_futures=True)
+            self._end_picks(picks)

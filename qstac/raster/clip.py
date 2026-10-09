@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import concurrent.futures
 import math
+import threading
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from osgeo import gdal, osr
@@ -87,6 +89,38 @@ def _cog_geometry(
     return gt, w, h, bx, by, factors, projwin
 
 
+_POOLS: dict[int, concurrent.futures.ThreadPoolExecutor] = {}
+_POOLS_LOCK = threading.Lock()
+
+
+def _fetch_pool() -> concurrent.futures.ThreadPoolExecutor:
+    """The threads every tile fetch runs on, kept between loads.
+
+    GDAL keeps its HTTP connections per thread: a fresh thread opened a COG
+    in 0.5 s (a TLS handshake first), a kept one in 0.05-0.3 s. A mosaic's
+    first look is a dozen scenes' clips, each a handful of tiles.
+    """
+    # The clip_workers setting: range requests in flight per COG, about
+    # four COGs at once.
+    size = 4 * settings.clip_workers()
+    with _POOLS_LOCK:
+        if size not in _POOLS:
+            _POOLS[size] = concurrent.futures.ThreadPoolExecutor(
+                size, thread_name_prefix="qstac-fetch"
+            )
+        return _POOLS[size]
+
+
+def _hedge_url(url: str) -> str:
+    """*url* for a hedged copy of a read: GDAL makes a thread wait for
+    another's download of the same range, so a copy of a stalled read on
+    the same URL stalled with it (30 s, until GDAL_HTTP_LOW_SPEED_TIME). A
+    query parameter Azure and S3 ignore makes it another file to GDAL."""
+    if not url.startswith("/vsicurl/http"):
+        return url  # /vsis3/: no query string
+    return url + ("&" if "?" in url else "?") + "qstac_hedge=1"
+
+
 def _run_hedged(
     fn: Callable[[int, int], str | None],
     n: int,
@@ -105,17 +139,15 @@ def _run_hedged(
     and nothing is returned. *cancel* is called from worker threads, so it
     must not touch a QgsTask (use a ``threading.Event``'s ``is_set``).
     """
-    pool = concurrent.futures.ThreadPoolExecutor(
-        # The clip_workers setting: range requests in flight per COG.
-        max_workers=min(2 * n, 2 * settings.clip_workers())
-    )
+    pool = _fetch_pool()
     pending = {pool.submit(fn, i, 0): i for i in range(n)}
     results: dict[int, str | None] = {}
     hedged: set[int] = set()
     deadline = time.monotonic() + hedge_after
     while pending:
         if cancel is not None and cancel():
-            pool.shutdown(wait=False, cancel_futures=True)
+            for fut in pending:
+                fut.cancel()  # queued ones; running ones see *cancel*
             concurrent.futures.wait(pending, timeout=_CANCEL_DRAIN_S)
             return []
         timeout = (
@@ -142,7 +174,6 @@ def _run_hedged(
             hedged |= set(range(n)) - set(pending.values())  # nothing left to hedge
         # Drop the slow twin of any job that already has a result.
         pending = {f: i for f, i in pending.items() if results.get(i) is None}
-    pool.shutdown(wait=False)
     return [results[i] for i in range(n) if results.get(i)]
 
 
@@ -219,7 +250,7 @@ def _materialize_window_tiles(
             # gdal.quiet_errors() does, which needs GDAL 3.7.
             gdal.PushErrorHandler("CPLQuietErrorHandler")
             try:
-                src = gdal.Open(url)
+                src = gdal.Open(_hedge_url(url) if attempt else url)
                 tile = gdal.Translate(
                     out,
                     src,
@@ -264,6 +295,52 @@ def _viewport_projwin(
     dst_srs = ds.GetSpatialRef()
     ds = None  # close before Translate reopens
     return _projwin_from(gt, dst_srs, viewport_4326)
+
+
+def render_clip(
+    render: Callable[[tuple[float, float, float, float], tuple[int, int]], bytes],
+    proj: AssetProj,
+    epsg: int,
+    view: tuple[tuple[float, float, float, float], tuple[int, int]],
+    out_prefix: str,
+) -> str | None:
+    """A server-rendered image of a scene's part of *view* (the canvas extent
+    in WGS84, its size in pixels) as a local GeoTIFF, or None.
+
+    *render* fetches the PNG for bounds in the scene's CRS (EPSG *epsg*) and
+    a size (``stac.auth.pc_render``); the bounds are the view's, cut to the
+    scene (STAC ``proj:``), at the canvas resolution.
+    """
+    t = proj.transform
+    gt = (t[2], t[0], t[1], t[5], t[3], t[4])
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(epsg)
+    srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    win = _projwin_from(gt, srs, view[0])
+    if win is None:
+        return None
+    ulx, uly, lrx, lry = win
+    res = (lrx - ulx) / max(1, view[1][0])  # map units per canvas pixel
+    h, w = proj.shape
+    x0, x1 = max(ulx, gt[0]), min(lrx, gt[0] + w * gt[1])
+    y0, y1 = max(lry, gt[3] + h * gt[5]), min(uly, gt[3])
+    size = (min(2048, round((x1 - x0) / res)), min(2048, round((y1 - y0) / res)))
+    if min(size) < 1:
+        return None  # outside the view
+    try:
+        png = f"{out_prefix}.png"
+        Path(png).write_bytes(render((x0, y0, x1, y1), size))
+        out = gdal.Translate(
+            f"{out_prefix}.tif",
+            png,
+            outputBounds=[x0, y1, x1, y0],
+            outputSRS=f"EPSG:{epsg}",
+            noData=0,
+        )
+    except Exception as exc:  # the COG mosaic still comes
+        log(f"Could not render a preview: {exc}")
+        return None
+    return f"{out_prefix}.tif" if out is not None else None
 
 
 def _projwin_from(

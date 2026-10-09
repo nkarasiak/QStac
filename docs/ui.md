@@ -70,10 +70,11 @@ Font sizes are relative to the QGIS application font (`styles.fs()` for
 stylesheets, `styles.pt()` for `QFont`), never px, so the dock follows the
 QGIS font size setting.
 
-The search area is the map view, so the caption over the Search row says
-*Area: this map view*
+The search area is the map view, so the *Area* field over the Search row
+(`combo_area`, a `widgets.MenuCombo`: styled as the combos above it, it opens
+a menu, not a list) says *This map view*,
 and `_show_search_area()` tints the searched box on the map until the search
-ends (`_stop_progress()`). The ▾ beside it (`_show_area_menu()`) swaps in a
+ends (`_stop_progress()`). Its menu (`_show_area_menu()`) swaps in a
 drawn rectangle or polygon (`ui/area_tool.py`, clicks, not a drag)
 or the active layer's selected features, which is searched right away, stays
 tinted and is kept for later searches until *This map view* is picked again
@@ -91,9 +92,10 @@ there is more. Card text lines are `ElidedLabel`s (date, satellite,
 tile, one line each): the card is held to the list's width, so a label that
 cannot shrink overlaps the thumbnail in a narrow dock.
 
-The tile mosaic is a 9-square button (`widgets.MosaicButton`, `btn_mosaic`,
-outlined) after *Search* and its area ▾, which stay one filled control, all
-under an "Area: this map view" caption that follows the area menu. Its icon
+The tile mosaic is the *Mosaic* button (`widgets.MosaicButton`, `btn_mosaic`,
+outlined) beside the filled *Search*, both under the *Area* field: what to
+cover, then what to do (the ▾ that was glued to Search read as part of it,
+and a bare 9-square icon said nothing to a newcomer). Its icon
 is a painted 3x3 patchwork (bright tiles a tile's newest scene, faded older
 fill); its tooltip says the rule in one line (`_sync_mosaic_button()`),
 and hovering it tints the area on the map (`_preview_mosaic_area()`), so the
@@ -114,7 +116,7 @@ over `_DATES_ASKED` (12) dates it asks first, via `_choose()`, whether to build
 only the 12 covering most of the area — `geo.day_cover()`, computed in the
 task — or all: over a wide area most dates are one orbit's strip of it).
 Under them *Only the search dates* (enabled for the newest-scenes kind) sets
-`mosaic_lookback_days` to 0, or back to its default when unchecked: no scene
+`mosaic_lookback_days` to 0 (the default), or to 365 when unchecked: no scene
 from before the start date, for a tile mosaic or an area cover alike.
 A pick builds that mosaic at once (not while one builds: no menu then), and
 later clicks build it again. Below that it picks what the mosaic shows, per collection for the session
@@ -156,8 +158,10 @@ searched 8 at a time (no next-page token chain: one took 30 s for France and
 Iberia) and trimmed by the fields extension (`supports_fields`, from
 `conformsTo`) to the footprint, properties and the assets the mosaic reads.
 Windows are read newest first, from the end date back to `mosaic_lookback_days`
-(365 by default, Settings > Mosaic; 0 keeps to the search dates) before the
-start date, and the search stops once every tile is covered; the last
+(0 by default: the search dates only; Settings > Mosaic) before the
+start date, and the search stops once every tile is covered within the search
+area (`TileCover(within=)`: a tile the view clips needs only its part, not
+its older scenes' slivers outside it); the last
 `mosaic_reach_days`, searched alongside without the cloud limit, say which
 tiles there are and how far their scenes reach. With none there (Landsat
 published late) the search reads every window rather than stop at once, empty. `geo.TileCover` keeps a tile's newest scene and older ones only where
@@ -168,6 +172,9 @@ off, most of France showed the basemap). France and Iberia at 20%: 331 tiles,
 587 scenes, 3 s to search, 6 s to build.
 Over `_MOSAIC_ASKED` (1000, as *Load all*) scenes it asks before building
 (`_on_tiles_found()`): one long build, and every redraw zoomed out reads each.
+The mosaic is on the map about 1.5 s after the click: a preview of the view
+made as the search picks its scenes, then sharp, then pannable (in
+loading.md).
 
 Loading several selected scenes from the load bar or Return/Space
 (`_shortcut_load()`) asks every time how: separate layers, mosaic or time
