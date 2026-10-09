@@ -112,10 +112,13 @@ with the others and *Change…*, Settings opened on its Mosaic page:
 `_note_composite()`), over the scenes of the dates, newest first,
 until each tile is likely clear; newest with *Hide clouds* on reads older
 Sentinel-2 ones the same way, to fill its clouds (`docs/loading.md`). The menu's first choice is named after it
-(`_COMPOSITE_TEXT`). When the dates leave holes over 0.1 % of the view
-with no clear view (`_FILL_LEFT`; at 1 %, France 0.9 % empty offered no fill;
+(`_COMPOSITE_TEXT`). When the dates leave over 0.1 % of the view with no
+clear view, specks too (`_FILL_LEFT`, `ClearViews.empty()`; at 1 % of holes,
+France 0.9 % empty offered no fill;
 measured on the finished mosaic at 512 px by its build,
-`MosaicBuildTask(goal=)._measure()`, 3 s for France, every tile of the area
+`MosaicBuildTask(goal=)._measure()`, 3 s for France: a tile grid's dated
+mosaic read locally, true colour, a band combination or an index, whose nodata is its own (a
+negative NDVI is data), every tile of the area
 counted: `TileSearchTask.goal`, `ClearViews.expect()`, so a tile no scene of
 the dates passed the cloud filter for is a hole too; the search's own count
 comes before the build clipped every scene: 31 % said, 3 % left), the message
@@ -128,16 +131,21 @@ keeps that mosaic (a new mosaic removes the last one's notes:
 every scene is clipped, saw no hole there and the fill took nothing), reads the year
 before its dates (`_year_before()`) over its holes only
 (`ClearViews.hole_cells()`, a few dozen rectangles sent as `intersects`:
-`TileSearchTask(holes=)`), a scene taken only where a pixel has no clear view
+`TileSearchTask(holes=)`; an index's counted on its first band, read from
+the COGs: NDVI near Ussel, 2.0 % empty to 0.01 % in 12 s, true colour's PC
+renders 4 s), a scene taken only where a pixel has no clear view
 yet, until 0.1 % of it lacks one (`_FILL_LEFT`: 1 % left the cloud blobs
-all over a zoomed-in view; 0.1 % took one scene and 0.9 s more), and builds
-those alone, a mosaic right under the
-first (`load_mosaic(under=)`); what is still empty is said from the count,
-the fill's own build seeing only the holes. It once built the whole mosaic
-again, dates and all, on top: France, 30 days, 991 scenes in 23 s of search
-(2485 in 47 s when older scenes also waited for three views), then all of
-them built again. Near Le Mans over 10 days (11.6 % missing): 6 scenes
-to build, not 30.
+all over a zoomed-in view; 0.1 % took one scene and 0.9 s more), then
+builds the mosaic again with them, the older under its own scenes, in its
+layers' place (`_Fill.scenes`, `load_mosaic(replaces=)`, the search's clips
+reused): its median or mean over them all, as a mosaic of those dates would
+be; what is still empty is said from the count. Built alone, a layer under
+the first, the holes' pixels had the older scenes' median and the rest the
+first's: true colour near Ussel 0.5 s, rebuilt 0.8 s; IRC near Paris 5.1 s,
+rebuilt 6.8 s. The first fill searched the dates again over the whole
+view: France, 30 days, 991 scenes in 23 s (2485 in 47 s when older scenes
+also waited for three views), then built all of them; near Le Mans, 30
+scenes where 6 filled the holes.
 Right-click (`_show_mosaic_menu()`) builds another, its picks kept for the
 session, never saved (two saved settings for it once made a click build one
 mosaic per date unasked). On top, set in place while the menu stays open
@@ -152,10 +160,9 @@ UTC day, `load_mosaic(stack=True)` so the time filter is not lifted, and
 over `_DATES_ASKED` (12) dates it asks first, via `_choose()`, whether to build
 only the 12 covering most of the area — `geo.day_cover()`, computed in the
 task — or all: over a wide area most dates are one orbit's strip of it).
-Right under *Newest*, indented as its option, *Only the search dates* (ticked)
-looks back 0 days, unticked 365: no scene from before the start date, for a
-tile mosaic or an area cover alike; one mosaic per date shows it ticked and
-greyed. Below them, what the mosaic shows, a pick building it (not while one
+A mosaic takes scenes of the search dates only; what they leave empty, *Fill
+from older scenes* reads the year before for (an *Only the search dates*
+checkbox under *Newest*, unticked a year's look back, went with it). Below them, what the mosaic shows, a pick building it (not while one
 builds: no menu then): the default and the band combinations, then the
 *Spectral index* submenu (the curated ones, then the templates of its kind,
 radar or not, and saved ones: `_mosaic_index_labels()`), titled with an index
@@ -176,8 +183,8 @@ and L2A (10), HLS S30 (14), Landsat C2 L2 and HLS L30 (32: 16-day revisit,
 published late), MODIS 09Q1 (40: 8-day composites, ~3 weeks late). Any
 other collection (no tile grid, or none tried) is covered by area instead
 (`geo.area_cover()`: `TileCover` with the search area as its one tile): its
-scenes up to the end date (from 1900: the Copernicus Data Space API refuses
-`../end`; from the start date with *Only the search dates*), newest first (`sortby`), a scene kept only where it adds ground,
+scenes of the dates (a timeless one's from 1900: the Copernicus Data Space
+API refuses `../end`), newest first (`sortby`), a scene kept only where it adds ground,
 until the area is covered or `mosaic_max_scenes` are read; then it asks
 before building the part they cover (a world-wide view of CDSE's 30 m DEM
 is thousands of 1° tiles, the newest 1000 a strip of it). A DEM or yearly
@@ -192,12 +199,13 @@ snapshot), not an action on the results: no search is needed first, and the
 result list is not used. While it runs the squares fill in with the progress
 and a click cancels. It runs one `stac.search_task.TileSearchTask`. For a
 tile mosaic the dates are cut into 2-day windows,
-searched 8 at a time (no next-page token chain: one took 30 s for France and
+searched 8 ahead of the one read (`_read_ahead()`; all at once, a fill
+stopping a month back had fetched the year's 188 while its clips rendered:
+14 s, 7.7 s without) (no next-page token chain: one took 30 s for France and
 Iberia) and trimmed by the fields extension (`supports_fields`, from
 `conformsTo`) to the footprint, properties and the assets the mosaic reads.
-Windows are read newest first, from the end date back to the look back
-(0 by default: the search dates only; the right-click menu) before the
-start date, and the search stops once every tile is covered within the search
+Windows are read newest first, from the end date back to the start date,
+and the search stops once every tile is covered within the search
 area (`TileCover(within=)`: a tile the view clips needs only its part, not
 its older scenes' slivers outside it); the last
 `mosaic_reach_days`, searched alongside without the cloud limit, say which

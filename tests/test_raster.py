@@ -183,6 +183,23 @@ def test_scl_mask_hides_clouds_on_every_path() -> None:
         assert list(got[2:]) == [_INDEX_NODATA] * 4, got
         assert float(ds.GetRasterBand(1).GetMetadataItem("STATISTICS_MINIMUM")) > 0.8
 
+        # A band combination's mosaic (IRC): baked RGB, its clouds 0, nodata,
+        # so the scene under them shows, as true colour's do.
+        import qstac.raster.tasks as tasks
+
+        read, tasks.view_clip = tasks.view_clip, lambda _i, href, *_a: href
+        try:
+            parts = [("X", {"a": src, "b": src, "c": src, "SCL": scl}, None, {})]
+            built = tasks._build_local_band_mosaic(
+                parts, ["a", "b", "c"], (0, 1000), ((0, 0, 1, 1), (6, 1)),
+                lambda: False, hide_clouds=True,
+            )  # fmt: skip
+        finally:
+            tasks.view_clip = read
+        ds = gdal.Open(built[0][0])
+        got = ds.GetRasterBand(1).ReadAsArray()[0]
+        assert list(got > 0) == [v == 255 for v in want], got
+
 
 def test_mosaic_shows_the_older_scene_under_a_cloud() -> None:
     """A cloud of the newest scene is 0, nodata: the one under it shows."""
@@ -316,6 +333,8 @@ def test_mosaic_search_reads_on_until_each_pixel_has_data() -> None:
         specks.add(clip(f"{tmp}/s2.tif", speck=True), box(0, 8))
         assert specks.enough() and specks.missing() == 0
         assert specks.empty() == 1 / 64, "said: the map shows it empty"
+        specks.specks = False  # Fill from older scenes: a speck is a hole
+        assert not specks.enough() and specks.wants(box(0, 8))
         # Filling from older scenes: a one-cell wedge is a hole, wanted.
         wedge = ClearViews((0, 0, 8, 8), width=8, tolerance=0)
         wedge.add(clip(f"{tmp}/w.tif", line=True), box(0, 8))
@@ -334,6 +353,18 @@ def test_mosaic_search_reads_on_until_each_pixel_has_data() -> None:
         # A tile east of it with no scene under the cloud filter: a hole too.
         coast.expect(box(4, 8))
         assert coast.missing() == 0.5, coast.missing()
+        # An index: negative values are data, its nodata is not.
+        ndvi = f"{tmp}/ndvi.tif"
+        ds = gdal.GetDriverByName("GTiff").Create(ndvi, 8, 8, 1, gdal.GDT_Float32)
+        ds.SetGeoTransform([0, 1, 0, 8, 0, -1])
+        ds.SetProjection("EPSG:4326")
+        values = np.full((8, 8), -0.2, np.float32)
+        values[:, 4:] = -9999
+        ds.GetRasterBand(1).WriteArray(values)
+        ds = None
+        index = ClearViews((0, 0, 8, 8), width=8)
+        index.add(ndvi, box(0, 8), nodata=-9999)
+        assert index.missing() == 0.5, index.missing()
         # Measured on the finished mosaic, by its build: the west clear, an
         # empty tile east of it.
         from qstac.raster.tasks import MosaicBuildTask
@@ -889,8 +920,8 @@ def test_tile_mosaic_reads_back_when_the_reach_is_empty() -> None:
         facets={"landsat:wrs_path": "198", "landsat:wrs_row": "027"},
     )
     task = st.TileSearchTask(
-        SimpleNamespace(), "landsat-c2-l2", (0, 0, 1, 1), "2026-09-07",
-        "2026-10-07", 20, ["red"], 30, 10, lookback_days=365,
+        SimpleNamespace(), "landsat-c2-l2", (0, 0, 1, 1), "2026-08-01",
+        "2026-10-07", 20, ["red"], 30, 10,
     )  # fmt: skip
     clear_since = datetime.date(2026, 8, 10)
     task._window = lambda end, cloud, _h: (

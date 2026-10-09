@@ -340,6 +340,11 @@ class ClearViews:
         # France fill chased clouds of every date for a year (106 s).
         self.tolerance = tolerance
         self.gaps = tolerance
+        # Specks left out of the holes (_holes): off for Fill from older
+        # scenes, which a speck held for no date (SCL wrong on every one):
+        # at 800 m cells it also dropped cloud blobs of 1-2 km near Ussel,
+        # clear on two older dates, and stopped with 0.36 % empty.
+        self.specks = True
         self.size = (width, max(1, round(width * (y1 - y0) / max(x1 - x0, 1e-9))))
         w, h = self.size
         self.gt = (x0, (x1 - x0) / w, 0.0, y1, 0.0, -(y1 - y0) / h)
@@ -348,8 +353,9 @@ class ClearViews:
         self.taken = np.zeros((h, w), bool)  # the footprints of the scenes added
         self._lock = threading.Lock()
 
-    def add(self, clip: str, footprint: dict | None) -> None:
-        """Count *clip*'s clear pixels and its scene's *footprint* (GeoJSON)."""
+    def add(self, clip: str, footprint: dict | None, nodata: float = 0) -> None:
+        """Count *clip*'s clear pixels and its scene's *footprint* (GeoJSON).
+        *nodata*: what is not clear (an index's: a negative NDVI is data)."""
         w, h = self.size
         try:
             ds = gdal.Warp(
@@ -360,10 +366,10 @@ class ClearViews:
                 outputBounds=self.bounds,
                 width=w,
                 height=h,
-                srcNodata=0,  # else Warp turns a hidden cloud's 0 into 1
-                dstNodata=0,
+                srcNodata=nodata,  # else Warp turns a hidden cloud's 0 into 1
+                dstNodata=nodata,
             )
-            clear = ds.ReadAsArray().reshape(-1, h, w).max(axis=0) > 0
+            clear = (ds.ReadAsArray().reshape(-1, h, w) != nodata).any(axis=0)
             shape = self._rasterize(footprint) if footprint else clear
         except Exception as exc:  # the search reads on as if it saw nothing
             log(f"Could not count the clear pixels of {clip}: {exc}")
@@ -404,7 +410,7 @@ class ClearViews:
             return True
         need = self.need if need is None else need
         with self._lock:
-            holes = _holes(self.covered & (self.clear < need))
+            holes = self._holes(self.covered & (self.clear < need))
         # Any hole: a wedge between two orbits is far under 1 % of a tile.
         return bool(holes[shape].any())
 
@@ -431,7 +437,7 @@ class ClearViews:
         rectangle (a few dozen: a search API slows on fine shapes); None
         without any. What Fill from older scenes searches."""
         with self._lock:
-            holes = _holes(self.covered & (self.clear == 0))
+            holes = self._holes(self.covered & (self.clear == 0))
         if not holes.any():
             return None
         h, w = holes.shape
@@ -458,15 +464,19 @@ class ClearViews:
         holes (:func:`_holes`), not specks."""
         with self._lock:
             covered = self.covered.copy()
-            holes = _holes(covered & (self.clear < need))
+            holes = self._holes(covered & (self.clear < need))
         return float(holes.sum() / covered.sum()) if covered.any() else 0.0
 
     def _gaps(self) -> float:
         """The share of the covered pixels no scene taken covers."""
         with self._lock:
             covered = self.covered.copy()
-            gaps = _holes(covered & ~self.taken)
+            gaps = self._holes(covered & ~self.taken)
         return float(gaps.sum() / covered.sum()) if covered.any() else 0.0
+
+    def _holes(self, mask: np.ndarray) -> np.ndarray:
+        """*mask* without its specks, unless they count (*specks* off)."""
+        return _holes(mask) if self.specks else mask
 
 
 def _holes(mask: np.ndarray) -> np.ndarray:

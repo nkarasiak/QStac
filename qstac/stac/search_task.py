@@ -8,7 +8,7 @@ from __future__ import annotations
 import datetime
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import TYPE_CHECKING
 
 from qgis.core import QgsTask
@@ -133,9 +133,9 @@ class TileSearchTask(QgsTask):
 
     The dates are cut into _WINDOW_DAYS windows, searched _IN_FLIGHT at a
     time and read newest first into a :class:`TileCover`, from *date_to*
-    back to *lookback_days* before *date_from* (the mosaic menu's *Only the
-    search dates*: 0 stays within the dates), stopping once every tile is
-    covered within the search area. The last *reach_days* (the
+    back to *date_from*, stopping once every tile is covered within the
+    search area (what the dates leave empty, Fill from older scenes reads
+    the year before for: dock). The last *reach_days* (the
     collection's revisit and publishing delay:
     ``CollectionInfo.mosaic_reach_days``), searched alongside without the
     cloud limit, say which tiles there are and how far their scenes
@@ -149,8 +149,8 @@ class TileSearchTask(QgsTask):
     product: today), newest first, into :func:`geo.area_cover` until the
     area is covered, reading at most *max_scenes*. A DEM or yearly product
     so takes its newest year (older ones only where it has no tile),
-    Sentinel-1 or NAIP each place's newest pass. A *lookback_days* of 0
-    keeps it to the search dates instead (not *timeless*: it has none).
+    Sentinel-1 or NAIP each place's newest pass, from *date_from* (not
+    *timeless*: it has none).
     """
 
     def __init__(
@@ -172,7 +172,6 @@ class TileSearchTask(QgsTask):
         holes: dict | None = None,
         expect: Callable[[list[QgsGeometry]], object] | None = None,
         area: QgsGeometry | None = None,
-        lookback_days: int = 0,
         max_scenes: int = 1000,
         timeless: bool = False,
         on_pick: Callable[[StacItemResult], object] | None = None,
@@ -206,7 +205,6 @@ class TileSearchTask(QgsTask):
         # Handed each tile's reach once known, before any scene is read:
         # what the clear-pixel count must see filled (ClearViews.expect).
         self.expect = expect
-        self.lookback_days = lookback_days
         # By time: the newest this many scenes, as "Load all" does its
         # results (a mosaic layer's scenes are read at build).
         self.max_scenes = max_scenes
@@ -225,6 +223,7 @@ class TileSearchTask(QgsTask):
         self.on_pick = on_pick
         self._handed = 0
         self._picks: list = []
+        self._settled = 0  # how many of _picks came before the last window's
         self._started = 0.0
         self.error: str | None = None
 
@@ -288,11 +287,12 @@ class TileSearchTask(QgsTask):
         if self.on_pick is None or self.by_time:
             return
         start = self._handed
+        self._settled = len(self._picks)
         for item in cover.picked[start:]:
             self._picks.append(pool.submit(self.on_pick, item))
         self._handed = len(cover.picked)
 
-    def _cover(self, reach: list, deepest: datetime.date) -> TileCover | _EveryScene:
+    def _cover(self, reach: list) -> TileCover | _EveryScene:
         """What takes the scenes as they are read: every one by time, else a
         :class:`TileCover` of the tiles *reach* (futures of recent scenes at
         any cloud cover) shows, those handed to *expect* first."""
@@ -318,7 +318,10 @@ class TileSearchTask(QgsTask):
             return True
         if self.enough is None:
             return not cover.cloudy()
-        wait(self._picks)  # their clips counted: what the map will show
+        # Their clips counted: what the map will show. Filling, all but the
+        # last window's, which render while the next is read: 14 windows
+        # waited for in turn were most of a 7.7 s fill search.
+        wait(self._picks[: self._settled] if self.holes else self._picks)
         return self.enough()
 
     def _past_the_limit(
@@ -346,6 +349,19 @@ class TileSearchTask(QgsTask):
         self._hand_picks(cover, picks)
         return sorted(cover.picked[before:], key=lambda i: i.datetime_str)
 
+    def _read_ahead(
+        self, pool: ThreadPoolExecutor, ends: list[datetime.date], headers: dict | None
+    ) -> Iterator[list[StacItemResult]]:
+        """The windows ending on *ends*, in order, each fetched _IN_FLIGHT
+        ahead of its reading, not the whole year at once: a fill stopping a
+        month back had fetched 188 windows."""
+        window: dict[int, Future] = {}
+        for n in range(len(ends)):
+            for i in range(n, min(n + _IN_FLIGHT, len(ends))):
+                if i not in window:
+                    window[i] = pool.submit(self._window, ends[i], self.cloud, headers)
+            yield window.pop(n).result()
+
     def _end_picks(self, pool: ThreadPoolExecutor) -> None:
         """Give the picks' work until _PICKS_DEADLINE_S: the build reads it next."""
         left = self._started + _PICKS_DEADLINE_S - time.monotonic()
@@ -356,9 +372,8 @@ class TileSearchTask(QgsTask):
     def _cover_area(self) -> bool:
         """No tile grid: newest first until the area is covered (class doc)."""
         end = datetime.date.today() if self.timeless else self.date_to
-        only_dates = self.lookback_days == 0 and not self.timeless
         # Not "../end": the Copernicus Data Space API refuses open ranges.
-        start = self.date_from if only_dates else "1900-01-01"
+        start = "1900-01-01" if self.timeless else self.date_from
         when = f"{start}T00:00:00Z/{end}T23:59:59Z"
         cover = area_cover(self.bbox, self.area)
         headers = request_headers(self.catalog) or None
@@ -390,11 +405,9 @@ class TileSearchTask(QgsTask):
                 return False
         day = datetime.date.fromisoformat
         step = datetime.timedelta(days=_WINDOW_DAYS)
-        last, deepest = day(self.date_to), day(self.date_from)
-        if not self.by_time:
-            deepest -= datetime.timedelta(days=self.lookback_days)
+        last, first = day(self.date_to), day(self.date_from)
         ends = []
-        while last >= deepest:
+        while last >= first:
             ends.append(last)
             last -= step
         reach_ends = [] if self.by_time else ends[: -(-self.reach_days // _WINDOW_DAYS)]
@@ -403,12 +416,12 @@ class TileSearchTask(QgsTask):
         try:
             headers = request_headers(self.catalog) or None
             reach = [pool.submit(self._window, e, None, headers) for e in reach_ends]
-            window = [pool.submit(self._window, e, self.cloud, headers) for e in ends]
-            cover = self._cover(reach, deepest)
-            for n, future in enumerate(window):
+            windows = self._read_ahead(pool, ends, headers)
+            cover = self._cover(reach)
+            for n, items in enumerate(windows):
                 if self.isCanceled():
                     return False
-                cover.add(future.result())
+                cover.add(items)
                 self._hand_picks(cover, picks)
                 # No tile seen in the reach (none published lately): no goal
                 # to meet, so every window is read rather than none.
@@ -418,7 +431,7 @@ class TileSearchTask(QgsTask):
                 goal = cover.goal or self.holes
                 if goal and not cover.missing() and self._clear(cover):
                     break
-                self.setProgress(100 * (n + 1) / len(window))
+                self.setProgress(100 * (n + 1) / len(ends))
             under = [] if self.by_time else self._past_the_limit(cover, reach, picks)
             ids = {it.id for it in under}
             self.scenes = under + [s for s in cover.scenes() if s.id not in ids]

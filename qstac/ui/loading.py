@@ -406,7 +406,9 @@ class _MosaicLoad:
     # view= and remote=): QGIS deletes a task once it ends.
     make: Callable[..., MosaicBuildTask] | None = None
     refresh: MosaicBuildTask | None = None  # clipping the latest view
-    under: list[QgsRasterLayer] = field(default_factory=list)  # its layers go under
+    # The mosaic it is built again as (Fill from older scenes): its layers
+    # take their place, and they go.
+    replaces: list[QgsRasterLayer] = field(default_factory=list)
 
 
 class LayerLoader(QObject):
@@ -1116,7 +1118,7 @@ class LayerLoader(QObject):
         preview: tuple | None = None,
         goal: list[dict] | None = None,
         on_done: Callable[[MosaicBuildTask, list], object] | None = None,
-        under: list[QgsRasterLayer] | None = None,
+        replaces: list[QgsRasterLayer] | None = None,
     ) -> None:
         """Mosaic several scenes off the GUI thread: one layer per CRS.
 
@@ -1126,7 +1128,8 @@ class LayerLoader(QObject):
         *preview*: the view (canvas extent in WGS84, size in pixels) and the
         preview clips the tile search made of it, item id → clip.
         *on_done*: called with the build and its layers once it ends well.
-        *under*: its layers go right under these (Fill from older scenes).
+        *replaces*: its layers take these' place, which go (Fill from older
+        scenes builds the mosaic again).
         """
         key = "mosaic:" + ",".join(sorted(it.id for it in items))
         if index_preset is not None or band_preset is not None:
@@ -1187,7 +1190,7 @@ class LayerLoader(QObject):
         )
         task = make(view=view, preview_clips=clips, goal=goal)
         ml = _MosaicLoad(
-            task, key, label, items, catalog, stack, make=make, under=under or []
+            task, key, label, items, catalog, stack, make=make, replaces=replaces or []
         )
         task.previewReady.connect(
             lambda m, sharp: self._on_mosaic_preview(ml, m, sharp, task)
@@ -1228,11 +1231,18 @@ class LayerLoader(QObject):
         self, ml: _MosaicLoad, opened: list, task: MosaicBuildTask
     ) -> None:
         self._add_to_project(
-            [lyr for lyr, _ in opened], task.collection_info.label, ml.stack, ml.under
+            [lyr for lyr, _ in opened],
+            task.collection_info.label,
+            ml.stack,
+            ml.replaces,
         )
         for layer, epsg in opened:
             self._added[layer.id()] = ml.key
             ml.layers[epsg] = layer
+        gone = [lyr.id() for lyr in ml.replaces if not sip.isdeleted(lyr)]
+        ml.replaces = []
+        if gone:
+            QgsProject.instance().removeMapLayers(gone)
 
     def _on_mosaic_preview(
         self,

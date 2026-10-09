@@ -67,7 +67,15 @@ two others around it is a speck, twice): SCL takes bright snow for cloud
 and steep shadows for a cloud's in specks, the same on every date, 1.3 % of
 a Tibetan view in single pixels, 0.1 % filtered. A 3 x 3 opening did that
 too, but also took a France view's orbit wedges (thinner than 3 cells, 16
-km) for specks. A scene is wanted if its footprint touches any hole (a
+km) for specks. Not Fill from older scenes (`ClearViews.specks` off): at
+800 m cells it also dropped cloud blobs of 1-2 km near Ussel, clear on two
+older dates, and stopped with 0.36 % of a 413 km view empty; counting
+them, 84 scenes in 15 s of search instead of 5 in 2.5 s, 0.10 % left. A
+speck SCL gets wrong on every date (snow) then keeps it reading the year.
+The fill waits, before each window, for the clips of all but the last
+one, which render while it is read (`TileSearchTask._settled`): waiting
+for each in turn, 7.6-9.1 s; one late, 5.4-5.8 s, a scene more.
+A scene is wanted if its footprint touches any hole (a
 wedge is far under 1 % of a tile). The search hands the tiles' reach to the
 count before reading (`TileSearchTask(expect=)`), so a gap, a pixel no scene
 taken covers (a tile with none under the cloud filter, a wedge), is a hole
@@ -78,10 +86,15 @@ of the view left).
 eo:cloud_cover could not say: it is the whole 110 km tile's, and the edge
 of an orbit is half nodata. Near London over 2026 the estimate stopped at
 6 scenes, half the view empty; counted, 10 scenes back to 25 August, 2.4 s
-of search, 0.4 % empty. A mosaic with no clips while searching (a band
-composite, an index) estimates instead: under `_CLOUD_LEFT` (2 %) likely
-cloudy in every scene, their eo:cloud_cover multiplied
-(`TileCover.cloudy()`).
+of search, 0.4 % empty. Whatever the mosaic shows (true colour, a band
+combination, an index), the clips are of true colour where the catalog
+renders it (`scene_render`, Planetary Computer: a few KB a scene, the same
+SCL), else of the mosaic's first asset (`_tile_mosaic()`'s `counted`), so
+the search takes the same scenes for each: an IRC estimated from
+eo:cloud_cover took 7 scenes near Paris and left 22 % empty; counted, 14.
+With no clip at all (no asset to count on), it estimates: under
+`_CLOUD_LEFT` (2 %) likely cloudy in every scene, their eo:cloud_cover
+multiplied (`TileCover.cloudy()`).
 Composite (`mosaic_composite`, median by default): a local mosaic's VRT
 (BuildVRT's, each source's nodata tagged) gets derived bands
 (`vrt._composite()`, in `MosaicBuildTask._show()`): GDAL's own `median` /
@@ -104,8 +117,9 @@ the scenes land, then computes the composite once into a GeoTIFF per CRS
 layers at it: 1-3 ms a redraw, and `_measure()` reads it in 0.07 s.
 Near London over 3 months: 25 scenes, 10.5 s of search; stopping at one
 view, 10 scenes in 2 s, but 38 % of the pixels had three, the rest hazy. A full read 0.3 s for 18 scenes, newest 0.08 s. Not for a time stack, a timeless collection (a DEM's
-or a land cover's tiles) or a remote mosaic (a band composite). Not on a time stack's or a band composite's remote mosaic, nor an
-unbaked multi-band clip (a stretch other than fixed).
+or a land cover's tiles) or a remote mosaic (a band combination under an
+adaptive stretch). Not on a time stack's remote mosaic, nor an unbaked
+multi-band clip (a stretch other than fixed).
 A single-band COG with a colour table (ESA WorldCover, IO LULC) renders
 paletted (`style._apply_singleband_renderer()`); `stamp_layer()` then keeps
 only the classes of the scene's one asset with STAC `classification:classes`
@@ -142,8 +156,12 @@ waits. An index mosaic follows the view too: each scene's bands clipped
 at once, its index computed from them (`tasks._build_local_index_mosaic()`,
 the single-scene `_bake_index`), on the map in 6 s for 7 Sentinel-2 NDVI
 scenes cold, 1 s to draw, where its remote mosaic took 8 s to build and 20 s
-to draw, blank. A time stack's dates and a band composite are remote
-mosaics as before. Measured on Planetary Computer's Sentinel-2 over 30
+to draw, blank. A band combination (IRC) the same way, each scene's bands
+and SCL clipped, baked to Byte RGB at the fixed stretch (`tasks._bake_rgb`)
+and its clouds burned to 0 (`_build_local_band_mosaic()`): its remote mosaic
+showed every cloud and the scenes under them never; near Paris, 14 scenes in
+13.7 s from the COGs. Under an adaptive stretch (Settings > Display) it stays
+remote, clouds shown. A time stack's dates are remote mosaics as before. Measured on Planetary Computer's Sentinel-2 over 30
 days: a regional view (7-15 scenes), first image 1.4-1.6 s, whole 1.8-3.1
 s; zoom or pan, 0.8-1 s; France (427 scenes in 5 UTM zones), first image
 4.4 s, 97% at 10 s, done at 15 s — its remote mosaic took 172 s to draw.

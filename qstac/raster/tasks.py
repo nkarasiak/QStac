@@ -24,6 +24,7 @@ from .clip import (
     _HEDGE_COARSE_S,
     CLIP_CREATION_OPTIONS,
     ClearViews,
+    _burn_scl,
     _materialize_window_tiles,
     _viewport_projwin,
 )
@@ -52,6 +53,7 @@ from .layers import (
     scene_mask,
     view_clip,
 )
+from .style import resolve_bake_stretch
 from .vrt import _add_scl_mask, _band_type, _build_vrt, _composite
 
 if TYPE_CHECKING:
@@ -214,10 +216,18 @@ class MosaicBuildTask(_EventTask):
             )
             self._show(sharp, True)
             return bool(sharp)
-        if len(bands) != 1:
-            # ponytail: a band composite waits for the remote mosaic as before;
-            # stack its bands' clips per scene as the index does if it drags.
-            return False
+        if len(bands) != 1:  # a band combination: baked RGB per scene, as one
+            stretch = resolve_bake_stretch(self.collection_info, self.stretch_override)
+            if stretch is None:
+                # ponytail: an adaptive stretch (Settings > Display) keeps the
+                # remote mosaic, clouds shown; bake its percentiles to join.
+                return False
+            self.stretch_baked = True  # before _show: the layers open with it
+            sharp = _build_local_band_mosaic(
+                parts, bands, stretch, self.view, cancel, self.hide_clouds
+            )
+            self._show(sharp, True)
+            return bool(sharp)
         viewport, (w, h) = self.view
         half = (viewport, (w // 2, h // 2))
         if self.render is not None:  # rendered at the canvas resolution: final
@@ -317,8 +327,9 @@ class MosaicBuildTask(_EventTask):
         if self.goal is None or not self._sharp or self.view is None:
             return
         views = ClearViews(self.view[0])
+        nodata = 0 if self.index_preset is None else _INDEX_NODATA
         for path, _, _ in self._sharp:
-            views.add(path, None)
+            views.add(path, None, nodata)
         for shape in self.goal:
             views.expect(shape)
         self.measured = views
@@ -356,6 +367,64 @@ def _build_local_index_mosaic(
     Its remote mosaic drew 7 Sentinel-2 NDVI scenes in 20 s, blank meanwhile.
     With *hide_clouds*, a scene's SCL too: its clouds are nodata."""
     names = list(index_preset.assets)
+    clips = _clip_bands(parts, names, view, cancel, hide_clouds, "index")
+    baked = []
+    for item_id, _, epsg, proj in parts:
+        got = [clips.get((item_id, n)) for n in names]
+        if all(got) and not cancel():
+            prefix = _vrt_path(f"{item_id}_index")
+            tif = _bake_index(
+                prefix,
+                got,
+                [proj.get(n) for n in names],
+                index_preset,
+                clips.get(item_id),
+            )
+            baked.append((item_id, epsg, tif))
+    return _local_mosaics(baked, _INDEX_NODATA, "index")
+
+
+def _build_local_band_mosaic(
+    parts: list[tuple[str, dict[str, str], int | None, dict[str, AssetProj]]],
+    names: list[str],
+    stretch: tuple[float, float],
+    view: tuple[tuple[float, float, float, float], tuple[int, int]],
+    cancel: Callable[[], bool],
+    hide_clouds: bool = False,
+) -> list[tuple[str, int | None, list[str]]]:
+    """The band combination *names* (R, G, B) of *parts* over *view*: each
+    scene's bands clipped and baked into a Byte RGB GeoTIFF at *stretch*
+    (``_bake_rgb``), its clouds 0 with *hide_clouds*, then mosaicked as a
+    true colour image is: median, measure and fill alike. Its remote mosaic
+    showed every cloud, and the scenes under them never."""
+    clips = _clip_bands(parts, names, view, cancel, hide_clouds, "bands")
+    baked = []
+    for item_id, _, epsg, proj in parts:
+        got = [clips.get((item_id, n)) for n in names]
+        if not all(got) or cancel():
+            continue
+        first = proj.get(names[0])
+        nodata = _band_type(first)[1] if first is not None else 0
+        prefix = _vrt_path(f"{item_id}_bands")
+        tif = _bake_rgb(prefix, got, nodata, stretch)
+        if tif and (mask := clips.get(item_id)):
+            tif = _burn_scl(tif, mask, f"{prefix}_clear.tif") or tif
+        if tif:
+            baked.append((item_id, epsg, tif))
+    return _local_mosaics(baked, 0, "bands")
+
+
+def _clip_bands(
+    parts: list[tuple[str, dict[str, str], int | None, dict[str, AssetProj]]],
+    names: list[str],
+    view: tuple[tuple[float, float, float, float], tuple[int, int]],
+    cancel: Callable[[], bool],
+    hide_clouds: bool,
+    tag: str,
+) -> dict:
+    """Each scene's clips of *names* over *view*, all at once: (item id,
+    name) → clip, and item id → its SCL clip with *hide_clouds*. A scene
+    lacking one of *names* is left out."""
     masks = SCL_ASSETS if hide_clouds else ()
     jobs = [
         (part, n)
@@ -366,25 +435,19 @@ def _build_local_index_mosaic(
 
     def clip(job: tuple) -> str | None:
         (item_id, assets, epsg, proj), name = job
-        tag = f"index_{name}"
-        return view_clip(item_id, assets[name], proj.get(name), epsg, view, tag, cancel)
+        return view_clip(
+            item_id, assets[name], proj.get(name), epsg, view, f"{tag}_{name}", cancel
+        )
 
     if not jobs:
-        return []
+        return {}
     with concurrent.futures.ThreadPoolExecutor(min(len(jobs), 32)) as pool:
         keys = [(p[0], n) for p, n in jobs]
         clips = dict(zip(keys, pool.map(clip, jobs), strict=True))
-    baked = []
-    for item_id, _, epsg, proj in parts:
-        got = [clips.get((item_id, n)) for n in names]
-        if all(got) and not cancel():
-            prefix = _vrt_path(f"{item_id}_index")
-            mask = next(filter(None, (clips.get((item_id, m)) for m in masks)), None)
-            tif = _bake_index(
-                prefix, got, [proj.get(n) for n in names], index_preset, mask
-            )
-            baked.append((item_id, epsg, tif))
-    return _local_mosaics(baked, _INDEX_NODATA, "index")
+    for (item_id, name), path in list(clips.items()):
+        if name in masks and path:
+            clips[item_id] = path
+    return clips
 
 
 # ---------------------------------------------------------------------------
@@ -701,44 +764,54 @@ class CogPrefetchTask(_EventTask):
                 self.remoteReady.emit(item_id, remote)
 
     def _bake_rgb(self, item_id: str, paths: dict[str, str], tag: str) -> str | None:
-        """Stack the per-asset clips into one Byte RGB GeoTIFF, stretch applied.
-
-        Valid pixels map to 1..255, clamped (``exponents=[1]`` makes GDAL clip
-        to the output range), so only nodata is 0 — a dark pixel below vmin
-        stays visible.
-        """
-        prefix = _vrt_path(f"{item_id}_{tag}_rgb")
+        """The per-asset clips as one Byte RGB GeoTIFF (``_bake_rgb``)."""
         proj = self._items_by_id[item_id].asset_proj.get(self.asset_names[0])
-        nodata = _band_type(proj)[1] if proj is not None else 0
-        try:
-            stacked = _build_vrt(
-                f"{prefix}.vrt",
-                [paths[n] for n in self.asset_names],
-                separate=True,
-                nodata=nodata,
-            )
-            if stacked is None:
-                return None
-            if MASK_CLIP in paths:  # the GeoTIFF keeps it, an internal mask
-                _add_scl_mask(stacked, paths[MASK_CLIP])
-            vmin, vmax = self.bake_stretch  # type: ignore[misc]
-            out = gdal.Translate(
-                f"{prefix}.tif",
-                stacked,
-                outputType=gdal.GDT_Byte,
-                scaleParams=[[vmin, vmax, 1, 255]],
-                exponents=[1],
-                noData=0,
-                creationOptions=CLIP_CREATION_OPTIONS,
-            )
-            if out is None:
-                return None
-            out.FlushCache()
-            out = None
-            return f"{prefix}.tif"
-        except Exception as exc:
-            log(f"Could not bake the RGB image of {item_id}: {exc}")
+        return _bake_rgb(
+            _vrt_path(f"{item_id}_{tag}_rgb"),
+            [paths[n] for n in self.asset_names],
+            _band_type(proj)[1] if proj is not None else 0,
+            self.bake_stretch,  # type: ignore[arg-type]
+            paths.get(MASK_CLIP),
+        )
+
+
+def _bake_rgb(
+    prefix: str,
+    clips: list[str],
+    nodata: float | None,
+    stretch: tuple[float, float],
+    mask: str | None = None,
+) -> str | None:
+    """Stack *clips* (R, G, B) into one Byte RGB GeoTIFF, *stretch* applied.
+
+    Valid pixels map to 1..255, clamped (``exponents=[1]`` makes GDAL clip
+    to the output range), so only nodata is 0 — a dark pixel below vmin
+    stays visible. *mask* (an SCL clip): kept as the GeoTIFF's internal mask.
+    """
+    try:
+        stacked = _build_vrt(f"{prefix}.vrt", clips, separate=True, nodata=nodata)
+        if stacked is None:
             return None
+        if mask is not None:
+            _add_scl_mask(stacked, mask)
+        vmin, vmax = stretch
+        out = gdal.Translate(
+            f"{prefix}.tif",
+            stacked,
+            outputType=gdal.GDT_Byte,
+            scaleParams=[[vmin, vmax, 1, 255]],
+            exponents=[1],
+            noData=0,
+            creationOptions=CLIP_CREATION_OPTIONS,
+        )
+        if out is None:
+            return None
+        out.FlushCache()
+        out = None
+        return f"{prefix}.tif"
+    except Exception as exc:
+        log(f"Could not bake the RGB image {prefix}: {exc}")
+        return None
 
 
 # ---------------------------------------------------------------------------
