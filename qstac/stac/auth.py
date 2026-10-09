@@ -24,7 +24,9 @@ __all__ = [
     "request_headers",
     "s3_keys",
 ]
-_HTTP_TIMEOUT_TOKEN = 15  # seconds, for the PC SAS token GET
+# Seconds for the PC SAS token GET, asked twice: it answers in ~0.3 s, or
+# hangs 15 s for a 504 (1 in 6 on 2026-10-09), when asking again answers.
+_HTTP_TIMEOUT_TOKEN = 5
 _TOKEN_EXPIRY_BUFFER_S = 60  # refresh a SAS token 60s before actual expiry
 _TOKEN_FALLBACK_TTL_S = 3600  # default TTL when msft:expiry is not provided
 
@@ -273,7 +275,12 @@ def _pc_cached_or_fetched(cache_key: str, account: str, container: str) -> str:
 
     url = f"{_PC_SAS_URL}/{account}/{container}"
     req = urllib.request.Request(url)
-    raw = _urlopen_safe(req, _HTTP_TIMEOUT_TOKEN, "PC SAS token")
+    try:
+        raw = _urlopen_safe(req, _HTTP_TIMEOUT_TOKEN, "PC SAS token")
+    except StacError as exc:
+        if exc.kind != "timeout":
+            raise
+        raw = _urlopen_safe(req, _HTTP_TIMEOUT_TOKEN, "PC SAS token")
     data = json.loads(raw.decode("utf-8"))
 
     token = data["token"]

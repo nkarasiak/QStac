@@ -80,7 +80,9 @@ Path-specific options need GDAL 3.6: older ones send no asset login at all
 (`set_asset_headers()` returns False), never a global header. Off by default:
 pre-signed URLs (S3 presigned, SAS) reject a second credential. A remote
 layer's source is its VRT XML, so a saved `.qgz` holds the signed hrefs (PC SAS,
-S3 presigned) in it. A 401/403
+S3 presigned) in it. PC's SAS token is asked for 5 s, then once more: it
+answers in ~0.3 s or hangs 15 s for a 504, which failed whole mosaics.
+A 401/403
 (`StacError.kind == "auth"`) opens `QStacDock._prompt_auth()`, which offers that
 catalog's editor.
 
