@@ -173,8 +173,8 @@ off, most of France showed the basemap). France and Iberia at 20%: 331 tiles,
 Over `_MOSAIC_ASKED` (1000, as *Load all*) scenes it asks before building
 (`_on_tiles_found()`): one long build, and every redraw zoomed out reads each.
 The mosaic is on the map about 1.5 s after the click: a preview of the view
-made as the search picks its scenes, then sharp, then pannable (in
-loading.md).
+made as the search picks its scenes, then sharp, then clipped anew for each
+view the map settles on (in loading.md).
 
 Loading several selected scenes from the load bar or Return/Space
 (`_shortcut_load()`) asks every time how: separate layers, mosaic or time

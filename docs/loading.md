@@ -55,8 +55,14 @@ read from the COG (`layers.view_clip()`). The search waits for them until
 `_PICKS_DEADLINE_S` (1.4 s) after it starts; the build shows those ready
 (`previewReady`), the first late one if none was, then all once in
 (`_PREVIEW_REST_S`). Then a **sharp** mosaic at the canvas resolution
-(`previewReady(sharp=True)`) repoints the same layers, and the remote VRT
-is their source from the first pan (`LayerLoader._mosaic_to_remote()`).
+(`previewReady(sharp=True)`) repoints the same layers. No remote VRT is
+built: the layers follow the view (`LayerLoader._follow_view()`, `_FOLLOW_MS`
+after the map rests), each view clipped anew by a task of its own
+(`_MosaicLoad.make(remote=False)`) while the last image stays on screen —
+swapping in the remote VRT on the first pan blanked the mosaic for the 30 s
+of its serial reads. Zoom in: new clips in 1.1 s, sharp in 2.5 s; zoom out
+x8: 1.6 s. A hidden mosaic waits; a time stack's dates, a band composite or
+an index are remote mosaics as before.
 Click to first image: 1.5-1.7 s over five views of the south of France.
 Tile reads run on kept threads (`clip._fetch_pool()`: GDAL keeps a
 connection per thread, a fresh one costs a TLS handshake, 0.5 s an open),

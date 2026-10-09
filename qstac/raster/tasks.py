@@ -102,10 +102,10 @@ class MosaicBuildTask(_EventTask):
     task completes.
 
     With *view* (the canvas extent in WGS84, its size in pixels) and one
-    asset per scene, the view comes first, from local clips
+    asset per scene, the mosaic is local clips of the view
     (``_build_local_mosaic``): ``previewReady`` at half the canvas
-    resolution, then at the canvas', before the remote ``mosaics`` the
-    layers take on the first pan.
+    resolution, then at the canvas', and no remote ``mosaics``: the layers
+    follow the view, each new one a task of its own (``remote=False``).
     """
 
     #: Emitted with local mosaics of the view, (path, epsg, ids) per CRS, and
@@ -123,9 +123,11 @@ class MosaicBuildTask(_EventTask):
         index_preset: IndexPreset | None = None,
         view: tuple[tuple[float, float, float, float], tuple[int, int]] | None = None,
         preview_clips: dict[str, str | None] | None = None,
+        remote: bool = True,
     ) -> None:
         super().__init__(f"Mosaicking {len(parts)} scenes")
         self.view = view
+        self.remote = remote  # else the view clips alone (a later view)
         self.preview_clips = preview_clips  # item id → its preview clip, made
         # Unsigned hrefs: signing may fetch a token, so it happens in run().
         self.parts = parts
@@ -151,7 +153,8 @@ class MosaicBuildTask(_EventTask):
                 (i, {n: sign(h) for n, h in a.items()} if sign else a, e, p)
                 for i, a, e, p in self.parts
             ]
-            self._build_local(parts)
+            if self._build_local(parts) or not self.remote:
+                return True  # the layers follow the view on local clips
             built = _build_mosaic_vrt(
                 parts,
                 self.collection_info,
@@ -168,22 +171,25 @@ class MosaicBuildTask(_EventTask):
         self.mosaics, self.dropped, self.stretch_baked = built
         return True
 
-    def _build_local(self, parts: list) -> None:
-        """The view first, from local clips: a preview, then sharp (class doc)."""
+    def _build_local(self, parts: list) -> bool:
+        """The view from local clips: a preview, then sharp (class doc);
+        whether it made the sharp one."""
         bands = self.band_override or list(self.collection_info.rgb_assets)
         if self.view is None or self.index_preset is not None or len(bands) != 1:
             # ponytail: one asset per scene (TCI, DEM); a band composite or
             # an index waits for the remote mosaic as before.
-            return
+            return False
         viewport, (w, h) = self.view
         half = (viewport, (w // 2, h // 2))
+        cancel = self._cancel.is_set
         if self.preview_clips is None:  # no tile search made them: here
-            self._show(_build_local_mosaic(parts, bands[0], half, "preview"), False)
+            preview = _build_local_mosaic(parts, bands[0], half, "preview", cancel)
+            self._show(preview, False)
         else:
             self._show_preview(parts, bands[0], half)
-        cancel = self._cancel.is_set
         sharp = _build_local_mosaic(parts, bands[0], self.view, "sharp", cancel)
-        self._show(sharp, True)  # as soon as it is ready: the remote may stall
+        self._show(sharp, True)
+        return bool(sharp)
 
     def _show(self, mosaics: list, sharp: bool) -> None:
         if mosaics and not self._cancel.is_set():

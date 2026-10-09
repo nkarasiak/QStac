@@ -7,6 +7,7 @@ import re
 import time
 import urllib.parse
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -21,7 +22,7 @@ from qgis.core import (
     QgsTask,
 )
 from qgis.PyQt import sip
-from qgis.PyQt.QtCore import QDateTime, QDir, QObject, pyqtSignal
+from qgis.PyQt.QtCore import QDateTime, QDir, QObject, QTimer, pyqtSignal
 from qgis.PyQt.QtWidgets import QFileDialog, QMessageBox
 
 from .. import settings
@@ -72,6 +73,8 @@ _REMOTE_TTL_S = 900.0
 
 # Unload waits this long, in all, for canceled tasks to stop writing clips.
 _STOP_WAIT_MS = 2000
+# How long the map must rest before a mosaic on view clips clips the new view.
+_FOLLOW_MS = 300
 
 
 def _uses_visual(coll: CollectionInfo) -> bool:
@@ -367,7 +370,7 @@ def _mosaic_name(label: str, scenes: list[StacItemResult], epsg: int | None) -> 
 
 @dataclass
 class _MosaicLoad:
-    """One mosaic build, from its first look to its remote source."""
+    """One mosaic, from its first look; on view clips, following the view."""
 
     task: MosaicBuildTask
     key: str
@@ -375,8 +378,13 @@ class _MosaicLoad:
     items: list[StacItemResult]
     catalog: CatalogProvider
     stack: bool
-    # EPSG → the layer its preview opened, repointed at sharp, then remote.
+    # EPSG → the layer its preview opened, repointed at sharp, then at the
+    # clips of each view the map settles on.
     layers: dict[int | None, QgsRasterLayer] = field(default_factory=dict)
+    # The same build over another view (a MosaicBuildTask's arguments but
+    # view= and remote=): QGIS deletes a task once it ends.
+    make: Callable[..., MosaicBuildTask] | None = None
+    refresh: MosaicBuildTask | None = None  # clipping the latest view
 
 
 class LayerLoader(QObject):
@@ -409,9 +417,13 @@ class LayerLoader(QObject):
         # _item_key() → layers still sourced from local viewport clips;
         # repointed at the pannable remote VRT on first pan.
         self._local: dict[str, _LocalLayer] = {}
-        # Mosaic layers on their sharp view clips: (layer, remote VRT, epsg,
-        # task), repointed at the remote mosaic on first pan.
-        self._mosaic_remote: list[tuple[QgsRasterLayer, str, int | None, object]] = []
+        # Mosaics on view clips: each view the map settles on (_FOLLOW_MS
+        # after it stops) is clipped anew, the last image kept meanwhile.
+        self._mosaic_loads: list[_MosaicLoad] = []
+        self._follow = QTimer(self)
+        self._follow.setSingleShot(True)
+        self._follow.setInterval(_FOLLOW_MS)
+        self._follow.timeout.connect(self._follow_view)
         QgsProject.instance().layersWillBeRemoved.connect(self._on_layers_removed)
         iface.mapCanvas().extentsChanged.connect(self._on_extents_changed)
 
@@ -482,7 +494,8 @@ class LayerLoader(QObject):
                 task.waitForFinished(left)
         self._warming.clear()
         self._local.clear()
-        self._mosaic_remote.clear()
+        self._mosaic_loads.clear()
+        self._follow.stop()
 
     def cancel_warming(self) -> None:
         """Stop the post-search header warms (new search, catalog switch)."""
@@ -1002,7 +1015,8 @@ class LayerLoader(QObject):
         task built is used while fresh; else it is rebuilt in a task
         (:meth:`_rebuild_remote`), the clip staying on screen meanwhile.
         """
-        self._mosaic_to_remote()
+        if self._mosaic_loads:
+            self._follow.start()  # restarted while the map still moves
         pending, self._local = self._local, {}
         now = time.monotonic()
         stale: dict[int, list[_LocalLayer]] = {}
@@ -1112,11 +1126,18 @@ class LayerLoader(QObject):
         visual = _VISUAL_STRETCH if _uses_visual(coll) else None
         stretch = band_preset.stretch if band_preset else visual
         canvas = self._iface.mapCanvas()
+        # A time stack's dates are remote mosaics: following the view, each
+        # hidden date would clip it on every zoom.
         view, clips = preview or (
-            (viewport_bbox_4326(canvas), _canvas_pixel_size(canvas)),
+            (
+                None
+                if stack
+                else (viewport_bbox_4326(canvas), _canvas_pixel_size(canvas))
+            ),
             None,
         )
-        task = MosaicBuildTask(
+        make = partial(
+            MosaicBuildTask,
             [(it.id, it.assets, it.epsg, it.asset_proj) for it in items],
             coll,
             band_override=assets,
@@ -1124,22 +1145,24 @@ class LayerLoader(QObject):
             sign_func=_sign_func(catalog),
             prepare=_asset_login(items, catalog),
             index_preset=preset,
-            view=view,
-            preview_clips=clips,
         )
-        ml = _MosaicLoad(task, key, label, items, catalog, stack)
+        task = make(view=view, preview_clips=clips)
+        ml = _MosaicLoad(task, key, label, items, catalog, stack, make=make)
         task.previewReady.connect(
-            lambda m, sharp: self._on_mosaic_preview(ml, m, sharp)
+            lambda m, sharp: self._on_mosaic_preview(ml, m, sharp, task)
         )
         task.taskCompleted.connect(lambda: self._on_mosaic_done(ml, True))
         task.taskTerminated.connect(lambda: self._on_mosaic_done(ml, False))
         self.run_task(task)
 
     def _open_mosaics(
-        self, ml: _MosaicLoad, mosaics: list[tuple[str, int | None, list[str]]]
+        self,
+        ml: _MosaicLoad,
+        mosaics: list[tuple[str, int | None, list[str]]],
+        task: MosaicBuildTask,
     ) -> list[tuple[QgsRasterLayer, int | None]]:
         """A layer per mosaic (one per CRS), each named for its own scenes."""
-        task, opened = ml.task, []
+        opened = []
         many = len(mosaics) > 1
         for path, epsg, ids in mosaics:
             scenes = [it for it in ml.items if it.id in ids]
@@ -1157,9 +1180,11 @@ class LayerLoader(QObject):
                 opened.append((layer, epsg))
         return opened
 
-    def _add_mosaics(self, ml: _MosaicLoad, opened: list) -> None:
+    def _add_mosaics(
+        self, ml: _MosaicLoad, opened: list, task: MosaicBuildTask
+    ) -> None:
         self._add_to_project(
-            [lyr for lyr, _ in opened], ml.task.collection_info.label, ml.stack
+            [lyr for lyr, _ in opened], task.collection_info.label, ml.stack
         )
         for layer, epsg in opened:
             self._added[layer.id()] = ml.key
@@ -1170,10 +1195,11 @@ class LayerLoader(QObject):
         ml: _MosaicLoad,
         mosaics: list[tuple[str, int | None, list[str]]],
         sharp: bool,
+        task: MosaicBuildTask,
     ) -> None:
         """The view from local clips: on the map at once. Again with the
         clips that came late, then *sharp*: its layers take them."""
-        if self._closed or ml.task.isCanceled():
+        if self._closed or task.isCanceled():
             return
         fresh = []
         for path, epsg, ids in mosaics:
@@ -1181,15 +1207,18 @@ class LayerLoader(QObject):
             if layer is None:
                 fresh.append((path, epsg, ids))
             elif not sip.isdeleted(layer):
-                self._repoint_mosaic(layer, path, epsg, ml.task)
+                self._repoint_mosaic(layer, path, epsg, task)
                 scenes = [it for it in ml.items if it.id in ids]
                 zone = epsg if len(ml.layers) > 1 else None
                 layer.setName(_mosaic_name(ml.label, scenes, zone))
-        opened = self._open_mosaics(ml, fresh)
+        opened = self._open_mosaics(ml, fresh, task)
         if opened:
-            self._add_mosaics(ml, opened)
-        n = _scenes(len(ml.items))
-        self._flash(f"Mosaic ({n}) loaded." if sharp else f"Mosaic ({n}): sharpening…")
+            self._add_mosaics(ml, opened, task)
+        if ml.key in self._loading:  # its first build, not a view it follows
+            n = _scenes(len(ml.items))
+            self._flash(
+                f"Mosaic ({n}) loaded." if sharp else f"Mosaic ({n}): sharpening…"
+            )
 
     def _on_mosaic_done(self, ml: _MosaicLoad, ok: bool) -> None:
         """Open the finished mosaic VRTs (one per CRS) on the GUI thread, add
@@ -1204,7 +1233,7 @@ class LayerLoader(QObject):
         if ml.layers:
             self._finish_preview(ml, ok)
             return
-        opened = self._open_mosaics(ml, task.mosaics if ok else [])
+        opened = self._open_mosaics(ml, task.mosaics if ok else [], task)
         if not opened:
             self._flash("Mosaic failed.")
             QMessageBox.warning(
@@ -1213,7 +1242,7 @@ class LayerLoader(QObject):
                 task.error or "Mosaic failed: no compatible scenes.",
             )
             return
-        self._add_mosaics(ml, opened)
+        self._add_mosaics(ml, opened, task)
         total = len(ml.items)
         if task.dropped:
             self._flash(
@@ -1224,15 +1253,46 @@ class LayerLoader(QObject):
             self._flash(f"Mosaic ({_scenes(total)}) loaded.")
 
     def _finish_preview(self, ml: _MosaicLoad, ok: bool) -> None:
-        """The view clips' layers take the remote mosaic on the first pan (at
-        once if the map moved meanwhile)."""
-        task = ml.task
-        remote = {epsg: path for path, epsg, _ in task.mosaics} if ok else {}
-        for epsg, layer in ml.layers.items():
-            if epsg in remote:
-                self._mosaic_remote.append((layer, remote[epsg], epsg, task))
-        if viewport_bbox_4326(self._iface.mapCanvas()) != task.view[0]:
-            self._mosaic_to_remote()
+        """A mosaic on view clips follows the view from now on (at once if
+        the map moved while it was built)."""
+        for path, epsg, _ in ml.task.mosaics:  # no sharp clips: remote instead
+            layer = ml.layers.get(epsg)
+            if layer is not None and not sip.isdeleted(layer):
+                self._repoint_mosaic(layer, path, epsg, ml.task)
+        if ml.task.view is None or ml.task.mosaics:
+            return  # a remote mosaic: pannable already
+        self._mosaic_loads.append(ml)
+        if viewport_bbox_4326(self._iface.mapCanvas()) != ml.task.view[0]:
+            self._follow.start()
+
+    def _follow_view(self) -> None:
+        """The map settled: each mosaic on view clips clips this view, its
+        layers showing the last one until the new lands (no blank redraw
+        from the network, as a remote mosaic's: 30 s for 12 scenes)."""
+        canvas = self._iface.mapCanvas()
+        view = (viewport_bbox_4326(canvas), _canvas_pixel_size(canvas))
+        live = []
+        tree = QgsProject.instance().layerTreeRoot()
+        for ml in self._mosaic_loads:
+            layers = [lyr for lyr in ml.layers.values() if not sip.isdeleted(lyr)]
+            if not layers:
+                continue  # removed from the map
+            live.append(ml)
+            nodes = [tree.findLayer(lyr.id()) for lyr in layers]
+            if not any(node is not None and node.isVisible() for node in nodes):
+                continue  # hidden: clipped when shown and the map moves again
+            if ml.refresh is not None:
+                with contextlib.suppress(RuntimeError):
+                    ml.refresh.cancel()  # overtaken by this view
+            task = ml.make(view=view, remote=False)
+            ml.refresh = task
+            task.previewReady.connect(
+                lambda m, sharp, ml=ml, t=task: (
+                    t is ml.refresh and self._on_mosaic_preview(ml, m, sharp, t)
+                )
+            )
+            self.run_task(task)
+        self._mosaic_loads = live
 
     def _repoint_mosaic(
         self, layer: QgsRasterLayer, path: str, epsg: int | None, task: MosaicBuildTask
@@ -1250,10 +1310,3 @@ class LayerLoader(QObject):
         return fresh is not None and swap_layer_source(
             layer, path, fresh.renderer().clone()
         )
-
-    def _mosaic_to_remote(self) -> None:
-        """Mosaic layers on view clips take their pannable remote mosaic."""
-        pending, self._mosaic_remote = self._mosaic_remote, []
-        for layer, path, epsg, task in pending:
-            if not sip.isdeleted(layer):
-                self._repoint_mosaic(layer, path, epsg, task)
