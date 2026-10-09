@@ -44,6 +44,7 @@ from .layers import (
     _build_local_mosaic,
     _build_mosaic_vrt,
     _remote_source,
+    scene_clip,
 )
 from .vrt import _band_type, _build_vrt
 
@@ -52,6 +53,7 @@ if TYPE_CHECKING:
 
     from ..stac.collections import CollectionInfo, IndexPreset
     from ..stac.items import AssetProj, StacItemResult
+    from .layers import SceneRender
 
 __all__ = [
     "CogPrefetchTask",
@@ -74,6 +76,8 @@ _COARSE_MAX_DIM = 256
 # How long a mosaic's build waits for the preview clips its tile search left
 # coming (a slow render or range request), to complete its first look.
 _PREVIEW_REST_S = 1.5
+# How often a mosaic of rendered scenes shows the ones landed since.
+_SHOW_EVERY_S = 1.0
 
 
 class _EventTask(QgsTask):
@@ -124,10 +128,14 @@ class MosaicBuildTask(_EventTask):
         view: tuple[tuple[float, float, float, float], tuple[int, int]] | None = None,
         preview_clips: dict[str, str | None] | None = None,
         remote: bool = True,
+        render: SceneRender | None = None,
     ) -> None:
         super().__init__(f"Mosaicking {len(parts)} scenes")
         self.view = view
         self.remote = remote  # else the view clips alone (a later view)
+        # The catalog renders a scene's part of the view itself, at the
+        # canvas resolution: then the clips are final, no COG is read.
+        self.render = render
         self.preview_clips = preview_clips  # item id → its preview clip, made
         # Unsigned hrefs: signing may fetch a token, so it happens in run().
         self.parts = parts
@@ -182,22 +190,61 @@ class MosaicBuildTask(_EventTask):
         viewport, (w, h) = self.view
         half = (viewport, (w // 2, h // 2))
         cancel = self._cancel.is_set
+        if self.render is not None:  # rendered at the canvas resolution: final
+            return self._show_rendered(parts, bands[0])
         if self.preview_clips is None:  # no tile search made them: here
             preview = _build_local_mosaic(parts, bands[0], half, "preview", cancel)
             self._show(preview, False)
         else:
-            self._show_preview(parts, bands[0], half)
+            self._show_preview(parts, bands[0], half, False)
         sharp = _build_local_mosaic(parts, bands[0], self.view, "sharp", cancel)
         self._show(sharp, True)
         return bool(sharp)
+
+    def _show_rendered(self, parts: list, band: str) -> bool:
+        """Every scene rendered by the catalog, shown as they land (each
+        _SHOW_EVERY_S): a France-wide mosaic is hundreds of renders, 32 at
+        a time. The tile search's clips are used, and the scenes it has not
+        started (``""``: started) rendered here."""
+        clips = self.preview_clips if self.preview_clips is not None else {}
+        cancel = self._cancel.is_set
+
+        def fill(part: tuple) -> None:
+            item_id, _, epsg, proj = part
+            if item_id in clips or cancel():
+                return
+            clips[item_id] = ""
+            clips[item_id] = scene_clip(
+                item_id, "", proj.get(band), epsg, self.view, "render", self.render
+            )
+
+        pool = concurrent.futures.ThreadPoolExecutor(32)
+        for part in parts:
+            pool.submit(fill, part)
+        pool.shutdown(wait=False)
+        ids = [p[0] for p in parts]
+        shown, last = 0, 0.0
+        while True:
+            done = all(clips.get(i, "") != "" for i in ids)
+            ready = sum(1 for i in ids if clips.get(i))
+            due = time.monotonic() - last >= _SHOW_EVERY_S
+            if ready > shown and (done or due):
+                tag = f"render{ready}"
+                self._show(
+                    _build_local_mosaic(parts, band, self.view, tag, None, clips), True
+                )
+                shown, last = ready, time.monotonic()
+            if done or self._cancel.wait(0.05):
+                return shown > 0
 
     def _show(self, mosaics: list, sharp: bool) -> None:
         if mosaics and not self._cancel.is_set():
             self.previewReady.emit(mosaics, sharp)
 
-    def _show_preview(self, parts: list, band: str, half: tuple) -> None:
-        """The tile search's preview clips: those ready now, else the first
-        to come, then all once in (up to _PREVIEW_REST_S for the late ones)."""
+    def _show_preview(self, parts: list, band: str, view: tuple, sharp: bool) -> None:
+        """The tile search's preview clips (of *view*; *sharp*: at the canvas
+        resolution): those ready now, else the first to come, then all once
+        in (up to _PREVIEW_REST_S for the late ones)."""
         clips = self.preview_clips
         deadline = time.monotonic() + _PREVIEW_REST_S
         shown = turn = 0
@@ -208,7 +255,7 @@ class MosaicBuildTask(_EventTask):
                 turn += 1
                 tag = f"preview{turn}"
                 self._show(
-                    _build_local_mosaic(parts, band, half, tag, None, clips), False
+                    _build_local_mosaic(parts, band, view, tag, None, clips), sharp
                 )
                 shown = ready
             if done or self._cancel.wait(0.05):

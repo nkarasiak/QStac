@@ -41,6 +41,9 @@ _FILL_GAPS = True
 # range request held one for 30 s) is left out of the first look, not
 # waited for. Then the mosaic's first image is on the map in about 2 s.
 _PICKS_DEADLINE_S = 1.4
+# Picks' work at once: a scene rendered by its catalog is one small request,
+# and a France-wide mosaic picks hundreds.
+_PICK_THREADS = 32
 _TRANSIENT = frozenset({"rate_limit", "timeout", "network", "server"})
 _RETRIES = 2  # per page, after search.py's own one retry on 429/5xx
 
@@ -274,7 +277,7 @@ class TileSearchTask(QgsTask):
         cover = area_cover(self.bbox, self.area)
         headers = request_headers(self.catalog) or None
         read = 0
-        picks = ThreadPoolExecutor(_IN_FLIGHT)
+        picks = ThreadPoolExecutor(_PICK_THREADS)
         try:
             for page in self._pages(when, self.cloud, headers, newest=True):
                 cover.add(page)
@@ -310,7 +313,7 @@ class TileSearchTask(QgsTask):
             last -= step
         reach_ends = [] if self.by_time else ends[: -(-self.reach_days // _WINDOW_DAYS)]
         pool = ThreadPoolExecutor(_IN_FLIGHT)
-        picks = ThreadPoolExecutor(_IN_FLIGHT)
+        picks = ThreadPoolExecutor(_PICK_THREADS)
         try:
             headers = request_headers(self.catalog) or None
             reach = [pool.submit(self._window, e, None, headers) for e in reach_ends]

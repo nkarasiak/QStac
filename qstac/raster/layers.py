@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+from functools import partial
 from typing import TYPE_CHECKING
 
 from qgis.core import (
@@ -19,7 +20,12 @@ from qgis.core import (
 )
 from qgis.PyQt.QtCore import QDateTime, Qt, QTime
 
-from .clip import _HEDGE_COARSE_S, _HEDGE_SHARP_S, _materialize_window_tiles
+from .clip import (
+    _HEDGE_COARSE_S,
+    _HEDGE_SHARP_S,
+    _materialize_window_tiles,
+    render_clip,
+)
 from .cog import (
     _prewarm_sources,
     _vrt_path,
@@ -50,6 +56,12 @@ if TYPE_CHECKING:
     from ..stac.catalogs import CatalogProvider
     from ..stac.collections import CollectionInfo, IndexPreset
     from ..stac.items import AssetProj, StacItemResult
+
+    # (item id, EPSG, bounds in it, size in pixels) → a PNG of the scene's
+    # asset there, rendered by its catalog (``stac.auth.pc_render``).
+    SceneRender = Callable[
+        [str, int, tuple[float, float, float, float], tuple[int, int]], bytes
+    ]
 
 __all__ = [
     "BAKED_RGB",
@@ -606,6 +618,28 @@ def view_clip(
     )
 
 
+def scene_clip(
+    item_id: str,
+    href: str,
+    proj: AssetProj | None,
+    epsg: int | None,
+    view: tuple[tuple[float, float, float, float], tuple[int, int]],
+    tag: str,
+    render: SceneRender | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> str | None:
+    """A local clip of a scene over *view*: rendered by its catalog when it
+    can (*render*: a few KB at the canvas resolution, where the COGs' smallest
+    overview is ~0.5 MB a scene, 300 MB for France), else read from the COG
+    at signed *href* (:func:`view_clip`)."""
+    if render is None:
+        return view_clip(item_id, href, proj, epsg, view, tag, cancel_check)
+    if proj is None or not epsg:
+        return None
+    fetch = partial(render, item_id, epsg)
+    return render_clip(fetch, proj, epsg, view, _vrt_path(f"{item_id}_{tag}"))
+
+
 def _local_mosaics(
     clips: list[tuple[str, int | None, str | None]], nodata: float | None, tag: str
 ) -> list[tuple[str, int | None, list[str]]]:
@@ -632,29 +666,34 @@ def _build_local_mosaic(
     tag: str,
     cancel_check: Callable[[], bool] | None = None,
     clips: dict[str, str | None] | None = None,
+    render: SceneRender | None = None,
+    fill: bool = False,
 ) -> list[tuple[str, int | None, list[str]]]:
     """*parts*' *band* over *view*, from local clips: (path, epsg, ids) per CRS.
 
     What a mosaic shows first. Its remote VRT reads overlapping sources one
     after another (GDAL's VRT threads skip them): 12 Sentinel-2 scenes took
     30 s to draw. Here each scene's view is read tile by tile, all scenes at
-    once (:func:`view_clip`), and the map draws local files. *clips*: the
+    once (:func:`scene_clip`), and the map draws local files. *clips*: the
     ones made already, used alone (the tile search makes the preview's as it
-    picks scenes; one still coming is left out of it).
+    picks scenes; one still coming is left out of it), or with *fill* the
+    others made here.
     """
 
     def clip(part: tuple) -> str | None:
         item_id, assets, epsg, proj = part
-        if clips is not None:  # those ready: a late one is left out
+        if clips is not None and (item_id in clips or not fill):
             return clips.get(item_id)
         href = assets.get(band)
         if not href:
             return None
-        return view_clip(item_id, href, proj.get(band), epsg, view, tag, cancel_check)
+        return scene_clip(
+            item_id, href, proj.get(band), epsg, view, tag, render, cancel_check
+        )
 
     if not parts:
         return []
-    with concurrent.futures.ThreadPoolExecutor(min(len(parts), 16)) as pool:
+    with concurrent.futures.ThreadPoolExecutor(min(len(parts), 32)) as pool:
         paths = list(pool.map(clip, parts))
     return _local_mosaics(
         [(p[0], p[2], path) for p, path in zip(parts, paths, strict=True)],

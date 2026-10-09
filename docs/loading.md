@@ -45,25 +45,29 @@ A mosaic's remote VRT draws its sources one after another (overlapping
 sources: GDAL's VRT threads skip them; 12 Sentinel-2 scenes took 30 s), and
 warming them first only moved the wait (15 s for 7 scenes: one connection
 to Azure moves ~1 MB/s, eight ~5 MB/s). So a mosaic shows the view first,
-from local files (`MosaicBuildTask`, one asset per scene: a TCI, a DEM):
-a **preview** at half the canvas resolution, made while the tile search
-still runs — each scene it picks (`TileSearchTask(on_pick=)`, final: a pick
-is never undone) is clipped at once in the search's threads, on Planetary
-Computer rendered by its data API (`stac.auth.pc_render()`, ~50 KB PNG of
-the scene's part of the view, georeferenced by `clip.render_clip()`), else
-read from the COG (`layers.view_clip()`). The search waits for them until
-`_PICKS_DEADLINE_S` (1.4 s) after it starts; the build shows those ready
-(`previewReady`), the first late one if none was, then all once in
-(`_PREVIEW_REST_S`). Then a **sharp** mosaic at the canvas resolution
-(`previewReady(sharp=True)`) repoints the same layers. No remote VRT is
-built: the layers follow the view (`LayerLoader._follow_view()`, `_FOLLOW_MS`
-after the map rests), each view clipped anew by a task of its own
-(`_MosaicLoad.make(remote=False)`) while the last image stays on screen —
-swapping in the remote VRT on the first pan blanked the mosaic for the 30 s
-of its serial reads. Zoom in: new clips in 1.1 s, sharp in 2.5 s; zoom out
-x8: 1.6 s. A hidden mosaic waits; a time stack's dates, a band composite or
-an index are remote mosaics as before.
-Click to first image: 1.5-1.7 s over five views of the south of France.
+from local files (`MosaicBuildTask`, one asset per scene: a TCI, a DEM),
+each scene's part of the view clipped while the tile search still runs —
+each scene it picks (`TileSearchTask(on_pick=)`, final: a pick is never
+undone) is clipped at once, `_PICK_THREADS` (32) at a time. On Planetary
+Computer the data API renders it (`loading.scene_render()` →
+`stac.auth.pc_render()`, georeferenced by `clip.render_clip()`) at the
+canvas resolution: final, a few KB at France scale where the COGs' smallest
+overview is ~0.5 MB a scene. The build shows those landed each
+`_SHOW_EVERY_S` and renders the ones the search did not start
+(`_show_rendered()`). Elsewhere the COG is read (`layers.view_clip()`): a
+preview at half the canvas resolution, shown 1.4 s after the click
+(`_PICKS_DEADLINE_S`), completed by late clips (`_PREVIEW_REST_S`), then a
+sharp mosaic (`previewReady(sharp=True)`) repoints the same layers.
+No remote VRT is built: the layers follow the view
+(`LayerLoader._follow_view()`, `_FOLLOW_MS` after the map rests), each view
+clipped anew by a task of its own (`_MosaicLoad.make(remote=False)`) while
+the last image stays on screen — swapping in the remote VRT on the first
+pan blanked the mosaic for the 30 s of its serial reads. A hidden mosaic
+waits; a time stack's dates, a band composite or an index are remote
+mosaics as before. Measured on Planetary Computer's Sentinel-2 over 30
+days: a regional view (7-15 scenes), first image 1.4-1.6 s, whole 1.8-3.1
+s; zoom or pan, 0.8-1 s; France (427 scenes in 5 UTM zones), first image
+4.4 s, 97% at 10 s, done at 15 s — its remote mosaic took 172 s to draw.
 Tile reads run on kept threads (`clip._fetch_pool()`: GDAL keeps a
 connection per thread, a fresh one costs a TLS handshake, 0.5 s an open),
 and a hedged copy reads through another URL (`clip._hedge_url()`): GDAL

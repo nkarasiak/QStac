@@ -10,7 +10,6 @@ import urllib.parse
 from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import date, timedelta
-from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
@@ -74,11 +73,10 @@ from ..geo import (
     _transform_from_wgs84,
 )
 from ..log import log
-from ..raster.clip import render_clip
-from ..raster.cog import _HAS_PATH_OPTIONS, _vrt_path, clear_asset_headers
-from ..raster.layers import enable_time_stack, view_clip
+from ..raster.cog import _HAS_PATH_OPTIONS, clear_asset_headers
+from ..raster.layers import enable_time_stack, scene_clip
 from ..raster.tasks import ExportClipTask
-from ..stac.auth import pc_render, request_headers
+from ..stac.auth import request_headers
 from ..stac.catalogs import (
     CATALOG_BY_ID,
     CATALOGS,
@@ -115,6 +113,7 @@ from .loading import (
     _natural_key,
     _raster_assets,
     _uses_visual,
+    scene_render,
     viewport_bbox_4326,
 )
 from .styles import fs
@@ -2454,37 +2453,22 @@ class QStacDock(QDockWidget):
         sign = _sign_func(run.catalog)
         canvas = self.iface.mapCanvas()
         view = (viewport_bbox_4326(canvas), _canvas_pixel_size(canvas))
-        half = (view[0], (view[1][0] // 2, view[1][1] // 2))
+        render = scene_render(run.catalog, run.collection, assets)
+        # Rendered by the catalog, the clip is final: at the canvas resolution.
+        # Read from COGs, a preview at half of it, then sharp in the build.
+        at = view if render else (view[0], (view[1][0] // 2, view[1][1] // 2))
         clips: dict[str, str | None] = {}
 
-        # Planetary Computer renders a true-colour asset itself: 50 KB a
-        # scene, not the megabytes of its COGs' smallest overview.
-        rendered = run.catalog.asset_signer == "pc_sas" and assets == [
-            run.collection.visual_asset
-        ]
-        timeout = settings.http_timeout()
-
         def clip(item: StacItemResult) -> None:
-            """A picked scene's preview clip, made as the search goes on (in
-            its threads): the mosaic's first look, from one asset per scene."""
+            """A picked scene's clip, made as the search goes on (in its
+            threads): the mosaic's first look, from one asset per scene."""
             href = item.assets.get(assets[0]) if len(assets) == 1 else None
-            proj = item.asset_proj.get(assets[0]) if href else None
-            prefix = _vrt_path(f"{item.id}_preview")
-            if rendered and proj is not None and item.epsg:
-                fetch = partial(
-                    pc_render, run.collection.id, item.id, assets[0], item.epsg
-                )
-                clips[item.id] = render_clip(
-                    lambda box, size: fetch(box, size, timeout),
-                    proj,
-                    item.epsg,
-                    half,
-                    prefix,
-                )
-            elif href:
-                url = sign(href) if sign else href
-                clips[item.id] = view_clip(
-                    item.id, url, proj, item.epsg, half, "preview"
+            if href:
+                url = sign(href) if sign and not render else href
+                proj = item.asset_proj.get(assets[0])
+                clips[item.id] = ""  # started: the build leaves it to us
+                clips[item.id] = scene_clip(
+                    item.id, url, proj, item.epsg, at, "preview", render
                 )
 
         task = TileSearchTask(

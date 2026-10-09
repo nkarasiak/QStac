@@ -44,7 +44,7 @@ from ..raster.tasks import (
     DownloadTask,
     MosaicBuildTask,
 )
-from ..stac.auth import pc_token_ttl, request_headers, s3_keys
+from ..stac.auth import pc_render, pc_token_ttl, request_headers, s3_keys
 from ..stac.indices import _is_jp2, resolve_variables
 from ..stac.items import AssetMeta
 from .constants import _item_key, _scenes, _sign_func
@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     from qgis.gui import QgisInterface, QgsMapCanvas
     from qgis.PyQt.QtWidgets import QWidget
 
+    from ..raster.layers import SceneRender
     from ..stac.catalogs import CatalogProvider
     from ..stac.collections import BandPreset, CollectionInfo, IndexPreset
     from ..stac.items import StacItemResult
@@ -366,6 +367,22 @@ def _mosaic_name(label: str, scenes: list[StacItemResult], epsg: int | None) -> 
     span = dates[0] if dates[0] == dates[-1] else f"{dates[0]}→{dates[-1]}"
     name = f"Mosaic ({_scenes(len(scenes))}) {span}{label}"
     return f"{name} · EPSG:{epsg}" if epsg is not None else name
+
+
+def scene_render(
+    catalog: CatalogProvider, coll: CollectionInfo, assets: list[str]
+) -> SceneRender | None:
+    """How *catalog* renders a scene's *assets* itself, if it does: Planetary
+    Computer's true colour (``pc_render``), a few KB a scene at the canvas
+    resolution where its COGs' smallest overview is ~0.5 MB."""
+    if catalog.asset_signer != "pc_sas" or assets != [coll.visual_asset]:
+        return None
+    timeout = settings.http_timeout()
+
+    def render(item_id: str, epsg: int, bounds: tuple, size: tuple) -> bytes:
+        return pc_render(coll.id, item_id, assets[0], epsg, bounds, size, timeout)
+
+    return render
 
 
 @dataclass
@@ -1145,6 +1162,7 @@ class LayerLoader(QObject):
             sign_func=_sign_func(catalog),
             prepare=_asset_login(items, catalog),
             index_preset=preset,
+            render=scene_render(catalog, coll, assets),
         )
         task = make(view=view, preview_clips=clips)
         ml = _MosaicLoad(task, key, label, items, catalog, stack, make=make)
