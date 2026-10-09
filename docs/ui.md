@@ -184,7 +184,8 @@ mosaic needs
 scene at any cloud cover: revisit plus publishing delay), set only on
 collections one was tried on: PC Sentinel-2 L2A, Earth Search Sentinel-2 C1
 and L2A (10), HLS S30 (14), Landsat C2 L2 and HLS L30 (32: 16-day revisit,
-published late), MODIS 09Q1 (40: 8-day composites, ~3 weeks late). Any
+published late), MODIS 09Q1 (40: 8-day composites, ~3 weeks late), MODIS 43A4 (30: newest
+scene ~16 days old). Any
 other collection (no tile grid, or none tried) is covered by area instead
 (`geo.area_cover()`: `TileCover` with the search area as its one tile): its
 scenes of the dates (a timeless one's from 1900: the Copernicus Data Space

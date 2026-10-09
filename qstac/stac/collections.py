@@ -307,6 +307,30 @@ PLANETARY_COMPUTER_COLLECTIONS: list[CollectionInfo] = [
         default_action_label="Red Reflectance",
         mosaic_reach_days=40,  # 8-day composites, published ~3 weeks late
     ),
+    CollectionInfo(
+        id="modis-43A4-061",
+        label="MODIS NBAR Daily",
+        description="500m daily nadir reflectance, true colour at country scale",
+        # MODIS numbers its bands out of colour order: 1 red, 4 green, 3 blue
+        rgb_assets=(
+            "Nadir_Reflectance_Band1",
+            "Nadir_Reflectance_Band4",
+            "Nadir_Reflectance_Band3",
+        ),
+        category="Optical",
+        # Each day is a 16-day BRDF window, published ~16 days after it
+        mosaic_reach_days=30,
+        band_presets=(
+            BandPreset(
+                "Infrared Color (IRC)",
+                (
+                    "Nadir_Reflectance_Band2",
+                    "Nadir_Reflectance_Band1",
+                    "Nadir_Reflectance_Band4",
+                ),
+            ),
+        ),
+    ),
     # ── SAR ──
     CollectionInfo(
         id="sentinel-1-rtc",
