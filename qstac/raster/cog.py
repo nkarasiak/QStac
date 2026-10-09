@@ -344,17 +344,47 @@ def clear_asset_headers(catalog_id: str) -> None:
         gdal.SetPathSpecificOption(prefix, "GDAL_HTTP_HEADERS", None)
 
 
+# COG tile size per storage location, learned from every header read: STAC
+# does not say, and it differs by collection (Sentinel-2 512 px on Planetary
+# Computer, 1024 on Earth Search, HLS 256). A clip on a 512 guess over 1024
+# px tiles had four reads wait on each tile, all past the hedge deadline.
+_BLOCKS: dict[str, int] = {}
+
+
+def _store(url: str) -> str:
+    """Where a COG lives: its host and first path segment (an Azure container,
+    an S3 prefix), or an /vsis3/ bucket and its first prefix."""
+    path = url.removeprefix("/vsicurl/")
+    if path.startswith("/vsis3/"):
+        return "/".join(path[7:].split("/", 2)[:2])
+    parts = urllib.parse.urlsplit(path)
+    return parts.netloc + "/" + parts.path.lstrip("/").partition("/")[0]
+
+
+def remember_block(url: str, ds: gdal.Dataset) -> None:
+    """Note the tile size of *ds*, opened from *url* (tiled files only)."""
+    bx, by = ds.GetRasterBand(1).GetBlockSize()
+    if bx == by:
+        _BLOCKS[_store(url)] = bx
+
+
+def block_size(url: str) -> int:
+    """The COG tile size where *url* lives: 512 until a header there is read."""
+    return _BLOCKS.get(_store(url), 512)
+
+
 def _warm_header(url: str) -> None:
     """Pull a COG's header and IFD chain into the VSI cache (one range request).
 
     Run for every listed result right after a search: the clip a click then
     materialises skips the header round trip (~0.4-1 s to Azure) and needs a
-    single request per tile.
+    single request per tile, on the tile grid this reads (``block_size``).
     """
     with contextlib.suppress(Exception):  # best-effort warm
         ds = gdal.Open(url)
         if ds is not None:
             ds.GetRasterBand(1).GetOverviewCount()
+            remember_block(url, ds)
 
 
 def _warm_one_source(url: str) -> None:
@@ -371,6 +401,7 @@ def _warm_one_source(url: str) -> None:
         ds = gdal.Open(url)
         if ds is None:
             return
+        remember_block(url, ds)
         band = ds.GetRasterBand(1)
         ovr_count = band.GetOverviewCount()
         if ovr_count > 0:

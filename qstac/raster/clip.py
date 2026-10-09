@@ -17,6 +17,7 @@ from osgeo import gdal, ogr, osr
 
 from .. import settings
 from ..log import log
+from .cog import block_size, remember_block
 from .vrt import _add_scl_mask, _build_vrt, _stac_nodata
 
 if TYPE_CHECKING:
@@ -57,8 +58,8 @@ def _cog_geometry(
     """(geotransform, width, height, block_x, block_y, overview factors, projwin).
 
     From STAC ``proj:`` metadata when given — no network, COG layout assumed
-    (512 px tiles, power-of-two overviews down to one tile) — else from the
-    COG header.
+    (the tile size last read where *url* lives, ``cog.block_size``;
+    power-of-two overviews down to under 512 px) — else from the COG header.
     """
     if proj is not None and epsg:
         t = proj.transform
@@ -70,16 +71,17 @@ def _cog_geometry(
         # lat/lon for 4326 and northing-first CRSs (3035).
         dst_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
         projwin = _projwin_from(gt, dst_srs, viewport_4326)
-        bx = by = 512
+        bx = by = block_size(url)
         factors = []
         f = 2
-        while max(w, h) / f >= bx:
+        while max(w, h) / f >= 512:
             factors.append(f)
             f *= 2
     else:
         ds = gdal.Open(url)
         if ds is None:
             return None
+        remember_block(url, ds)
         gt = ds.GetGeoTransform()
         projwin = _projwin_from(gt, ds.GetSpatialRef(), viewport_4326)
         w, h = ds.RasterXSize, ds.RasterYSize
@@ -198,8 +200,8 @@ def _materialize_window_tiles(
     *cancel* aborts the fetch (and the GDAL copies in flight) once true.
 
     With STAC ``proj:`` metadata (*proj*, *epsg*) the window and tile grid are
-    computed without touching the network, assuming the COG layout (512 px
-    tiles, power-of-two overviews down to one tile); the per-tile Translates
+    computed without touching the network, assuming the COG layout (see
+    ``_cog_geometry``); the per-tile Translates
     then open the file concurrently and absorb the header round-trip in
     parallel instead of paying it serially up front (~0.4-1 s cold). A wrong
     guess only misaligns pieces to tiles — output stays correct.
@@ -255,6 +257,7 @@ def _materialize_window_tiles(
             gdal.PushErrorHandler("CPLQuietErrorHandler")
             try:
                 src = gdal.Open(_hedge_url(url) if attempt else url)
+                remember_block(url, src)
                 tile = gdal.Translate(
                     out,
                     src,

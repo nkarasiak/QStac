@@ -31,10 +31,13 @@ from qstac.geo import (
 )
 from qstac.raster.clip import _cog_geometry, _hedge_url, render_clip
 from qstac.raster.cog import (
+    _BLOCKS,
+    _store,
     _vrt_path,
     _vsicurl,
     configure_gdal_for_cog,
     delete_clips,
+    remember_block,
     restore_gdal_config,
     set_s3_login,
 )
@@ -84,6 +87,31 @@ def test_projwin_4326_is_lon_lat() -> None:
     ulx, uly, lrx, lry = geom[-1]
     assert abs(ulx - 10.2) < 1e-6 and abs(uly - 44.8) < 1e-6, geom[-1]
     assert abs(lrx - 10.4) < 1e-6 and abs(lry - 44.6) < 1e-6, geom[-1]
+
+
+def test_clip_grid_takes_the_tile_size_read_where_the_cog_lives() -> None:
+    """A header read teaches its storage location's tile size to the clip grid
+    from STAC proj: Earth Search's 1024 px Sentinel-2, not the 512 guess."""
+    es = "/vsicurl/https://b.s3.us-west-2.amazonaws.com/sentinel-2-c1-l2a/31/U"
+    proj = AssetProj([10980, 10980], [10, 0, 399960, 0, -10, 5500020])
+    view = (2.2, 48.8, 2.4, 48.9)
+    assert _store(_hedge_url(f"{es}/a/B04.tif")) == _store(f"{es}/b/B03.tif")
+    assert _store("/vsis3/eodata/CLMS/x/a.tif") == "eodata/CLMS"
+    assert _cog_geometry(f"{es}/b/B03.tif", view, proj, 32631)[3] == 512
+    with tempfile.TemporaryDirectory() as tmp:
+        opts = ["TILED=YES", "BLOCKXSIZE=1024", "BLOCKYSIZE=1024"]
+        gtiff = gdal.GetDriverByName("GTiff")
+        ds = gtiff.Create(f"{tmp}/t.tif", 2048, 2048, 1, gdal.GDT_Byte, opts)
+        remember_block(f"{es}/a/B04.tif", ds)
+        ds = None
+    try:
+        geom = _cog_geometry(f"{es}/b/B03.tif", view, proj, 32631)
+        assert geom[3:5] == (1024, 1024), geom[3:5]
+        assert geom[5] == [2, 4, 8, 16], geom[5]  # overviews still to < 512 px
+        other = "/vsicurl/https://x.blob.core.windows.net/sentinel2-l2/a.tif"
+        assert _cog_geometry(other, view, proj, 32631)[3] == 512
+    finally:
+        _BLOCKS.clear()
 
 
 def test_fast_path_nodata_and_type() -> None:

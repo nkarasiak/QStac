@@ -180,7 +180,12 @@ Tile reads run on kept threads (`clip._fetch_pool()`: GDAL keeps a
 connection per thread, a fresh one costs a TLS handshake, 0.5 s an open),
 and a hedged copy reads through another URL (`clip._hedge_url()`): GDAL
 makes a thread wait for another's download of the same range, so a copy of
-a stalled read stalled with it, 30 s.
+a stalled read stalled with it, 30 s. The tile grid of a clip from STAC
+`proj:` is the tile size the last header read found where the COG lives
+(host and first path segment, `cog.block_size()`; 512 until one is read,
+which the search's header warm does before a click): Earth Search's
+Sentinel-2 is 1024 px, PC's 512. The hedge deadline is fixed, not per host:
+one from each host's average read time let a few stalls lift PC's past 5 s.
 When `item_assets` names no raster the guess is left empty and the scene's first
 `.tif` loads; right-click > *Load asset* loads any of its rasters instead. Asset
 names may hold a `/`, so temp files are always named through `raster.cog._vrt_path()`.
