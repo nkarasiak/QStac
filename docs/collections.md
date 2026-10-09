@@ -27,8 +27,8 @@ collection combo:
 
 - **Type-to-filter** (`_ComboFilter` in `ui/collection_combo.py`). The combo stays
   click-to-open — its line edit is read-only, so a click opens the list rather
-  than dropping a caret — and typing while the popup is open hides rows that do
-  not contain what was typed, echoing the filter in the closed box. The filter
+  than dropping a caret — and typing while the popup is open hides rows whose
+  title and id do not contain what was typed, echoing the filter in the closed box. The filter
   sits on the line edit and the view, and `_prepare_popup()` adopts the popup
   container on each open so closing it resets the filter. Filtering resizes
   the popup, so it must be re-anchored to the combo (Qt placed it for the

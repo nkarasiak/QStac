@@ -161,9 +161,9 @@ class _ComboFilter(QObject):
             # Category headers label groups; with a filter on there are no
             # groups left to label, so they go too.
             is_header = bool(model.item(row).data(_SEPARATOR_ROLE))
-            view.setRowHidden(
-                row, is_header or needle not in combo.itemText(row).casefold()
-            )
+            # The id too: a title rarely says "modis-43A4-061"
+            haystack = f"{combo.itemText(row)} {combo.itemData(row) or ''}"
+            view.setRowHidden(row, is_header or needle not in haystack.casefold())
         self._fit_height()
         self._highlight_first()
         self._echo()
