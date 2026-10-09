@@ -45,6 +45,9 @@ def test_dialog_round_trip() -> None:
 
     dlg = SettingsDialog()
     values = dlg.collect_values()
+    # A mosaic's note opens it on the Mosaic page (Where scenes overlap).
+    on_mosaic = SettingsDialog(page="Mosaic")
+    assert on_mosaic._nav.currentItem().text() == "Mosaic"
     # Every plain setting has a widget, and every widget a setting.
     plain = set(settings.DEFAULTS) - {"catalog", "asset_login", "s3_login"}
     plain -= {"custom_indices"}  # the Custom index dialog's

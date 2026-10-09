@@ -228,6 +228,14 @@ def test_timeless_search_sends_no_dates() -> None:
     assert body["datetime"] == "2020/2021"
 
 
+def test_intersects_replaces_the_bbox() -> None:
+    """Fill from older scenes searches its holes: the API takes one or the
+    other."""
+    holes = {"type": "MultiPolygon", "coordinates": []}
+    body = search._build_search_body("x", (0, 0, 1, 1), "", 10, 250, intersects=holes)
+    assert body["intersects"] is holes and "bbox" not in body
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

@@ -231,6 +231,7 @@ def _build_search_body(
     cloud_cover_max: int | None = None,
     sortby: bool = False,
     fields: dict | None = None,
+    intersects: dict | None = None,
 ) -> dict:
     """Build the POST body for a STAC search request.
 
@@ -238,11 +239,12 @@ def _build_search_body(
     extension — an API that does not expose ``eo:cloud_cover`` as a supported
     queryable keeps it a client-side filter.
     """
-    body: dict = {
-        "collections": [collection],
-        "bbox": list(bbox),
-        "limit": min(max_items, page_limit),
-    }
+    body: dict = {"collections": [collection], "limit": min(max_items, page_limit)}
+    # One or the other (STAC API): *intersects* (GeoJSON) is the finer.
+    if intersects:
+        body["intersects"] = intersects
+    else:
+        body["bbox"] = list(bbox)
     if datetime_range:  # "": any date (CollectionInfo.timeless)
         body["datetime"] = datetime_range
     # 100% means "no cloud filtering", so no query is sent: the query extension
@@ -304,6 +306,7 @@ def search_catalog(
     server_side_cloud_filter: bool = False,
     server_side_sort: bool = False,
     fields: dict | None = None,
+    intersects: dict | None = None,
 ) -> tuple[list[StacItemResult], PageToken | None]:
     """Search a STAC API.
 
@@ -336,6 +339,8 @@ def search_catalog(
         client-side check still runs — it is cheap and harmless).
     server_side_sort : bool
         Ask the API to sort by datetime descending (``sortby`` extension).
+    intersects : dict or None
+        A GeoJSON geometry searched instead of *bbox*.
 
     Returns
     -------
@@ -362,6 +367,7 @@ def search_catalog(
             cloud_cover_max=cloud_cover_max if server_side_cloud_filter else None,
             sortby=server_side_sort,
             fields=fields,
+            intersects=intersects,
         )
 
     # Credentials only go to the API that was configured, never to a next

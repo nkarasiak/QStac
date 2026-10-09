@@ -140,10 +140,11 @@ class MosaicBuildTask(_EventTask):
         goal: list[dict] | None = None,
     ) -> None:
         super().__init__(f"Mosaicking {len(parts)} scenes")
-        # The tiles of the area (GeoJSON, WGS84): with them, the share of
-        # the view the finished mosaic leaves empty there (missing_share).
+        # The tiles of the area (GeoJSON, WGS84): with them, what of the view
+        # the finished mosaic leaves empty there (measured), which Fill from
+        # older scenes fills (dock: _Fill).
         self.goal = goal
-        self.missing_share: float | None = None
+        self.measured: ClearViews | None = None
         self._sharp: list = []  # the last sharp mosaics shown
         # Each scene's SCL clouds are 0, nodata (``layers.scene_mask``).
         self.hide_clouds = hide_clouds
@@ -311,7 +312,7 @@ class MosaicBuildTask(_EventTask):
 
     def _measure(self) -> None:
         """The share of the view's tiles (*goal*) the finished mosaic leaves
-        empty, read at 256 px: the search's own count is taken before the
+        empty, read at 512 px: the search's own count is taken before the
         build has clipped every scene (France: 31 % said, 3 % left)."""
         if self.goal is None or not self._sharp or self.view is None:
             return
@@ -320,7 +321,7 @@ class MosaicBuildTask(_EventTask):
             views.add(path, None)
         for shape in self.goal:
             views.expect(shape)
-        self.missing_share = views.missing()
+        self.measured = views
 
     def _show_preview(self, parts: list, band: str, view: tuple, sharp: bool) -> None:
         """The tile search's preview clips (of *view*; *sharp*: at the canvas

@@ -301,14 +301,21 @@ def test_mosaic_search_reads_on_until_each_pixel_has_data() -> None:
         assert views.wants(box(4, 8)), "an older scene of the cloudy east"
         assert not views.wants(box(0, 4)), "the west is clear: skipped"
         assert not views.wants(box(9, 10)), "off the view"
+        # Fill from older scenes searches the cloudy east only.
+        cells = views.hole_cells(cells=4)
+        xs = {x for rect in cells["coordinates"] for x, _ in rect[0]}
+        assert cells["type"] == "MultiPolygon" and len(cells["coordinates"]) == 4
+        assert xs == {4, 8}, xs
         views.add(clip(f"{tmp}/old.tif", speck=True), box(0, 8))
         assert views.enough() and views.missing() == 0
         assert not views.wants(box(0, 8))
+        assert views.hole_cells() is None
         # A speck masked on every date: no hole, the search not held.
         specks = ClearViews((0, 0, 8, 8), width=8)
         specks.add(clip(f"{tmp}/s1.tif", speck=True), box(0, 8))
         specks.add(clip(f"{tmp}/s2.tif", speck=True), box(0, 8))
         assert specks.enough() and specks.missing() == 0
+        assert specks.empty() == 1 / 64, "said: the map shows it empty"
         # Filling from older scenes: a one-cell wedge is a hole, wanted.
         wedge = ClearViews((0, 0, 8, 8), width=8, tolerance=0)
         wedge.add(clip(f"{tmp}/w.tif", line=True), box(0, 8))
@@ -335,7 +342,10 @@ def test_mosaic_search_reads_on_until_each_pixel_has_data() -> None:
         build.goal = [box(0, 8)]
         build._sharp = [(clip(f"{tmp}/mosaic.tif", cloud_from=4), 4326, [])]
         build._measure()
-        assert build.missing_share == 0.5, build.missing_share
+        assert build.measured.missing() == 0.5, build.measured.missing()
+        # What Fill from older scenes searches: the empty east, as measured.
+        cells = build.measured.hole_cells(cells=4)
+        assert {x for r in cells["coordinates"] for x, _ in r[0]} == {4, 8}
 
 
 def test_inline_vrt_is_a_datasource() -> None:
@@ -892,6 +902,46 @@ def test_tile_mosaic_reads_back_when_the_reach_is_empty() -> None:
     finally:
         st.request_headers = headers
     assert [i.id for i in task.scenes] == ["old"], task.scenes
+
+
+def test_tile_mosaic_fills_a_wedge_past_the_cloud_limit() -> None:
+    """Clouds hidden, a tile's part no scene under the limit covers (the
+    other orbit's wedge, cloudier on every date) takes its cloudy scene,
+    painted under the rest."""
+    import qstac.stac.search_task as st
+
+    def scene(fid: str, day: str, x0: float, x1: float) -> SimpleNamespace:
+        ring = [[x0, 0], [x1, 0], [x1, 1], [x0, 1], [x0, 0]]
+        return SimpleNamespace(
+            id=fid,
+            datetime_str=f"{day} 10:30",
+            geometry={"type": "Polygon", "coordinates": [ring]},
+            facets={"s2:mgrs_tile": "31UDQ"},
+            assets={"SCL": "scl.tif"},
+            cloud_cover=0,
+        )
+
+    west = scene("west", "2026-10-04", 0, 0.6)  # under the limit
+    wedge = scene("wedge", "2026-10-08", 0.4, 1)  # 30 %: over it
+
+    def window(end: object, cloud: int | None, _h: object) -> list:
+        return [] if str(end) < "2026-10-04" else [west] if cloud else [west, wedge]
+
+    def search(assets: list[str]) -> list[str]:
+        task = st.TileSearchTask(
+            SimpleNamespace(), "sentinel-2-l2a", (0, 0, 1, 1), "2026-09-09",
+            "2026-10-09", 20, assets, 30, 10,
+        )  # fmt: skip
+        task._window = window
+        headers, st.request_headers = st.request_headers, lambda _cat: {}
+        try:
+            assert task.run(), task.error
+        finally:
+            st.request_headers = headers
+        return [i.id for i in task.scenes]
+
+    assert search(["visual", "SCL"]) == ["wedge", "west"]
+    assert search(["visual"]) == ["west"], "clouds shown: the limit holds"
 
 
 def test_mosaic_by_time_takes_every_scene_of_the_dates() -> None:

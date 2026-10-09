@@ -158,10 +158,14 @@ _EMPTY_HINT = (
 )
 
 
-# The share of a mosaic's view left with no clear view said, and how far
-# before the dates "Fill from older scenes" looks.
-_MISSING_NOTED = 0.01
+# The share of a mosaic's view its search may leave with no clear view, how
+# far before the dates "Fill from older scenes" looks, and what it may leave
+# (and is offered over): searching the holes only, 0.1 % costs one scene more
+# than 1 % (near Tulle, 0.9 s), and 1 % was the cloud blobs left all over a
+# zoomed-in view, or France with 0.9 % of it empty, no fill offered.
+_MOSAIC_LEFT = 0.01
 _FILL_LOOKBACK_DAYS = 365
+_FILL_LEFT = 0.001
 
 # Settings > Mosaic > Where scenes overlap, as the mosaic menu says it.
 _COMPOSITE_TEXT = {
@@ -181,6 +185,14 @@ def _mosaic_assets(coll: CollectionInfo, render: str = "") -> list[str]:
         return next((list(p.assets) for p in presets if p.label == render), [])
     extra = list(coll.default_preset.assets) if coll.default_preset else []
     return list(dict.fromkeys(_default_assets(coll) + extra))
+
+
+def _year_before(run: _SearchRun) -> _SearchRun:
+    """*run* over the _FILL_LOOKBACK_DAYS before its dates."""
+    start = date.fromisoformat(run.date_from)
+    back = start - timedelta(days=_FILL_LOOKBACK_DAYS)
+    end = str(start - timedelta(days=1))
+    return replace(run, date_from=str(back), date_to=end, task=None)
 
 
 def _default_label(coll: CollectionInfo) -> str:
@@ -328,6 +340,20 @@ class _SearchRun:
     date_to: str
     cloud: int | None
     task: StacSearchTask | None = None  # the page request in flight
+
+
+@dataclass
+class _Fill:
+    """What Fill from older scenes fills (``_note_missing``): a tile mosaic's
+    search (*run*), the view (WGS84 bounds, pixels) it counted the clear
+    pixels of (*views*), its *layers*, which the older scenes' go under, and
+    what it shows (*shows*, ``_mosaic_options``)."""
+
+    run: _SearchRun
+    shows: str
+    view: tuple
+    views: ClearViews
+    layers: list[QgsRasterLayer]
 
 
 class QStacDock(QDockWidget):
@@ -761,7 +787,7 @@ class QStacDock(QDockWidget):
         # STAC API is the combo's last entry; the rarely used rest is in ⋯.
         bar.addWidget(self.combo_catalog)
         bar.addAction(icon("mActionOptions.svg"), "Settings…").triggered.connect(
-            self.open_settings_dialog
+            lambda: self.open_settings_dialog()  # not *checked* for its page
         )
         more = QMenu(self)
         # Search covers the map view; another area is a choice made rarely,
@@ -1830,15 +1856,16 @@ class QStacDock(QDockWidget):
         url = _metadata("tracker").rstrip("/") + "/new?" + query
         QDesktopServices.openUrl(QUrl(url))
 
-    def open_settings_dialog(self) -> None:
-        """Open the settings dialog and apply changes to this dock.
+    def open_settings_dialog(self, page: str = "") -> None:
+        """Open the settings dialog (on *page*, a page title, if given) and
+        apply changes to this dock.
 
         Also called from the plugin's "Settings…" menu action so a catalog
         switch refreshes the collection combo regardless of entry point.
         """
         from .settings_dialog import SettingsDialog
 
-        dlg = SettingsDialog(self)
+        dlg = SettingsDialog(self, page)
         if dlg.exec():
             changed = settings.apply_dialog(dlg)
             if changed & {"catalog", "user_catalogs"}:
@@ -2504,26 +2531,28 @@ class QStacDock(QDockWidget):
         elif self._area is None and self._search_band is not None:
             self._search_band.reset(QgsWkbTypes.GeometryType.Polygon)
 
-    def _tile_mosaic(self, picked: bool = False, older: bool = False) -> None:
+    def _tile_mosaic(self, picked: bool = False, fill: _Fill | None = None) -> None:
         """Mosaic every tile of the form's area, its newest scenes on top.
 
         A search of its own (TileSearchTask), going back in time for the
         tiles the dates leave uncovered: the result list is not used.
         *picked*: with the right-click menu's options (``_mosaic_options``).
-        *older*: the dates left pixels with no clear view (``_note_missing``):
-        scenes up to a year before them fill those, read until they are.
+        *fill*: a mosaic left pixels with no clear view (``_note_missing``):
+        scenes of the year before its dates fill those, searched over them
+        only and read until they are clear, a mosaic of their own under it.
         """
-        run = self._form_run()
+        run = self._form_run() if fill is None else _year_before(fill.run)
         if run is None or self._tile_task is not None:
             return
         self._clear_mosaic_notes()
-        kind, days, shows = self._mosaic_options(run.collection, picked)
-        if older:
-            days = max(days, _FILL_LOOKBACK_DAYS)
+        if fill is None:
+            kind, days, shows = self._mosaic_options(run.collection, picked)
+            canvas = self.iface.mapCanvas()
+            view = (viewport_bbox_4326(canvas), _canvas_pixel_size(canvas))
+        else:
+            kind, days, shows, view = "tile", 0, fill.shows, fill.view
         assets = _mosaic_assets(run.collection, shows)
         sign = _sign_func(run.catalog)
-        canvas = self.iface.mapCanvas()
-        view = (viewport_bbox_4326(canvas), _canvas_pixel_size(canvas))
         render = scene_render(run.catalog, run.collection, assets)
         # Rendered by the catalog, the clip is final: at the canvas resolution.
         # Read from COGs, a preview at half of it, then sharp in the build.
@@ -2538,20 +2567,18 @@ class QStacDock(QDockWidget):
         # has data, counted on the clips the search makes; a composite's,
         # three clear views: its median outvotes what the cloud mask missed
         # (one view: 38 % of a London view had three, hazy).
-        keep = dated and (hide_clouds or composite)
-        need = 3 if composite else 1
-        # Filling from older scenes: those fill the pixels the dates left
-        # without a clear view only, the search reading back until they
-        # are (France, 30 days: 2485 scenes in 47 s when each pixel waited
-        # for three views).
-        counted = 1 if older else need
-        views = (
-            ClearViews(view[0], counted, tolerance=_MISSING_NOTED)
-            if keep and len(assets) == 1
-            else None
-        )
-        if views is not None and older:
-            views.gaps = 0.0  # no tile or wedge left without a scene
+        keep = fill is not None or (dated and (hide_clouds or composite))
+        # Filling from older scenes: one clear view for the pixels the
+        # mosaic left without any, counted on with its own (France, 30
+        # days: 2485 scenes in 47 s when each pixel waited for three).
+        need = 3 if composite and fill is None else 1
+        views = None
+        if fill is not None:
+            views = fill.views
+            views.need, views.tolerance = 1, _FILL_LEFT
+            views.gaps = 0.0  # no tile or wedge left without one
+        elif keep and len(assets) == 1:
+            views = ClearViews(view[0], need, tolerance=_MOSAIC_LEFT)
 
         def clip(item: StacItemResult) -> None:
             """A picked scene's clip, made as the search goes on (in its
@@ -2593,7 +2620,7 @@ class QStacDock(QDockWidget):
             )
             if views is not None
             else None,
-            keep_older=older,
+            holes=fill.views.hole_cells() if fill is not None else None,
             expect=(
                 lambda shapes: [views.expect(json.loads(g.asJson())) for g in shapes]
             )
@@ -2609,9 +2636,7 @@ class QStacDock(QDockWidget):
         # A bound method: the signal comes from the worker thread.
         task.progressChanged.connect(self._sync_mosaic_button)
         preview = (view, clips)
-        found = partial(
-            self._on_tiles_found, task, run, shows, preview, views, picked, older
-        )
+        found = partial(self._on_tiles_found, task, run, shows, preview, views, fill)
         task.taskCompleted.connect(found)
         task.taskTerminated.connect(found)
         self._sync_mosaic_button()
@@ -2624,14 +2649,13 @@ class QStacDock(QDockWidget):
         render: str = "",
         preview: tuple | None = None,
         views: ClearViews | None = None,
-        picked: bool = False,
-        older: bool = False,
+        fill: _Fill | None = None,
     ) -> None:
         """The tile search ended: build its mosaic, showing *render* (a band
         combination or index label, "" the default). *preview*: the view at
         the click and the preview clips made of it (``MosaicBuildTask``).
-        *views*: their clear pixels, *picked* and *older* as it was asked
-        (``_tile_mosaic``), for ``_note_missing``."""
+        *views*: their clear pixels, for ``_note_missing``; *fill* as it was
+        asked (``_tile_mosaic``)."""
         if self._closed or task is not self._tile_task:
             return
         self._tile_task = None
@@ -2700,7 +2724,7 @@ class QStacDock(QDockWidget):
                 task.scenes, coll, run.catalog, task.day_cover, index, band
             )
         else:
-            measure = self._measured(task, views, run, picked, older)
+            measure = self._measured(task, views, run, render, preview, fill)
             self._load_mosaic(
                 task.scenes, coll, run.catalog, index, band, preview, **measure
             )
@@ -2710,52 +2734,83 @@ class QStacDock(QDockWidget):
         task: TileSearchTask,
         views: ClearViews | None,
         run: _SearchRun,
-        picked: bool,
-        older: bool,
+        shows: str,
+        preview: tuple | None,
+        fill: _Fill | None,
     ) -> dict:
-        """``load_mosaic``'s *goal* and *on_done*: the build measures what
-        the finished mosaic leaves empty of the area's tiles (a tile with no
+        """``load_mosaic``'s *goal* and *on_done*: once on the map, the
+        mosaic says how it treats overlaps (``_note_composite``); the build
+        measures what it leaves empty of the area's tiles (a tile with no
         scene taken counts), then ``_note_missing`` says it. Only a mosaic
-        whose search counted clear pixels (*views*): one asset per scene."""
-        if views is None:
-            return {}
-        goal = [json.loads(shape.asJson()) for shape in task.goal]
+        whose search counted clear pixels (*views*): one asset per scene.
+        A *fill*'s goes under its mosaic, and its holes are said at once, as
+        its scenes' clips left them: its own mosaic shows them alone."""
+        if fill is not None:
+            self._note_missing(fill.views, fill.run)
+            return {"under": fill.layers}
+        counted = views is not None and preview is not None
+        goal = [json.loads(g.asJson()) for g in task.goal] if counted else None
 
-        def done(build: MosaicBuildTask) -> None:
-            if not self._closed:
-                self._note_missing(build.missing_share, run, picked, older)
+        def done(build: MosaicBuildTask, layers: list) -> None:
+            if self._closed:
+                return
+            if not run.collection.timeless:  # one value a tile: no overlap
+                self._note_composite()
+            if counted:
+                # The holes as the note says them, on the finished mosaic:
+                # the search's own count, taken before every scene is
+                # clipped, may see none there (the fill then took nothing).
+                fill = _Fill(run, shows, preview[0], build.measured, layers)
+                self._note_missing(build.measured, run, fill)
 
         return {"goal": goal, "on_done": done}
 
+    def _note_composite(self) -> None:
+        """What a mosaic shows where scenes overlap, once it is on the map,
+        and the other choices: Settings > Mosaic, a click away."""
+        rules = {**_COMPOSITE_TEXT, "newest": "Newest on top"}
+        now = settings.mosaic_composite()
+        others = ", ".join(t.lower() for k, t in rules.items() if k != now)
+        button = QPushButton("Change…")
+        button.setToolTip("Settings > Mosaic, then build the mosaic again.")
+        button.clicked.connect(lambda: self.open_settings_dialog("Mosaic"))
+        self._mosaic_note(
+            f"Where scenes overlap: {rules.get(now, now).lower()}. Also: {others}.",
+            button=button,
+        )
+
     def _note_missing(
-        self, share: float | None, run: _SearchRun, picked: bool, older: bool
+        self, views: ClearViews | None, run: _SearchRun, fill: _Fill | None = None
     ) -> None:
-        """The share of the view the dates left with no clear view, if over
-        1 %; with a button to fill it from older scenes (``_tile_mosaic``)."""
-        if share is None or share <= _MISSING_NOTED:
+        """The share of the view *run*'s dates left with no clear view
+        (*views*), if its holes are over _FILL_LEFT; with a button to *fill*
+        it from older scenes (``_tile_mosaic``), else the year before was
+        read too. The share said is what the map shows, specks too."""
+        if views is None or views.missing() <= _FILL_LEFT:
             return
+        share = views.empty()
         span = f"from {run.date_from} to {run.date_to}"
-        if older:
+        if fill is None:
             span += ", nor in the year before"
-        text = f"{share:.0%} of the view has no clear view {span}."
-        if older:
+        text = f"{share:.1%} of the view has no clear view {span}."
+        if fill is None:
             self._mosaic_note(text)
             return
         button = QPushButton("Fill from older scenes")
         button.setToolTip(
-            "Build it again, older scenes (up to a year before the start"
-            " date) filling those pixels: read until they are clear."
+            "Older scenes (up to a year before the start date) fill those"
+            " pixels, read until they are clear: a mosaic under this one."
         )
 
-        def fill() -> None:
-            self._tile_mosaic(picked, older=True)  # its notes go: this one too
+        def start() -> None:
+            self._tile_mosaic(fill=fill)  # its notes go: this one too
             # Said where it was clicked: the progress is on the 9 squares.
             self._mosaic_note(
-                "Filling the mosaic from older scenes: a new layer, on top"
+                "Filling the mosaic from older scenes: a new layer under it,"
                 " in a few seconds."
             )
 
-        button.clicked.connect(fill)
+        button.clicked.connect(start)
         self._mosaic_note(text, button=button, duration=0)
 
     def _mosaic_note(

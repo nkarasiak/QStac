@@ -406,6 +406,7 @@ class _MosaicLoad:
     # view= and remote=): QGIS deletes a task once it ends.
     make: Callable[..., MosaicBuildTask] | None = None
     refresh: MosaicBuildTask | None = None  # clipping the latest view
+    under: list[QgsRasterLayer] = field(default_factory=list)  # its layers go under
 
 
 class LayerLoader(QObject):
@@ -634,7 +635,11 @@ class LayerLoader(QObject):
         self._flash(f"Saved and opened {name}.")
 
     def _add_to_project(
-        self, layers: list[QgsRasterLayer], group: str, stack: bool = False
+        self,
+        layers: list[QgsRasterLayer],
+        group: str,
+        stack: bool = False,
+        under: list[QgsRasterLayer] | None = None,
     ) -> None:
         """Add *layers* to the map, and make sure they show.
 
@@ -642,10 +647,10 @@ class LayerLoader(QObject):
         a Temporal Controller range) hides every scene of another date with
         no error, and a newcomer sees an empty map: it is lifted, and said.
         Not for a time stack's own layers (*stack*): hiding the other dates
-        is what its animation does.
+        is what its animation does. *under*: they go right under these.
         """
         canvas = self._iface.mapCanvas()
-        add_layers_to_project(layers, canvas=canvas, group=group)
+        add_layers_to_project(layers, canvas=canvas, group=group, under=under)
         if stack or not hidden_by_time_filter(canvas.mapSettings(), layers):
             return
         self._show_all_dates(canvas)
@@ -1110,7 +1115,8 @@ class LayerLoader(QObject):
         band_preset: BandPreset | None = None,
         preview: tuple | None = None,
         goal: list[dict] | None = None,
-        on_done: Callable[[MosaicBuildTask], object] | None = None,
+        on_done: Callable[[MosaicBuildTask, list], object] | None = None,
+        under: list[QgsRasterLayer] | None = None,
     ) -> None:
         """Mosaic several scenes off the GUI thread: one layer per CRS.
 
@@ -1119,6 +1125,8 @@ class LayerLoader(QObject):
         *band_preset*: the bands it shows instead of the default ones;
         *preview*: the view (canvas extent in WGS84, size in pixels) and the
         preview clips the tile search made of it, item id → clip.
+        *on_done*: called with the build and its layers once it ends well.
+        *under*: its layers go right under these (Fill from older scenes).
         """
         key = "mosaic:" + ",".join(sorted(it.id for it in items))
         if index_preset is not None or band_preset is not None:
@@ -1178,14 +1186,17 @@ class LayerLoader(QObject):
             else settings.mosaic_composite(),
         )
         task = make(view=view, preview_clips=clips, goal=goal)
-        if on_done is not None:  # *goal*'s share left empty: task.missing_share
-            task.taskCompleted.connect(lambda: on_done(task))
-        ml = _MosaicLoad(task, key, label, items, catalog, stack, make=make)
+        ml = _MosaicLoad(
+            task, key, label, items, catalog, stack, make=make, under=under or []
+        )
         task.previewReady.connect(
             lambda m, sharp: self._on_mosaic_preview(ml, m, sharp, task)
         )
         task.taskCompleted.connect(lambda: self._on_mosaic_done(ml, True))
         task.taskTerminated.connect(lambda: self._on_mosaic_done(ml, False))
+        if on_done is not None:  # after: its layers are open
+            # *goal*'s pixels left empty: task.measured
+            task.taskCompleted.connect(lambda: on_done(task, list(ml.layers.values())))
         self.run_task(task)
 
     def _open_mosaics(
@@ -1217,7 +1228,7 @@ class LayerLoader(QObject):
         self, ml: _MosaicLoad, opened: list, task: MosaicBuildTask
     ) -> None:
         self._add_to_project(
-            [lyr for lyr, _ in opened], task.collection_info.label, ml.stack
+            [lyr for lyr, _ in opened], task.collection_info.label, ml.stack, ml.under
         )
         for layer, epsg in opened:
             self._added[layer.id()] = ml.key

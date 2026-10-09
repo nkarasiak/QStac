@@ -53,7 +53,8 @@ keeps scenes of the dates that have one under each tile's newest
 (`TileSearchTask(keep_period=)`, `TileCover(keep_since=)`), so the older
 scenes fill the clouds' holes, until each pixel of the view has data:
 the search counts, on the clips it makes of its picks (cloud 0), how many
-show each pixel clear (`clip.ClearViews`, 256 px wide, a pixel no picked
+show each pixel clear (`clip.ClearViews`, 512 px wide: at 256, blobs of a
+few hundred metres a fill left, 0.3 % of a 195 km view, 0.06 % at 512; a pixel no picked
 footprint covers left out), waits for a window's clips and stops reading
 older dates once `_VIEW_CLEAR` (99 %) of them are (`TileSearchTask(enough=)`).
 A scene of the dates is taken only where it shows pixels still wanting

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import itertools
 import json
 import math
 import threading
@@ -326,7 +327,7 @@ class ClearViews:
         self,
         bounds: tuple[float, float, float, float],
         need: int = 1,
-        width: int = 256,
+        width: int = 512,
         tolerance: float = 1 - _VIEW_CLEAR,
     ) -> None:
         x0, y0, x1, y1 = bounds
@@ -411,11 +412,46 @@ class ClearViews:
         """The share of the pixels a scene covers that none shows clear."""
         return self._share(1)
 
+    def empty(self) -> float:
+        """:meth:`missing` with the specks: what the map shows empty."""
+        with self._lock:
+            covered = self.covered.copy()
+            empty = covered & (self.clear == 0)
+        return float(empty.sum() / covered.sum()) if covered.any() else 0.0
+
     def enough(self) -> bool:
         """Whether the pixels the scenes cover are clear *need* times."""
         if not self.covered.any():
             return False
         return self._share(self.need) <= self.tolerance and self._gaps() <= self.gaps
+
+    def hole_cells(self, cells: int = 32) -> dict | None:
+        """The holes no scene shows clear yet as a GeoJSON MultiPolygon of
+        cells, *cells* across the view, each row's run of them one
+        rectangle (a few dozen: a search API slows on fine shapes); None
+        without any. What Fill from older scenes searches."""
+        with self._lock:
+            holes = _holes(self.covered & (self.clear == 0))
+        if not holes.any():
+            return None
+        h, w = holes.shape
+        step = max(1, w // cells)
+        rows, cols = -(-h // step), -(-w // step)
+        grid = np.zeros((rows * step, cols * step), bool)
+        grid[:h, :w] = holes
+        hit = grid.reshape(rows, step, cols, step).any(axis=(1, 3))
+        x0, dx, _, y1, _, dy = self.gt
+        rects = []
+        for r, row in enumerate(hit):
+            top, bottom = y1 + r * step * dy, y1 + min(h, (r + 1) * step) * dy
+            for on, run in itertools.groupby(enumerate(row), key=lambda ch: ch[1]):
+                if on:
+                    run = list(run)
+                    xa = x0 + run[0][0] * step * dx
+                    xb = x0 + min(w, (run[-1][0] + 1) * step) * dx
+                    ring = [[xa, top], [xb, top], [xb, bottom], [xa, bottom]]
+                    rects.append([[*ring, ring[0]]])
+        return {"type": "MultiPolygon", "coordinates": rects}
 
     def _share(self, need: int) -> float:
         """The share of the covered pixels clear fewer than *need* times, in

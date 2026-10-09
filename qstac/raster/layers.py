@@ -855,15 +855,19 @@ def _layer_start(lyr: object) -> QDateTime | None:
     return props.fixedTemporalRange().begin()
 
 
-def _deferred_tree_insert(layer_ids: list[str], group: str | None = None) -> None:
+def _deferred_tree_insert(
+    layer_ids: list[str], group: str | None = None, under: list[str] | None = None
+) -> None:
     """Insert layers into the layer tree if still alive in the project.
 
     What was just added must show: with *group*, layers go into the group of
     that name, moved to the top of its parent (or created at the top of the
-    tree), and they go on top of it. Only within one batch are they ordered
-    newest scene first, so a time stack reads as one in the legend and the
-    Temporal Controller; a date order across loads put an older scene, or a
-    reused group, under what was already there, hidden.
+    tree), and they go on top of it. With *under* (layer ids still in the
+    tree), right under the lowest of those instead: a mosaic's fill. Only
+    within one batch are they ordered newest scene first, so a time stack
+    reads as one in the legend and the Temporal Controller; a date order
+    across loads put an older scene, or a reused group, under what was
+    already there, hidden.
 
     Refetch project + root fresh — captured wrappers can be stale after
     project close, layer removal, or plugin reload.
@@ -873,8 +877,13 @@ def _deferred_tree_insert(layer_ids: list[str], group: str | None = None) -> Non
     try:
         proj = QgsProject.instance()
         tree_root = proj.layerTreeRoot()
-        parent = tree_root
-        if group:
+        parent, start = tree_root, 0
+        below = [n for i in under or () if (n := tree_root.findLayer(i)) is not None]
+        if below:
+            parent = below[0].parent()
+            kids = [getattr(k, "layerId", lambda: None)() for k in parent.children()]
+            start = max(kids.index(i) for i in under if i in kids) + 1
+        elif group:
             parent = tree_root.findGroup(group)
             if parent is None:
                 parent = tree_root.insertGroup(0, group)
@@ -898,7 +907,7 @@ def _deferred_tree_insert(layer_ids: list[str], group: str | None = None) -> Non
     undated = [lyr for lyr in layers if _layer_start(lyr) is None]
     try:
         for pos, lyr in enumerate(dated + undated):
-            parent.insertLayer(pos, lyr)
+            parent.insertLayer(start + pos, lyr)
     except RuntimeError:
         return  # the tree went with its project
 
@@ -907,8 +916,10 @@ def add_layers_to_project(
     layers: list[QgsRasterLayer],
     canvas: object | None = None,
     group: str | None = None,
+    under: list[QgsRasterLayer] | None = None,
 ) -> None:
-    """Add raster layers to the project and the map canvas.
+    """Add raster layers to the project and the map canvas (right under
+    *under*, the lowest of them, when given: ``_deferred_tree_insert``).
 
     When *canvas* is provided, uses a deferred legend-insert pattern so the
     map canvas paints the new layer in ~10 ms (cached path) instead of the
@@ -924,10 +935,11 @@ def add_layers_to_project(
     direct ``addMapLayer`` path.
     """
     project = QgsProject.instance()
+    below = _safe_layer_ids(under or [])
     if canvas is None:
         for layer in layers:
             project.addMapLayer(layer, False)
-        _deferred_tree_insert(_safe_layer_ids(layers), group)
+        _deferred_tree_insert(_safe_layer_ids(layers), group, below)
         return
 
     from qgis.PyQt.QtCore import QTimer
@@ -935,7 +947,10 @@ def add_layers_to_project(
     for layer in layers:
         project.addMapLayer(layer, False)
     # Index 0 draws on top: new layers go above the basemap, not under it.
-    canvas.setLayers(layers + list(canvas.layers()))
+    drawn = list(canvas.layers())
+    ids = [lyr.id() for lyr in drawn]
+    at = max((ids.index(i) + 1 for i in below if i in ids), default=0)
+    canvas.setLayers(drawn[:at] + layers + drawn[at:])
     canvas.refresh()
 
     layer_ids = _safe_layer_ids(layers)
@@ -947,7 +962,7 @@ def add_layers_to_project(
     def insert_after_paint() -> None:
         with contextlib.suppress(TypeError, RuntimeError):
             canvas.mapCanvasRefreshed.disconnect(insert_after_paint)
-        _deferred_tree_insert(layer_ids, group)
+        _deferred_tree_insert(layer_ids, group, below)
 
     canvas.mapCanvasRefreshed.connect(insert_after_paint)
     # Safety net: a canvas that never repaints (hidden window, canceled render)

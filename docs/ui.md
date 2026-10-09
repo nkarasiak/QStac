@@ -107,23 +107,37 @@ shows) plays one animation of the squares
 *off*. Not at dock start (it restores a collection), not while a mosaic runs. A click builds the default: each tile's newest scene of the
 search dates, in the collection's default look (`_mosaic_options(picked=False)`);
 where scenes overlap, their median by default (Settings > Mosaic: median,
-mean, or the newest on top), over the scenes of the dates, newest first,
+mean, or the newest on top; once the mosaic is on the map a note says which,
+with the others and *Change…*, Settings opened on its Mosaic page:
+`_note_composite()`), over the scenes of the dates, newest first,
 until each tile is likely clear; newest with *Hide clouds* on reads older
 Sentinel-2 ones the same way, to fill its clouds (`docs/loading.md`). The menu's first choice is named after it
-(`_COMPOSITE_TEXT`). When the dates leave over 1 % of the view with no
-clear view (measured on the finished mosaic at 256 px by its build,
+(`_COMPOSITE_TEXT`). When the dates leave holes over 0.1 % of the view
+with no clear view (`_FILL_LEFT`; at 1 %, France 0.9 % empty offered no fill;
+measured on the finished mosaic at 512 px by its build,
 `MosaicBuildTask(goal=)._measure()`, 3 s for France, every tile of the area
 counted: `TileSearchTask.goal`, `ClearViews.expect()`, so a tile no scene of
 the dates passed the cloud filter for is a hole too; the search's own count
 comes before the build clipped every scene: 31 % said, 3 % left), the message
-bar says how much, with *Fill from older scenes* (`_note_missing()`): the
-same mosaic again, `_tile_mosaic(older=True)` (a new mosaic removes the
-last one's notes: `_mosaic_note()`, 6 s, the fill's until closed), the dates read first as
-before, then a year back, older scenes kept (`TileSearchTask(keep_older=)`)
-only where a pixel has no clear view yet, until none lacks one. France, 30
-days: 3 % missing (16 tiles with no scene); filled, 991 scenes back to 28
-July in 23 s, none missing (2485 in 47 s when older scenes also waited for
-three views).
+bar says how much of it the map shows empty (`ClearViews.empty()`, specks
+too: France, 0.5 % in holes, 0.9 % empty), with *Fill from older scenes* (`_note_missing()`), which
+keeps that mosaic (a new mosaic removes the last one's notes:
+`_mosaic_note()`, 6 s, the fill's until closed): `_tile_mosaic(fill=)`, a
+`_Fill` of its search, view, layers and the build's clear-pixel count
+(`MosaicBuildTask.measured`, the note's: the search's own, taken before
+every scene is clipped, saw no hole there and the fill took nothing), reads the year
+before its dates (`_year_before()`) over its holes only
+(`ClearViews.hole_cells()`, a few dozen rectangles sent as `intersects`:
+`TileSearchTask(holes=)`), a scene taken only where a pixel has no clear view
+yet, until 0.1 % of it lacks one (`_FILL_LEFT`: 1 % left the cloud blobs
+all over a zoomed-in view; 0.1 % took one scene and 0.9 s more), and builds
+those alone, a mosaic right under the
+first (`load_mosaic(under=)`); what is still empty is said from the count,
+the fill's own build seeing only the holes. It once built the whole mosaic
+again, dates and all, on top: France, 30 days, 991 scenes in 23 s of search
+(2485 in 47 s when older scenes also waited for three views), then all of
+them built again. Near Le Mans over 10 days (11.6 % missing): 6 scenes
+to build, not 30.
 Right-click (`_show_mosaic_menu()`) builds another, its picks kept for the
 session, never saved (two saved settings for it once made a click build one
 mosaic per date unasked). On top, set in place while the menu stays open
@@ -192,7 +206,12 @@ published late) the search reads every window rather than stop at once, empty. `
 the newer show nothing, by footprint: a scene is cut by its orbit's edge *and*
 along its track (one pass, several products), so neither the relative orbit
 nor `s2:nodata_pixel_percentage` says what fills it (`_FILL_GAPS`: tried
-off, most of France showed the basemap). France and Iberia at 20%: 331 tiles,
+off, most of France showed the basemap). Clouds hidden, a tile still not
+covered once the dates are read takes its reach's scenes at any cloud cover
+where they add ground, painted under the rest (`_past_the_limit()`):
+eo:cloud_cover is the whole tile's, and near Paris the other orbit's wedge of
+31UDQ was 23-100 % cloudy on every date of a month, a basemap triangle under
+20 %. France and Iberia at 20%: 331 tiles,
 587 scenes, 3 s to search, 6 s to build.
 Over `_MOSAIC_ASKED` (1000, as *Load all*) scenes it asks before building
 (`_on_tiles_found()`): one long build, and every redraw zoomed out reads each.

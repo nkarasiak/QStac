@@ -15,6 +15,7 @@ from qgis.core import QgsTask
 
 from ..geo import TileCover, area_cover, day_cover, search_area
 from .auth import request_headers
+from .collections import SCL_ASSETS
 from .net import StacError
 from .search import search_catalog, server_cloud_filter
 
@@ -168,7 +169,7 @@ class TileSearchTask(QgsTask):
         keep_any: bool = False,
         enough: Callable[[], bool] | None = None,
         wants: Callable[[StacItemResult], bool] | None = None,
-        keep_older: bool = False,
+        holes: dict | None = None,
         expect: Callable[[list[QgsGeometry]], object] | None = None,
         area: QgsGeometry | None = None,
         lookback_days: int = 0,
@@ -197,9 +198,11 @@ class TileSearchTask(QgsTask):
         # it, each scene's eo:cloud_cover says (TileCover.cloudy()).
         self.enough = enough
         self.wants = wants  # whether a scene shows pixels not clear enough yet
-        # The look back's scenes kept too, not only the dates': the dates
-        # left pixels with no clear view (dock: Fill from older scenes).
-        self.keep_older = keep_older
+        # Fill from older scenes (dock): the pixels a mosaic left with no
+        # clear view (GeoJSON, ClearViews.hole_cells), searched instead of
+        # the bbox; its tiles are on the map, so a scene is taken only
+        # where *wants* says.
+        self.holes = holes
         # Handed each tile's reach once known, before any scene is read:
         # what the clear-pixel count must see filled (ClearViews.expect).
         self.expect = expect
@@ -265,6 +268,7 @@ class TileSearchTask(QgsTask):
                         server_side_cloud_filter=server_cloud,
                         server_side_sort=newest and cat.supports_sortby,
                         fields=fields,
+                        intersects=self.holes,
                     )
                     break
                 except StacError as e:
@@ -294,31 +298,53 @@ class TileSearchTask(QgsTask):
         any cloud cover) shows, those handed to *expect* first."""
         if self.by_time:
             return _EveryScene(self.max_scenes)
-        keep_since = str(deepest) if self.keep_older else self.date_from
         cover = TileCover(
             [i for f in reach for i in f.result()],
             _FILL_GAPS,
             within=search_area(self.bbox, self.area),
-            keep_since=keep_since if self.keep_period else "",
+            keep_since=self.date_from if self.keep_period else "",
             keep_any=self.keep_any,
             wants=self.wants,
         )
-        if self.expect is not None and cover.goal:
+        if self.holes:
+            cover.done = set(cover.goal)
+        elif self.expect is not None and cover.goal:
             self.expect(list(cover.goal.values()))
         return cover
 
-    def _clear(self, cover: TileCover | _EveryScene, before: datetime.date) -> bool:
-        """Whether the scenes taken leave no cloud to fill under the dates',
-        the windows read back to *before*. Filling from older scenes, the
-        dates are read first: their scenes are the mosaic's."""
+    def _clear(self, cover: TileCover | _EveryScene) -> bool:
+        """Whether the scenes taken leave no cloud to fill under the dates'."""
         if not self.keep_period:
             return True
-        if self.keep_older and before >= datetime.date.fromisoformat(self.date_from):
-            return False
         if self.enough is None:
             return not cover.cloudy()
         wait(self._picks)  # their clips counted: what the map will show
         return self.enough()
+
+    def _past_the_limit(
+        self, cover: TileCover, reach: list, picks: ThreadPoolExecutor
+    ) -> list[StacItemResult]:
+        """Clouds hidden (the SCL asked for), a tile no scene under the cloud
+        limit covers whole takes its reach's scenes at any cloud cover where
+        they add ground; returned oldest first, to paint under the rest and
+        come last in a median. eo:cloud_cover is the whole tile's: near Paris
+        the other orbit's wedge of 31UDQ was 23-100 % cloudy on every date of
+        a month, and empty under a 20 % limit, its clear part not shown."""
+        missing = set(cover.missing())
+        if not missing or not any(a in self.assets for a in SCL_ASSETS):
+            return []
+        taken = {it.id for it in cover.picked}
+        before = len(cover.picked)
+        cover.add(
+            [
+                it
+                for f in reach
+                for it in f.result()
+                if cover.key(it) in missing and it.id not in taken
+            ]
+        )
+        self._hand_picks(cover, picks)
+        return sorted(cover.picked[before:], key=lambda i: i.datetime_str)
 
     def _end_picks(self, pool: ThreadPoolExecutor) -> None:
         """Give the picks' work until _PICKS_DEADLINE_S: the build reads it next."""
@@ -388,11 +414,14 @@ class TileSearchTask(QgsTask):
                 # to meet, so every window is read rather than none.
                 # Covered first: _clear waits for the window's clips, which a
                 # tile still uncovered cannot spare (France: 5 s became 27).
-                before = ends[n] - step
-                if cover.goal and not cover.missing() and self._clear(cover, before):
+                # Filling holes, the clear pixels are the goal.
+                goal = cover.goal or self.holes
+                if goal and not cover.missing() and self._clear(cover):
                     break
                 self.setProgress(100 * (n + 1) / len(window))
-            self.scenes = cover.scenes()
+            under = [] if self.by_time else self._past_the_limit(cover, reach, picks)
+            ids = {it.id for it in under}
+            self.scenes = under + [s for s in cover.scenes() if s.id not in ids]
             self.missing = cover.missing()
             self.goal = list(cover.goal.values())
             self.capped = self.by_time and len(cover.found) > self.max_scenes

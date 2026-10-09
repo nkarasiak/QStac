@@ -330,7 +330,8 @@ class SettingsDialog(QDialog):
     kept them.
     """
 
-    def __init__(self, parent: QWidget | None = None):
+    def __init__(self, parent: QWidget | None = None, page: str = ""):
+        """*page*: the title of the page to open on, else the last one."""
         super().__init__(parent)
         self.setWindowTitle("QStac Settings")
         self.setMinimumSize(560, 400)
@@ -385,6 +386,10 @@ class SettingsDialog(QDialog):
 
         self._load_current()
         self._nav.setCurrentRow(min(settings.settings_page(), self._nav.count() - 1))
+        for item in (
+            self._nav.findItems(page, Qt.MatchFlag.MatchExactly) if page else ()
+        ):
+            self._nav.setCurrentItem(item)
 
     # -----------------------------------------------------------------
     # Page builders
