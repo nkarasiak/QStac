@@ -20,6 +20,7 @@ from .layers import BAKED_INDEX, REMOTE_VRT, _open_raster_layer
 from .pixel_fn import _EXPR_PIXEL_FN_NAME, _PIXEL_FN_NAME, _eval_index, _norm_diff
 from .style import _apply_band_ranges, _apply_index_renderer
 from .vrt import (
+    _add_scl_mask,
     _band_type,
     _build_vrt,
     _finest_grid,
@@ -291,9 +292,13 @@ def _bake_index(
     clips: list[str],
     projs: list[AssetProj | None],
     index_preset: IndexPreset | None = None,
+    mask: str | None = None,
 ) -> str | None:
     """Compute a spectral index from local clips (one per asset) → Float32 tif
     (one band per channel for a colour composite).
+
+    With a *mask* (an SCL clip, ``vrt._add_scl_mask``) clouds are nodata, so
+    they also stay out of the auto range.
 
     Runs in the prefetch worker so the GUI opens a plain local GeoTIFF; the
     remote derived-band VRT is only used once the user pans off the clip.
@@ -304,39 +309,21 @@ def _bake_index(
         stacked = _build_vrt(f"{prefix}.vrt", clips, separate=True)
         if stacked is None:
             return None
+        if mask is not None:
+            _add_scl_mask(stacked, mask)
         src = gdal.Open(stacked)
         bands = [src.GetRasterBand(i + 1) for i in range(len(clips))]
-        arrays = [b.ReadAsArray() for b in bands]
-        scaling = [(p.scale, p.offset) if p else (1.0, 0.0) for p in projs]
+        outs = _index_outs(bands, projs, index_preset)
         stats = None
-        if _is_formula(index_preset):
-            nodatas = [
-                _band_type(p)[1] if p else b.GetNoDataValue()
-                for p, b in zip(projs, bands, strict=True)
-            ]
-            outs = []
-            for expr, fill in _channels(index_preset):
-                out = np.empty(arrays[0].shape, dtype="float32")
-                _eval_index(
-                    expr,
-                    list(index_preset.variables or index_preset.assets),
-                    arrays,
-                    [s for s, _ in scaling],
-                    [o for _, o in scaling],
-                    [None if n is None else float(n) for n in nodatas],
-                    out,
-                    fill,
-                )
-                outs.append(out)
+        if mask is not None:
+            hidden = bands[0].GetMaskBand().ReadAsArray() == 0
+            for out in outs:
+                out[hidden] = _INDEX_NODATA
+        if _is_formula(index_preset) and not index_preset.rgb_ranges:
             valid = outs[0][outs[0] != _INDEX_NODATA]
-            if valid.size and not index_preset.rgb_ranges:
+            if valid.size:
                 lo, hi = (float(v) for v in np.percentile(valid, (2, 98)))
                 stats = _stats(lo, hi if hi > lo else lo + 1e-6)
-        else:
-            out = np.empty(arrays[0].shape, dtype="float32")
-            (sa, oa), (sb, ob) = scaling
-            _norm_diff(arrays[0], arrays[1], out, sa, oa, sb, ob)
-            outs = [out]
         dst = gdal.GetDriverByName("GTiff").Create(
             f"{prefix}.tif",
             src.RasterXSize,
@@ -358,3 +345,37 @@ def _bake_index(
     except Exception as exc:
         log(f"Could not compute the index for {prefix}: {exc}")
         return None
+
+
+def _index_outs(
+    bands: list[gdal.Band],
+    projs: list[AssetProj | None],
+    index_preset: IndexPreset | None,
+) -> list[np.ndarray]:
+    """The Float32 channels of *index_preset* over *bands* (one per asset)."""
+    arrays = [b.ReadAsArray() for b in bands]
+    scaling = [(p.scale, p.offset) if p else (1.0, 0.0) for p in projs]
+    if not _is_formula(index_preset):
+        out = np.empty(arrays[0].shape, dtype="float32")
+        (sa, oa), (sb, ob) = scaling
+        _norm_diff(arrays[0], arrays[1], out, sa, oa, sb, ob)
+        return [out]
+    nodatas = [
+        _band_type(p)[1] if p else b.GetNoDataValue()
+        for p, b in zip(projs, bands, strict=True)
+    ]
+    outs = []
+    for expr, fill in _channels(index_preset):
+        out = np.empty(arrays[0].shape, dtype="float32")
+        _eval_index(
+            expr,
+            list(index_preset.variables or index_preset.assets),
+            arrays,
+            [s for s, _ in scaling],
+            [o for _, o in scaling],
+            [None if n is None else float(n) for n in nodatas],
+            out,
+            fill,
+        )
+        outs.append(out)
+    return outs

@@ -129,6 +129,215 @@ def test_baked_stretch_keeps_dark_pixels() -> None:
             assert list(band[0]) == [0, 1, 1, 255, 255], baked
 
 
+def test_scl_mask_hides_clouds_on_every_path() -> None:
+    """A 20 m SCL masks 10 m bands: remote XML, a clip VRT, the baked RGB."""
+    from qgis.core import QgsRasterLayer
+
+    from qstac.raster.index import _INDEX_NODATA, _bake_index
+    from qstac.raster.layers import MASK_CLIP
+    from qstac.raster.style import _apply_rgb_renderer
+    from qstac.raster.tasks import CogPrefetchTask
+    from qstac.raster.vrt import _add_scl_mask
+    from qstac.stac.collections import IndexPreset
+
+    want = [255, 255, 0, 0, 0, 0]  # vegetation, then cloud (9), shadow (3)
+
+    def mask_of(path: str) -> list[int]:
+        ds = gdal.Open(path)  # held: a band outliving its dataset crashes
+        return list(ds.GetRasterBand(1).GetMaskBand().ReadAsArray()[0])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src = _tif(f"{tmp}/b.tif", np.arange(1, 7, dtype=np.uint16)[None] * 100)
+        scl = _tif(f"{tmp}/scl.tif", np.array([[4, 9, 3]], np.uint8), gdal.GDT_Byte)
+        ds = gdal.Open(scl, gdal.GA_Update)
+        ds.SetGeoTransform([500000, 20, 0, 4000000, 0, -20])
+        ds = None
+
+        xml = _add_scl_mask(_build_vrt("", [src, src, src], separate=True), scl)
+        assert mask_of(xml) == want, mask_of(xml)
+        layer = QgsRasterLayer(xml, "m", "gdal")
+        _apply_rgb_renderer(layer, stretch_baked=True)
+        assert layer.renderer().alphaBand() == 4, layer.bandCount()
+
+        clip = _build_vrt(f"{tmp}/clip.vrt", [src])
+        assert _add_scl_mask(clip, scl) == clip  # rewritten in place
+        assert mask_of(clip) == want, mask_of(clip)
+
+        item = SimpleNamespace(id="X", assets={"a": "", "SCL": ""}, asset_proj={})
+        task = CogPrefetchTask([item], ["a", "b"], bake_stretch=(0, 1000))
+        assert task.mask_of == {}, "on only when asked"
+        task = CogPrefetchTask(
+            [item], ["a", "b"], bake_stretch=(0, 1000), hide_clouds=True
+        )
+        assert task.mask_of == {"X": "SCL"}, task.mask_of
+        paths = {"a": src, "b": src, MASK_CLIP: scl}
+        baked = task._bake_rgb("X", paths, "sharp")
+        assert baked is not None and mask_of(baked) == want, baked
+
+        # An index: clouds are nodata, out of its auto range too.
+        nir = _tif(f"{tmp}/nir.tif", np.array([[3000, 3000, 9000, 1, 1, 1]], np.uint16))
+        ndvi = IndexPreset("NDVI", ("nir", "red"), "ndvi", "(nir - red) / (nir + red)")
+        out = _bake_index(f"{tmp}/ndvi", [nir, src], [None, None], ndvi, scl)
+        ds = gdal.Open(out)
+        got = ds.GetRasterBand(1).ReadAsArray()[0]
+        assert list(got[2:]) == [_INDEX_NODATA] * 4, got
+        assert float(ds.GetRasterBand(1).GetMetadataItem("STATISTICS_MINIMUM")) > 0.8
+
+
+def test_mosaic_shows_the_older_scene_under_a_cloud() -> None:
+    """A cloud of the newest scene is 0, nodata: the one under it shows."""
+    from qstac.raster.clip import _burn_scl
+    from qstac.raster.layers import _local_mosaics, scene_mask
+
+    assert scene_mask({"B04": "r", "scl": "s"}, {}) == ("s", None)
+    assert scene_mask({"B04": "r"}, {}) is None
+    with tempfile.TemporaryDirectory() as tmp:
+        byte = gdal.GDT_Byte
+        old = _tif(f"{tmp}/old.tif", np.full((1, 4), 50, np.uint8), byte)
+        new = _tif(f"{tmp}/new.tif", np.full((1, 4), 200, np.uint8), byte)
+        scl = _tif(f"{tmp}/scl.tif", np.array([[4, 9, 5, 3]], np.uint8), byte)
+        clear = _burn_scl(new, scl, f"{tmp}/clear.tif")
+        assert clear is not None
+        clips = [("old", 32631, old), ("new", 32631, clear)]  # oldest first
+        ((mosaic, _, _),) = _local_mosaics(clips, 0, "t")
+        got = gdal.Open(mosaic).ReadAsArray()
+        assert list(got[0]) == [200, 50, 200, 50], got
+
+
+def test_composite_takes_each_pixels_median_of_the_clear_scenes() -> None:
+    """0 is nodata (a hidden cloud); scene c covers the right half only.
+    GDAL's own pixel function and the NumPy fallback agree."""
+    import qstac.raster.vrt as vrt_mod
+    from qstac.raster.cog import configure_gdal_for_cog
+    from qstac.raster.layers import _local_mosaics
+
+    configure_gdal_for_cog()  # the fallback is a trusted Python pixel function
+    byte = gdal.GDT_Byte
+    with tempfile.TemporaryDirectory() as tmp:
+        a = _tif(f"{tmp}/a.tif", np.array([[10, 0, 30, 40]], np.uint8), byte)
+        b = _tif(f"{tmp}/b.tif", np.array([[20, 50, 0, 60]], np.uint8), byte)
+        c = _tif(f"{tmp}/c.tif", np.array([[90, 70]], np.uint8), byte)
+        ds = gdal.Open(c, gdal.GA_Update)
+        ds.SetGeoTransform([500020, 10, 0, 4000000, 0, -10])
+        ds = None
+        for src in (a, b, c):
+            ds = gdal.Open(src, gdal.GA_Update)
+            ds.GetRasterBand(1).SetNoDataValue(0)
+            ds = None
+        clips = [("a", 32631, a), ("b", 32631, b), ("c", 32631, c)]
+
+        def composite(how: str) -> list[int]:
+            ((path, _, _),) = _local_mosaics(clips, 0, how)
+            vrt_mod._composite(path, how)
+            return list(gdal.Open(path).ReadAsArray()[0])
+
+        assert composite("median") == [15, 50, 60, 60], composite("median")
+        assert composite("mean") == [15, 50, 60, 57], composite("mean")
+        # The median of the newest 3: an old outlier (200) drops out, unless
+        # a newer view is nodata (px 1: 200, 30, 40).
+        recent = []
+        for n, values in enumerate(([200, 200], [10, 0], [20, 30], [30, 40])):
+            src = _tif(f"{tmp}/r{n}.tif", np.array([values], np.uint8), byte)
+            ds = gdal.Open(src, gdal.GA_Update)
+            ds.GetRasterBand(1).SetNoDataValue(0)
+            ds = None
+            recent.append((f"r{n}", 32631, src))  # oldest first
+        ((path, _, _),) = _local_mosaics(recent, 0, "recent")
+        vrt_mod._composite(path, "recent")
+        got = list(gdal.Open(path).ReadAsArray()[0])
+        assert got == [20, 40], got
+
+        # The build computes it once, into a GeoTIFF the layer draws.
+        from qstac.raster.tasks import MosaicBuildTask
+
+        build = MosaicBuildTask([], SimpleNamespace(), composite="median")
+        build._sharp = _local_mosaics(clips, 0, "baked")
+        build._bake_composite()
+        ((tif, _, _),) = build._sharp
+        assert tif.endswith("_median.tif"), tif
+        assert list(gdal.Open(tif).ReadAsArray()[0]) == [15, 50, 60, 60]
+
+        has = vrt_mod._has_pixel_fn
+        vrt_mod._has_pixel_fn = lambda _name: False  # an older GDAL
+        try:
+            assert composite("median") == [15, 50, 60, 60], composite("median")
+            assert composite("mean") == [15, 50, 60, 57], composite("mean")
+        finally:
+            vrt_mod._has_pixel_fn = has
+
+
+def test_mosaic_search_reads_on_until_each_pixel_has_data() -> None:
+    """A clip's 0 (a hidden cloud) leaves its pixels wanting an older scene;
+    a pixel no footprint covers (the sea), or a speck SCL fails on every
+    date (snow taken for cloud), never holds the search."""
+    from qstac.raster.clip import ClearViews
+
+    def clip(
+        path: str, cloud_from: int = 8, speck: bool = False, line: bool = False
+    ) -> str:
+        """An 8 x 8 clip, lon 0..8, lat 0..8: clear west of *cloud_from*."""
+        values = np.full((8, 8), 9, np.uint8)
+        values[:, cloud_from:] = 0
+        if speck:
+            values[2, 2] = 0
+        if line:  # a wedge between two orbits, one cell wide
+            values[:, 4] = 0
+        ds = gdal.GetDriverByName("GTiff").Create(path, 8, 8, 1, gdal.GDT_Byte)
+        ds.SetGeoTransform([0, 1, 0, 8, 0, -1])
+        ds.SetProjection("EPSG:4326")
+        ds.GetRasterBand(1).WriteArray(values)
+        ds = None
+        return path
+
+    def box(x0: float, x1: float) -> dict:
+        ring = [[x0, 0], [x1, 0], [x1, 8], [x0, 8], [x0, 0]]
+        return {"type": "Polygon", "coordinates": [ring]}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        views = ClearViews((0, 0, 8, 8), width=8)
+        views.add(clip(f"{tmp}/new.tif", cloud_from=4), box(0, 8))  # cloud east
+        assert not views.enough()
+        assert views.missing() == 0.5, views.missing()
+        assert views.wants(box(4, 8)), "an older scene of the cloudy east"
+        assert not views.wants(box(0, 4)), "the west is clear: skipped"
+        assert not views.wants(box(9, 10)), "off the view"
+        views.add(clip(f"{tmp}/old.tif", speck=True), box(0, 8))
+        assert views.enough() and views.missing() == 0
+        assert not views.wants(box(0, 8))
+        # A speck masked on every date: no hole, the search not held.
+        specks = ClearViews((0, 0, 8, 8), width=8)
+        specks.add(clip(f"{tmp}/s1.tif", speck=True), box(0, 8))
+        specks.add(clip(f"{tmp}/s2.tif", speck=True), box(0, 8))
+        assert specks.enough() and specks.missing() == 0
+        # Filling from older scenes: a one-cell wedge is a hole, wanted.
+        wedge = ClearViews((0, 0, 8, 8), width=8, tolerance=0)
+        wedge.add(clip(f"{tmp}/w.tif", line=True), box(0, 8))
+        assert not wedge.enough() and wedge.wants(box(3.5, 5))
+        assert not wedge.wants(box(0, 3)), "west of it: nothing to fill"
+        # Clouds not hidden, a median: three views of each pixel.
+        three = ClearViews((0, 0, 8, 8), need=3, width=8)
+        for n in range(3):
+            assert not three.enough()
+            three.add(clip(f"{tmp}/{n}.tif"), box(0, 8))
+        assert three.enough()
+        # Land to lon 4, sea east of it: the west alone needs data.
+        coast = ClearViews((0, 0, 8, 8), width=8)
+        coast.add(clip(f"{tmp}/coast.tif", cloud_from=4), box(0, 4))
+        assert coast.enough()
+        # A tile east of it with no scene under the cloud filter: a hole too.
+        coast.expect(box(4, 8))
+        assert coast.missing() == 0.5, coast.missing()
+        # Measured on the finished mosaic, by its build: the west clear, an
+        # empty tile east of it.
+        from qstac.raster.tasks import MosaicBuildTask
+
+        build = MosaicBuildTask([], SimpleNamespace(), view=((0, 0, 8, 8), (8, 8)))
+        build.goal = [box(0, 8)]
+        build._sharp = [(clip(f"{tmp}/mosaic.tif", cloud_from=4), 4326, [])]
+        build._measure()
+        assert build.missing_share == 0.5, build.missing_share
+
+
 def test_inline_vrt_is_a_datasource() -> None:
     """``_build_vrt("")`` hands back XML GDAL opens, with scale/offset cleared."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -549,13 +758,15 @@ def test_tile_cover_fills_slivers_with_older_scenes() -> None:
     Each tile is the unit square; a scene is (id, tile, day, x0, y0, x1, y1).
     """
 
-    def scene(fid: str, tile: str, day: int, x0, y0, x1, y1):
+    def scene(fid: str, tile: str, day: int, x0, y0, x1, y1, assets=None, cloud=None):
         ring = [[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]]
         return SimpleNamespace(
             id=fid,
             datetime_str=f"2026-09-{day:02d} 10:56",
             geometry={"type": "Polygon", "coordinates": [ring]},
             facets={"s2:mgrs_tile": tile},
+            assets=assets or {},
+            cloud_cover=cloud,
         )
 
     # How far each tile's scenes reach: 31TDL all of it, 31TEL its west half.
@@ -580,6 +791,35 @@ def test_tile_cover_fills_slivers_with_older_scenes() -> None:
     assert cover.missing() == []
     # Oldest first: a mosaic paints the newest on top.
     assert [i.id for i in cover.scenes()] == ["deeper", "half", "south", "north"]
+
+    # Clouds hidden: scenes of the dates with an SCL, covered or not, until a
+    # pixel is under 2 % likely cloudy in all (50 % x 50 %: not yet); older
+    # than the dates, only where nothing shows, as before.
+    scl = {"SCL": "s"}
+    keep = TileCover([scene("r", "31TDL", 28, 0, 0, 1, 1)], keep_since="2026-09-20")
+    keep.add(
+        [
+            scene("new", "31TDL", 25, 0, 0, 1, 1, scl, 50),
+            scene("under", "31TDL", 23, 0, 0, 1, 1, scl, 50),  # through clouds
+            scene("no-scl", "31TDL", 22, 0, 0, 1, 1, cloud=10),  # nothing to hide
+            scene("before", "31TDL", 10, 0, 0, 1, 1, scl, 0),  # before the dates
+        ]
+    )
+    assert [i.id for i in keep.scenes()] == ["under", "new"], keep.scenes()
+    assert keep.cloudy() == ["tile 31TDL"], "25 % left: older dates wanted"
+    # 10 % x 10 % = 1 %: clear, the search stops taking (and reading) more.
+    clear = TileCover([scene("r", "31TDL", 28, 0, 0, 1, 1)], keep_since="2026-09-20")
+    clear.add([scene(f"s{d}", "31TDL", d, 0, 0, 1, 1, scl, 10) for d in (25, 23, 21)])
+    assert [i.id for i in clear.scenes()] == ["s23", "s25"], clear.scenes()
+    assert clear.cloudy() == []
+    # A median or mean: any scene of the dates, SCL or not, three at least.
+    every = TileCover(
+        [scene("r", "31TDL", 28, 0, 0, 1, 1)], keep_since="2026-09-20", keep_any=True
+    )
+    every.add(
+        [scene(f"s{d}", "31TDL", d, 0, 0, 1, 1, cloud=0) for d in (27, 25, 23, 21)]
+    )
+    assert [i.id for i in every.scenes()] == ["s23", "s25", "s27"], every.scenes()
 
     # Without filling: each tile's newest alone, slivers and all.
     alone = TileCover([], fill=False)

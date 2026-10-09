@@ -26,8 +26,8 @@ one in 1900. The `start_on` setting (Settings > Catalogs, *Start on*) set to
 The date buttons under the dates are the `date_buttons` setting, in its order
 (Settings > Search, a table: `settings_dialog._DatePresetEditor`): a number of
 days ("last N days", labelled 1w, 1m, 1y, 10d by `settings.preset_label()`),
-`this_year`, `last_year` and `all`, default "7, 30, this_year, last_year,
-all". Any can be dropped or moved; they are rebuilt when the setting changes
+`this_year`, `last_year` and `all`, default "7, 30, 90, this_year,
+last_year, all" (90: "3m", a composite's few clear views of each pixel). Any can be dropped or moved; they are rebuilt when the setting changes
 (`_fill_date_presets()`).
 
 First opening: the dock opens at QGIS start only if it was left open
@@ -105,7 +105,25 @@ shows) plays one animation of the squares
 (Settings > Mosaic), *sweep* (a light crosses them diagonally twice, 2.1 s, the default),
 *build* (they land one by one, centre first, 2 s), *pulse* (they breathe twice, 2.4 s) or
 *off*. Not at dock start (it restores a collection), not while a mosaic runs. A click builds the default: each tile's newest scene of the
-search dates, in the collection's default look (`_mosaic_options(picked=False)`).
+search dates, in the collection's default look (`_mosaic_options(picked=False)`);
+where scenes overlap, their median by default (Settings > Mosaic: median,
+mean, or the newest on top), over the scenes of the dates, newest first,
+until each tile is likely clear; newest with *Hide clouds* on reads older
+Sentinel-2 ones the same way, to fill its clouds (`docs/loading.md`). The menu's first choice is named after it
+(`_COMPOSITE_TEXT`). When the dates leave over 1 % of the view with no
+clear view (measured on the finished mosaic at 256 px by its build,
+`MosaicBuildTask(goal=)._measure()`, 3 s for France, every tile of the area
+counted: `TileSearchTask.goal`, `ClearViews.expect()`, so a tile no scene of
+the dates passed the cloud filter for is a hole too; the search's own count
+comes before the build clipped every scene: 31 % said, 3 % left), the message
+bar says how much, with *Fill from older scenes* (`_note_missing()`): the
+same mosaic again, `_tile_mosaic(older=True)` (a new mosaic removes the
+last one's notes: `_mosaic_note()`, 6 s, the fill's until closed), the dates read first as
+before, then a year back, older scenes kept (`TileSearchTask(keep_older=)`)
+only where a pixel has no clear view yet, until none lacks one. France, 30
+days: 3 % missing (16 tiles with no scene); filled, 991 scenes back to 28
+July in 23 s, none missing (2485 in 47 s when older scenes also waited for
+three views).
 Right-click (`_show_mosaic_menu()`) builds another, its picks kept for the
 session, never saved (two saved settings for it once made a click build one
 mosaic per date unasked). On top, set in place while the menu stays open

@@ -31,6 +31,80 @@ corners never paint over a neighbour. Never a signed or float file: a DEM's
 0 (Cop-DEM, ALOS) is sea level; a mosaic of those gets a nodata of the VRT
 alone (`vrt._GAP`, -32768), so where no tile is (open sea) is transparent,
 not 0, black, and the tiles' own 0 stays a value.
+Clouds: with *Hide clouds* on (Display settings, the default), a scene
+with a Sentinel-2 `SCL` (or `scl`) asset gets a dataset mask from it
+(`vrt._add_scl_mask()`): a `<MaskBand>` reading the SCL through a `<LUT>`
+that zeroes no data, saturated, cloud shadow, cloud medium/high and cirrus
+(`vrt.SCL_HIDDEN`), placed by geotransform so GDAL resamples the 20 m
+classes onto the bands' grid. `CogPrefetchTask` clips the SCL beside the
+bands (`mask_of`) and masks every source it sends: the TCI clip VRT in place
+(the SCL clip rides along as `MASK_CLIP`, deleted with it), the baked RGB
+GeoTIFF (an internal mask), a baked index (clouds made nodata, so they stay
+out of its auto range) and the remote VRT. QGIS shows the mask as an alpha
+band, which every renderer and a source swap's kept one read
+(`style._mask_alpha()`). A mosaic VRT paints its sources' values and never
+reads their masks, so a mosaic's scene clips have their clouds burned to 0,
+nodata (`layers.scene_clip(scl=)`, `layers.scene_mask()`): read from COGs,
+the SCL is clipped beside the band (`clip._burn_scl()`); on Planetary
+Computer the render request does it, `expression=where(SCL…, 0, visual_bN)`
+(`stac.auth.pc_render(hide_clouds=)`, same speed). The tile search asks
+for the SCL too (its fields extension returns only the assets named), and
+keeps scenes of the dates that have one under each tile's newest
+(`TileSearchTask(keep_period=)`, `TileCover(keep_since=)`), so the older
+scenes fill the clouds' holes, until each pixel of the view has data:
+the search counts, on the clips it makes of its picks (cloud 0), how many
+show each pixel clear (`clip.ClearViews`, 256 px wide, a pixel no picked
+footprint covers left out), waits for a window's clips and stops reading
+older dates once `_VIEW_CLEAR` (99 %) of them are (`TileSearchTask(enough=)`).
+A scene of the dates is taken only where it shows pixels still wanting
+views (`ClearViews.wants()` on its footprint, `TileCover(wants=)`): a tile
+done takes no more while the rest of a wide view fills. 3.6° x 2° of
+southern France, 3 months, three views: 99 scenes in 7 s, where taking
+every scene until the whole view was done took 250 in 16 s. Pixels still
+wanting views count in holes only (`clip._holes()`: a cell with fewer than
+two others around it is a speck, twice): SCL takes bright snow for cloud
+and steep shadows for a cloud's in specks, the same on every date, 1.3 % of
+a Tibetan view in single pixels, 0.1 % filtered. A 3 x 3 opening did that
+too, but also took a France view's orbit wedges (thinner than 3 cells, 16
+km) for specks. A scene is wanted if its footprint touches any hole (a
+wedge is far under 1 % of a tile). The search hands the tiles' reach to the
+count before reading (`TileSearchTask(expect=)`), so a gap, a pixel no scene
+taken covers (a tile with none under the cloud filter, a wedge), is a hole
+from the start: `ClearViews.gaps`, 0 when filling from older scenes, while
+pixels cloudy in every scene may stay under 1 % (strict on both, a France
+fill chased those through a year: 106 s; now 52 s, back to 20 June, 0.2 %
+of the view left).
+eo:cloud_cover could not say: it is the whole 110 km tile's, and the edge
+of an orbit is half nodata. Near London over 2026 the estimate stopped at
+6 scenes, half the view empty; counted, 10 scenes back to 25 August, 2.4 s
+of search, 0.4 % empty. A mosaic with no clips while searching (a band
+composite, an index) estimates instead: under `_CLOUD_LEFT` (2 %) likely
+cloudy in every scene, their eo:cloud_cover multiplied
+(`TileCover.cloudy()`).
+Composite (`mosaic_composite`, median by default): a local mosaic's VRT
+(BuildVRT's, each source's nodata tagged) gets derived bands
+(`vrt._composite()`, in `MosaicBuildTask._show()`): GDAL's own `median` /
+`mean` pixel function, in C, the nodata sources left out; a GDAL without it
+(`_has_pixel_fn()`, a probe) gets `pixel_fn.composite_pixel_fn`, NumPy. Any
+scene of the dates is kept (`keep_any`), SCL or not, until each pixel has
+three clear views (`ClearViews(need=3)`, `_COMPOSITE_VIEWS` when
+estimated): a median outvotes what the cloud mask misses. The default,
+`recent`, is the median of each pixel's newest 3 (`composite_pixel_fn`,
+NumPy: GDAL has none; the sources come oldest first): recent, and clean.
+It fills 3 slots per pixel from the newest source (`_newest_median()`);
+the NumPy median and mean go 256 px at a time, each block's sources with
+no data there skipped (`_COMPOSITE_BLOCK`): 68 scenes stacked whole were
+470 MB a band and a 6-7 s redraw; now 1 s, GDAL's own median 0.6 s.
+Drawn from the VRT, though, every redraw ran it over every scene of a zone
+(France: 200-900), seconds each, cut off by the next update of the build
+and left half drawn on the map. So the build shows the newest on top while
+the scenes land, then computes the composite once into a GeoTIFF per CRS
+(`MosaicBuildTask._bake_composite()`, France 3 s in all) and repoints the
+layers at it: 1-3 ms a redraw, and `_measure()` reads it in 0.07 s.
+Near London over 3 months: 25 scenes, 10.5 s of search; stopping at one
+view, 10 scenes in 2 s, but 38 % of the pixels had three, the rest hazy. A full read 0.3 s for 18 scenes, newest 0.08 s. Not for a time stack, a timeless collection (a DEM's
+or a land cover's tiles) or a remote mosaic (a band composite). Not on a time stack's or a band composite's remote mosaic, nor an
+unbaked multi-band clip (a stretch other than fixed).
 A single-band COG with a colour table (ESA WorldCover, IO LULC) renders
 paletted (`style._apply_singleband_renderer()`); `stamp_layer()` then keeps
 only the classes of the scene's one asset with STAC `classification:classes`

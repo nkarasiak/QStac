@@ -117,6 +117,9 @@ class _EveryScene:
     def missing(self) -> list[str]:
         return []
 
+    def cloudy(self) -> list[str]:
+        return []
+
     def scenes(self) -> list[StacItemResult]:
         """The newest *max_scenes*, oldest first."""
         ordered = sorted(self.found.values(), key=lambda i: i.datetime_str)
@@ -161,6 +164,12 @@ class TileSearchTask(QgsTask):
         http_timeout: int,
         reach_days: int = 10,
         by_time: bool = False,
+        keep_period: bool = False,
+        keep_any: bool = False,
+        enough: Callable[[], bool] | None = None,
+        wants: Callable[[StacItemResult], bool] | None = None,
+        keep_older: bool = False,
+        expect: Callable[[list[QgsGeometry]], object] | None = None,
         area: QgsGeometry | None = None,
         lookback_days: int = 0,
         max_scenes: int = 1000,
@@ -178,6 +187,22 @@ class TileSearchTask(QgsTask):
         self.http_timeout = http_timeout
         self.reach_days = reach_days
         self.by_time = by_time  # every scene of the dates (_EveryScene)
+        # Scenes of the dates under each tile's newest until it is likely
+        # clear (TileCover(keep_since=), cloudy()): their clouds hidden or
+        # composited away, the older scenes fill the holes.
+        self.keep_period = keep_period
+        self.keep_any = keep_any  # any scene of the dates: a composite's
+        # Whether the picks' clips show every pixel clear enough
+        # (raster.clip.ClearViews): then no older date is read. Without
+        # it, each scene's eo:cloud_cover says (TileCover.cloudy()).
+        self.enough = enough
+        self.wants = wants  # whether a scene shows pixels not clear enough yet
+        # The look back's scenes kept too, not only the dates': the dates
+        # left pixels with no clear view (dock: Fill from older scenes).
+        self.keep_older = keep_older
+        # Handed each tile's reach once known, before any scene is read:
+        # what the clear-pixel count must see filled (ClearViews.expect).
+        self.expect = expect
         self.lookback_days = lookback_days
         # By time: the newest this many scenes, as "Load all" does its
         # results (a mosaic layer's scenes are read at build).
@@ -188,6 +213,9 @@ class TileSearchTask(QgsTask):
         self.day_cover: dict[str, float] = {}  # by time: geo.day_cover()
         self.scenes: list[StacItemResult] = []
         self.missing: list[str] = []  # tiles never covered
+        # Each tile's reach in the search area (its recent scenes at any
+        # cloud cover): what a mosaic should show, picked scenes or not.
+        self.goal: list[QgsGeometry] = []
         # Run (in threads) on each scene the cover takes, as it takes it: a
         # pick is never undone, so the build's reads can start while the
         # search still runs (the mosaic's first image, 1.5 s sooner).
@@ -260,6 +288,38 @@ class TileSearchTask(QgsTask):
             self._picks.append(pool.submit(self.on_pick, item))
         self._handed = len(cover.picked)
 
+    def _cover(self, reach: list, deepest: datetime.date) -> TileCover | _EveryScene:
+        """What takes the scenes as they are read: every one by time, else a
+        :class:`TileCover` of the tiles *reach* (futures of recent scenes at
+        any cloud cover) shows, those handed to *expect* first."""
+        if self.by_time:
+            return _EveryScene(self.max_scenes)
+        keep_since = str(deepest) if self.keep_older else self.date_from
+        cover = TileCover(
+            [i for f in reach for i in f.result()],
+            _FILL_GAPS,
+            within=search_area(self.bbox, self.area),
+            keep_since=keep_since if self.keep_period else "",
+            keep_any=self.keep_any,
+            wants=self.wants,
+        )
+        if self.expect is not None and cover.goal:
+            self.expect(list(cover.goal.values()))
+        return cover
+
+    def _clear(self, cover: TileCover | _EveryScene, before: datetime.date) -> bool:
+        """Whether the scenes taken leave no cloud to fill under the dates',
+        the windows read back to *before*. Filling from older scenes, the
+        dates are read first: their scenes are the mosaic's."""
+        if not self.keep_period:
+            return True
+        if self.keep_older and before >= datetime.date.fromisoformat(self.date_from):
+            return False
+        if self.enough is None:
+            return not cover.cloudy()
+        wait(self._picks)  # their clips counted: what the map will show
+        return self.enough()
+
     def _end_picks(self, pool: ThreadPoolExecutor) -> None:
         """Give the picks' work until _PICKS_DEADLINE_S: the build reads it next."""
         left = self._started + _PICKS_DEADLINE_S - time.monotonic()
@@ -318,15 +378,7 @@ class TileSearchTask(QgsTask):
             headers = request_headers(self.catalog) or None
             reach = [pool.submit(self._window, e, None, headers) for e in reach_ends]
             window = [pool.submit(self._window, e, self.cloud, headers) for e in ends]
-            cover = (
-                _EveryScene(self.max_scenes)
-                if self.by_time
-                else TileCover(
-                    [i for f in reach for i in f.result()],
-                    _FILL_GAPS,
-                    within=search_area(self.bbox, self.area),
-                )
-            )
+            cover = self._cover(reach, deepest)
             for n, future in enumerate(window):
                 if self.isCanceled():
                     return False
@@ -334,11 +386,15 @@ class TileSearchTask(QgsTask):
                 self._hand_picks(cover, picks)
                 # No tile seen in the reach (none published lately): no goal
                 # to meet, so every window is read rather than none.
-                if cover.goal and not cover.missing():
+                # Covered first: _clear waits for the window's clips, which a
+                # tile still uncovered cannot spare (France: 5 s became 27).
+                before = ends[n] - step
+                if cover.goal and not cover.missing() and self._clear(cover, before):
                     break
                 self.setProgress(100 * (n + 1) / len(window))
             self.scenes = cover.scenes()
             self.missing = cover.missing()
+            self.goal = list(cover.goal.values())
             self.capped = self.by_time and len(cover.found) > self.max_scenes
             if self.by_time:  # here: it grows with the scenes
                 self.day_cover = day_cover(self.scenes, self.bbox, self.area)

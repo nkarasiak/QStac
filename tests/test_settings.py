@@ -37,7 +37,7 @@ def test_date_presets() -> None:
     expected = ["1w", "2w", "1m", "2m", "1y", "10d", "2026", "2025", "All"]
     assert labels == expected, labels
     default = settings.date_presets()
-    assert default == [7, 30, "this_year", "last_year", "all"], default
+    assert default == [7, 30, 90, "this_year", "last_year", "all"], default
 
 
 def test_dialog_round_trip() -> None:
@@ -68,6 +68,8 @@ def test_dialog_round_trip() -> None:
     # Saved values come back in a new dialog.
     most.setValue(1000)
     editor = dlg._fields["date_buttons"][0]
+    editor._table.selectRow(2)
+    editor._remove()  # 90 days (3m)
     editor._add()  # a 90-day button at the end
     editor._table.selectRow(0)
     editor._remove()  # 7 days

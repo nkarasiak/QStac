@@ -12,6 +12,7 @@ from qgis.core import (
     QgsPalettedRasterRenderer,
     QgsRasterLayer,
     QgsRasterMinMaxOrigin,
+    QgsRasterRenderer,
     QgsRasterShader,
     QgsSingleBandGrayRenderer,
     QgsSingleBandPseudoColorRenderer,
@@ -94,6 +95,15 @@ def _apply_fixed_stretch(
     _set_band_ranges(layer, renderer, [(vmin, vmax)] * 3)
 
 
+def _mask_alpha(layer: QgsRasterLayer, renderer: QgsRasterRenderer) -> None:
+    """Read *layer*'s dataset mask (the SCL cloud mask, ``vrt._add_scl_mask``),
+    which QGIS shows as one more band, an alpha one; none, no alpha band."""
+    last = layer.bandCount()
+    alpha = Qgis.RasterColorInterpretation.AlphaBand
+    masked = last > 1 and layer.dataProvider().colorInterpretation(last) == alpha
+    renderer.setAlphaBand(last if masked else -1)
+
+
 def _set_band_ranges(
     layer: QgsRasterLayer,
     renderer: QgsMultiBandColorRenderer,
@@ -115,6 +125,7 @@ def _set_band_ranges(
         ce.setMinimumValue(vmin)
         ce.setMaximumValue(vmax)
         setter(ce)
+    _mask_alpha(layer, renderer)
     layer.setRenderer(renderer)
 
 
@@ -162,6 +173,7 @@ def _apply_rgb_renderer(
     4. Settings stretch_method (fixed / cumulative_cut / min_max)
     """
     renderer = QgsMultiBandColorRenderer(layer.dataProvider(), 1, 2, 3)
+    _mask_alpha(layer, renderer)
 
     if stretch_baked:
         layer.setRenderer(renderer)
@@ -273,4 +285,5 @@ def _apply_index_renderer(
     renderer = QgsSingleBandPseudoColorRenderer(layer.dataProvider(), 1, shader)
     renderer.setClassificationMin(lo)
     renderer.setClassificationMax(hi)
+    _mask_alpha(layer, renderer)
     layer.setRenderer(renderer)

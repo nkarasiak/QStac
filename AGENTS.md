@@ -115,7 +115,7 @@ docs/                    One file per area, see "Where to read" above
 stac:    net, items, collections (leaves) ← detect;  collections ← catalogs ← auth
          catalogs, items, net ← search ← search_task (+ auth)
 raster:  pixel_fn, vrt (leaves) ← cog ← clip, style ← layers ← index ← tasks
-         (cog imports stac/items for s3_to_https)
+         (cog imports stac/items for s3_to_https, vrt stac/collections for SCL)
 ui:      theme ← constants, styles ← widgets, collection_combo, thumbnails ← loading ← index_dialog ← dock
          area_tool (leaf) ← dock
 geo.py, log.py   leaves (qgis.core only); raster/ and ui/ log, stac/ never does

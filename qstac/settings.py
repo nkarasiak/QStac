@@ -44,15 +44,22 @@ DEFAULTS: dict[str, object] = {
     "min_overlap_pct": 1,
     # The dock's date buttons, in order: a number is "last N days", then
     # "this_year", "last_year" and "all" (parse_date_presets()).
-    "date_buttons": "7, 30, this_year, last_year, all",
+    "date_buttons": "7, 30, 90, this_year, last_year, all",
     # Rendering
     # Prefer the provider-rendered true-color asset (Sentinel-2 TCI) for
     # default loads: one 8-bit COG instead of a 3-band 16-bit VRT.
     "use_visual_asset": True,
+    # Hide the clouds Sentinel-2's scene classification (SCL) marks, on a
+    # scene opened as an image (raster.vrt._add_scl_mask).
+    "hide_clouds": True,
     "stretch_method": "fixed",  # "fixed", "cumulative_cut", "min_max"
     # A mosaic per date keeps the newest this many scenes of its dates; one
     # with no tile grid (a DEM) reads at most this many to cover the area.
     "mosaic_max_scenes": 500,
+    # Where a mosaic's scenes overlap, each pixel is the median of its newest
+    # 3 clear views ("recent"), of all of them ("median"), their "mean", or
+    # the "newest" scene's.
+    "mosaic_composite": "recent",
     # Played by its 9 squares when a collection that mosaics well is picked:
     # "sweep", "build", "pulse" (widgets.MosaicButton.ANIMATIONS) or "off".
     "mosaic_animation": "sweep",
@@ -396,8 +403,16 @@ def use_visual_asset() -> bool:
     return bool(_get("use_visual_asset", bool))
 
 
+def hide_clouds() -> bool:
+    return bool(_get("hide_clouds", bool))
+
+
 def mosaic_max_scenes() -> int:
     return int(_get("mosaic_max_scenes", int))
+
+
+def mosaic_composite() -> str:
+    return str(_get("mosaic_composite", str))
 
 
 def mosaic_animation() -> str:

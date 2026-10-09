@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
+import json
 import math
 import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from osgeo import gdal, osr
+import numpy as np
+from osgeo import gdal, ogr, osr
 
 from .. import settings
 from ..log import log
-from .vrt import _build_vrt, _stac_nodata
+from .vrt import _add_scl_mask, _build_vrt, _stac_nodata
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -275,6 +278,177 @@ def _materialize_window_tiles(
         if cancel is None or not cancel():
             log(f"Could not clip {url}: {exc}")
         return None
+
+
+def _burn_scl(src: str, scl: str, out: str) -> str | None:
+    """*src* as a GeoTIFF at *out*, the clouds the SCL raster *scl* marks set
+    to 0, its nodata: a mosaic VRT paints its sources' values and never reads
+    their masks, so a masked cloud would still cover the scene under it."""
+    masked = _add_scl_mask(_build_vrt("", [src]) or "", scl)
+    ds = gdal.Open(masked) if masked else None
+    if ds is None:
+        return None
+    hidden = ds.GetRasterBand(1).GetMaskBand().ReadAsArray() == 0
+    dst = gdal.GetDriverByName("GTiff").Create(
+        out,
+        ds.RasterXSize,
+        ds.RasterYSize,
+        ds.RasterCount,
+        ds.GetRasterBand(1).DataType,
+        CLIP_CREATION_OPTIONS,
+    )
+    dst.SetGeoTransform(ds.GetGeoTransform())
+    dst.SetProjection(ds.GetProjection())
+    for i in range(1, ds.RasterCount + 1):
+        values = ds.GetRasterBand(i).ReadAsArray()
+        values[hidden] = 0
+        band = dst.GetRasterBand(i)
+        band.SetNoDataValue(0)
+        band.WriteArray(values)
+    dst = None  # flush + close
+    return out
+
+
+# A tile mosaic's search stops once this share of the view's pixels, of
+# those a picked scene covers, is clear in enough scenes (ClearViews).
+_VIEW_CLEAR = 0.99
+
+
+class ClearViews:
+    """Per pixel of a view (WGS84 bounds), how many scene clips show it
+    clear, at a coarse *width*: a tile mosaic's search reads older dates
+    until each pixel a scene covers is seen clear *need* times. A clip's 0
+    is nodata or a hidden cloud; a scene's footprint says which pixels it
+    covers, so the open sea or a cloud all year cannot hold the search.
+    Safe from the search's pick threads."""
+
+    def __init__(
+        self,
+        bounds: tuple[float, float, float, float],
+        need: int = 1,
+        width: int = 256,
+        tolerance: float = 1 - _VIEW_CLEAR,
+    ) -> None:
+        x0, y0, x1, y1 = bounds
+        self.bounds = bounds
+        self.need = need
+        # The share of the view a scene covers but shows cloudy every time
+        # the search may stop at; *gaps*: the share no scene taken covers at
+        # all (a tile with none, an orbit's thin wedge), 0 for Fill from
+        # older scenes: some older scene covers them. Strict on both, a
+        # France fill chased clouds of every date for a year (106 s).
+        self.tolerance = tolerance
+        self.gaps = tolerance
+        self.size = (width, max(1, round(width * (y1 - y0) / max(x1 - x0, 1e-9))))
+        w, h = self.size
+        self.gt = (x0, (x1 - x0) / w, 0.0, y1, 0.0, -(y1 - y0) / h)
+        self.clear = np.zeros((h, w), np.uint16)
+        self.covered = np.zeros((h, w), bool)
+        self.taken = np.zeros((h, w), bool)  # the footprints of the scenes added
+        self._lock = threading.Lock()
+
+    def add(self, clip: str, footprint: dict | None) -> None:
+        """Count *clip*'s clear pixels and its scene's *footprint* (GeoJSON)."""
+        w, h = self.size
+        try:
+            ds = gdal.Warp(
+                "",
+                clip,
+                format="MEM",
+                dstSRS="EPSG:4326",
+                outputBounds=self.bounds,
+                width=w,
+                height=h,
+                srcNodata=0,  # else Warp turns a hidden cloud's 0 into 1
+                dstNodata=0,
+            )
+            clear = ds.ReadAsArray().reshape(-1, h, w).max(axis=0) > 0
+            shape = self._rasterize(footprint) if footprint else clear
+        except Exception as exc:  # the search reads on as if it saw nothing
+            log(f"Could not count the clear pixels of {clip}: {exc}")
+            return
+        with self._lock:
+            self.clear += clear
+            self.covered |= shape
+            self.taken |= shape
+
+    def _rasterize(self, footprint: dict) -> np.ndarray:
+        w, h = self.size
+        mem = gdal.GetDriverByName("MEM").Create("", w, h, 1, gdal.GDT_Byte)
+        mem.SetGeoTransform(self.gt)
+        feature = {"type": "Feature", "properties": {}, "geometry": footprint}
+        src = ogr.Open(json.dumps(feature))
+        gdal.RasterizeLayer(mem, [1], src.GetLayer(), burn_values=[1])
+        return mem.ReadAsArray() > 0
+
+    def expect(self, footprint: dict) -> None:
+        """Count the pixels of *footprint* (GeoJSON) as ones a scene covers,
+        though none was taken there: a tile no scene of the dates passed
+        the cloud filter for is a hole of the mosaic too."""
+        with contextlib.suppress(Exception):
+            shape = self._rasterize(footprint)
+            with self._lock:
+                self.covered |= shape
+
+    def wants(self, footprint: dict | None, need: int | None = None) -> bool:
+        """Whether a scene over *footprint* would show pixels of the view
+        clear fewer than *need* (default: the view's) times yet, over 1 %
+        of it: else the search skips it, its tile done though the view is
+        not."""
+        if not footprint:
+            return True
+        try:
+            shape = self._rasterize(footprint)
+        except Exception:
+            return True
+        need = self.need if need is None else need
+        with self._lock:
+            holes = _holes(self.covered & (self.clear < need))
+        # Any hole: a wedge between two orbits is far under 1 % of a tile.
+        return bool(holes[shape].any())
+
+    def missing(self) -> float:
+        """The share of the pixels a scene covers that none shows clear."""
+        return self._share(1)
+
+    def enough(self) -> bool:
+        """Whether the pixels the scenes cover are clear *need* times."""
+        if not self.covered.any():
+            return False
+        return self._share(self.need) <= self.tolerance and self._gaps() <= self.gaps
+
+    def _share(self, need: int) -> float:
+        """The share of the covered pixels clear fewer than *need* times, in
+        holes (:func:`_holes`), not specks."""
+        with self._lock:
+            covered = self.covered.copy()
+            holes = _holes(covered & (self.clear < need))
+        return float(holes.sum() / covered.sum()) if covered.any() else 0.0
+
+    def _gaps(self) -> float:
+        """The share of the covered pixels no scene taken covers."""
+        with self._lock:
+            covered = self.covered.copy()
+            gaps = _holes(covered & ~self.taken)
+        return float(gaps.sum() / covered.sum()) if covered.any() else 0.0
+
+
+def _holes(mask: np.ndarray) -> np.ndarray:
+    """*mask* without its specks: cells with fewer than two others around
+    them, twice (pairs go too); a line or a wedge stays.
+
+    SCL takes bright snow for cloud and a steep slope's shadow for a cloud's
+    in a few pixels, the same ones on every date: on the Tibetan plateau
+    1.3 % of a view in single pixels, never filled, holding the search and
+    saying the view had no clear view (0.1 % left). A 3 x 3 opening also
+    took a France view's orbit wedges, thinner than 3 cells (16 km), for
+    specks, and never filled them.
+    """
+    windows = np.lib.stride_tricks.sliding_window_view
+    for _ in range(2):
+        around = windows(np.pad(mask, 1), (3, 3)).sum(axis=(2, 3)) - mask
+        mask = mask & (around >= 2)
+    return mask
 
 
 def _viewport_projwin(

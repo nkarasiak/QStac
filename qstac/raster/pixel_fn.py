@@ -266,8 +266,83 @@ def expr_pixel_fn(
     )
 
 
+def composite_pixel_fn(
+    in_ar,
+    out_ar,
+    xoff,
+    yoff,
+    xsize,
+    ysize,
+    raster_xsize,
+    raster_ysize,
+    buf_radius,
+    gt,
+    **kwargs,
+) -> None:
+    """GDAL VRT pixel function: per pixel, the ``median`` or ``mean`` (*how*)
+    of the sources that are not *nodata* — GDAL's own ``median`` / ``mean``
+    pixel functions, for a GDAL without them (``vrt._composite``) — or with
+    *how* ``recent``, the median of the *newest* (3) of them: the sources
+    come oldest first, as a mosaic paints them."""
+    import numpy as np
+
+    nodata = float(_text(kwargs, "nodata") or 0)
+    how = _text(kwargs, "how")
+    if how == "recent":
+        out = _newest_median(in_ar, nodata, int(_text(kwargs, "newest") or 3))
+    else:
+        out = np.full(out_ar.shape, np.nan, "float32")
+        step = _COMPOSITE_BLOCK
+        for y in range(0, out.shape[0], step):
+            for x in range(0, out.shape[1], step):
+                win = (slice(y, y + step), slice(x, x + step))
+                # A scene covers part of a wide view: those not here, skipped.
+                parts = [a[win] for a in in_ar if (a[win] != nodata).any()]
+                if parts:
+                    out[win] = _reduce(np.stack(parts), nodata, how)
+    if out_ar.dtype.kind in "iu":
+        out = np.rint(out)  # a Byte image, not an index
+    out_ar[:] = np.where(np.isnan(out), nodata, out)
+
+
+# composite_pixel_fn's median or mean, a block at a time: 70 scenes of a
+# 1233 x 954 view stacked whole as float32 were 470 MB a band, 6 s a redraw.
+_COMPOSITE_BLOCK = 256
+
+
+def _reduce(stack, nodata: float, how: str):
+    """Per pixel, the ``median`` or ``mean`` of *stack*'s values not *nodata*."""
+    import warnings
+
+    import numpy as np
+
+    stack = stack.astype("float32")
+    stack[stack == nodata] = np.nan
+    reduce = np.nanmean if how == "mean" else np.nanmedian
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # all nodata: NaN
+        return reduce(stack, axis=0)
+
+
+def _newest_median(in_ar, nodata: float, newest: int):
+    """Per pixel, the median of its *newest* values not *nodata*, the
+    sources oldest first: they fill *newest* slots from the last one, so
+    no stack of every scene is ever made."""
+    import numpy as np
+
+    shape = in_ar[0].shape
+    slots = np.full((newest, *shape), np.nan, "float32")
+    count = np.zeros(shape, "int16")
+    for a in reversed(in_ar):
+        rows, cols = np.nonzero((a != nodata) & (count < newest))
+        slots[count[rows, cols], rows, cols] = a[rows, cols]
+        count[rows, cols] += 1
+    return _reduce(slots, np.nan, "median")
+
+
 # Derived from ``__name__`` rather than hard-coded: GDAL imports the pixel
 # function by this exact dotted path, which follows the folder QGIS installed
 # the plugin under — a literal would break if the module or folder moved.
 _PIXEL_FN_NAME = f"{__name__}.norm_diff_pixel_fn"
 _EXPR_PIXEL_FN_NAME = f"{__name__}.expr_pixel_fn"
+_COMPOSITE_PIXEL_FN_NAME = f"{__name__}.composite_pixel_fn"

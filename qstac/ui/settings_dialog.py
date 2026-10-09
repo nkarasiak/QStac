@@ -549,6 +549,14 @@ class SettingsDialog(QDialog):
         )
         self._row(
             form,
+            "",
+            "hide_clouds",
+            QCheckBox("Hide clouds (Sentinel-2 scene classification)"),
+            "Clouds, their shadows and cirrus the scene's SCL band marks are "
+            "transparent; in a mosaic, the scene under them shows.",
+        )
+        self._row(
+            form,
             "Contrast:",
             "stretch_method",
             self._combo(_STRETCH_METHODS),
@@ -560,6 +568,23 @@ class SettingsDialog(QDialog):
     def _build_mosaic_page(self) -> None:
         page = self._page("Mosaic", "mIconRaster.svg")
         form = self._group(page, "The Mosaic button")
+        self._row(
+            form,
+            "Where scenes overlap:",
+            "mosaic_composite",
+            self._combo(
+                [
+                    ("Median of the newest 3", "recent"),
+                    ("Median of the dates", "median"),
+                    ("Mean of the dates", "mean"),
+                    ("Newest scene on top", "newest"),
+                ]
+            ),
+            "The scenes of the search dates are taken newest first until every "
+            "pixel has three clear views (newest: one); each pixel then shows "
+            "the median of its newest 3 (recent, and what a cloud mask misses "
+            "is outvoted), of all of them, their mean, or the newest alone.",
+        )
         self._row(
             form,
             "Most scenes per mosaic:",

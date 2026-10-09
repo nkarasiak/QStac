@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import math
+import re
 from html import escape
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from osgeo import gdal
+
+from ..stac.collections import SCL_HIDDEN
+from .pixel_fn import _COMPOSITE_PIXEL_FN_NAME
 
 if TYPE_CHECKING:
     from ..stac.items import AssetProj
@@ -265,6 +270,100 @@ def _write_vrt_xml(
                 f"{band_nodata}{source}\n  </VRTRasterBand>"
             )
     return _write_vrt_dataset(vrt_path, finest, epsg, bands)
+
+
+_SCL_LUT = ",".join(f"{v}:{0 if v in SCL_HIDDEN else 255}" for v in range(12))
+
+
+def _add_scl_mask(src: str, scl: str) -> str | None:
+    """*src* with a dataset mask that hides the clouds the SCL raster *scl* marks.
+
+    *src* is VRT XML (the masked XML is returned) or a VRT file (rewritten in
+    place, its path returned). The mask is *scl* itself through a LUT, placed
+    by geotransform (same CRS), so GDAL resamples it onto *src*'s grid; QGIS
+    shows it as an alpha band and a GeoTIFF translated from it keeps it.
+    None when either cannot be opened.
+    """
+    ds = mask = None
+    with contextlib.suppress(RuntimeError):
+        ds, mask = gdal.Open(src), gdal.Open(scl)
+    if ds is None or mask is None:
+        return None
+    gt, mgt = ds.GetGeoTransform(), mask.GetGeoTransform()
+    w, h = mask.RasterXSize, mask.RasterYSize
+    ds = mask = None  # closed before the file is rewritten
+    dst = (
+        f'xOff="{(mgt[0] - gt[0]) / gt[1]}" yOff="{(mgt[3] - gt[3]) / gt[5]}"'
+        f' xSize="{w * mgt[1] / gt[1]}" ySize="{h * mgt[5] / gt[5]}"'
+    )
+    band = (
+        '  <MaskBand>\n    <VRTRasterBand dataType="Byte">\n'
+        "      <ComplexSource>\n"
+        f'        <SourceFilename relativeToVRT="0">{escape(scl, quote=False)}'
+        "</SourceFilename>\n"
+        "        <SourceBand>1</SourceBand>\n"
+        f'        <SrcRect xOff="0" yOff="0" xSize="{w}" ySize="{h}" />\n'
+        f"        <DstRect {dst} />\n"
+        f"        <LUT>{_SCL_LUT}</LUT>\n"
+        "      </ComplexSource>\n    </VRTRasterBand>\n  </MaskBand>\n"
+    )
+    is_xml = src.lstrip().startswith("<")
+    xml = src if is_xml else Path(src).read_text(encoding="utf-8")
+    xml = xml.replace("</VRTDataset>", f"{band}</VRTDataset>")
+    if is_xml:
+        return xml
+    Path(src).write_text(xml, encoding="utf-8")
+    return src
+
+
+def _composite(path: str, how: str) -> str:
+    """Make BuildVRT's mosaic at *path* a per-pixel *how* ("median", "mean",
+    or "recent": the median of the newest 3) of its sources instead of the
+    last one on top: each band derived, a source's nodata left out. GDAL's
+    own pixel function when it has it, else ``pixel_fn.composite_pixel_fn``
+    (NumPy, slower; "recent" always)."""
+    xml = Path(path).read_text(encoding="utf-8")
+    fn = f"<PixelFunctionType>{how}</PixelFunctionType>"
+    if how == "recent" or not _has_pixel_fn(how):
+        found = re.search(r"<NoDataValue>([^<]+)</NoDataValue>", xml)
+        nodata = found.group(1) if found else "0"
+        fn = (
+            f"<PixelFunctionType>{_COMPOSITE_PIXEL_FN_NAME}</PixelFunctionType>"
+            "<PixelFunctionLanguage>Python</PixelFunctionLanguage>"
+            f'<PixelFunctionArguments how="{how}" nodata="{nodata}" newest="3" />'
+        )
+    xml = re.sub(
+        r'(<VRTRasterBand dataType="\w+" band="\d+")>',
+        rf'\1 subClass="VRTDerivedRasterBand">{fn}',
+        xml,
+    )
+    Path(path).write_text(xml, encoding="utf-8")
+    return path
+
+
+@functools.cache
+def _has_pixel_fn(name: str) -> bool:
+    """Whether this GDAL has the VRT pixel function *name* (``median`` and
+    ``mean`` are recent: QGIS 3.40's GDAL may lack them)."""
+    src = "/vsimem/qstac_pixel_fn_probe.tif"
+    gdal.GetDriverByName("GTiff").Create(src, 1, 1, 1, gdal.GDT_Byte)
+    xml = (
+        '<VRTDataset rasterXSize="1" rasterYSize="1">'
+        '<VRTRasterBand dataType="Byte" band="1" subClass="VRTDerivedRasterBand">'
+        f"<PixelFunctionType>{name}</PixelFunctionType>"
+        f"<SimpleSource><SourceFilename>{src}</SourceFilename>"
+        "<SourceBand>1</SourceBand></SimpleSource>"
+        "</VRTRasterBand></VRTDataset>"
+    )
+    gdal.PushErrorHandler("CPLQuietErrorHandler")
+    try:
+        ds = gdal.Open(xml)
+        return ds is not None and ds.ReadAsArray() is not None
+    except RuntimeError:
+        return False
+    finally:
+        gdal.PopErrorHandler()
+        gdal.Unlink(src)
 
 
 def _finest_grid(asset_proj: dict[str, AssetProj], names: list[str]) -> AssetProj:

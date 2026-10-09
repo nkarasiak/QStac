@@ -10,6 +10,7 @@ import urllib.parse
 import urllib.request
 from typing import TYPE_CHECKING
 
+from .collections import SCL_HIDDEN
 from .net import StacError, _urlopen_safe
 
 if TYPE_CHECKING:
@@ -358,6 +359,7 @@ def pc_render(
     bounds: tuple[float, float, float, float],
     size: tuple[int, int],
     timeout: int,
+    hide_clouds: bool = False,
 ) -> bytes:
     """A PNG of a 3-band Byte *asset* (Sentinel-2's TCI) over *bounds* (minx,
     miny, maxx, maxy in EPSG:*epsg*, returned exactly) at *size* pixels,
@@ -365,19 +367,27 @@ def pc_render(
 
     About 50 KB in 0.5 s, where reading the COGs' smallest overview moved
     megabytes at 1 MB/s a connection: a mosaic's first look. Lossless, its
-    no-data stays 0 (no mask band), as in the COG.
+    no-data stays 0 (no mask band), as in the COG. *hide_clouds* makes the
+    pixels the scene's SCL marks cloudy 0 too, in the same request.
     """
-    query = urllib.parse.urlencode(
-        {
-            "collection": collection,
-            "item": item_id,
-            "assets": asset,
-            "asset_bidx": f"{asset}|1,2,3",
-            "nodata": 0,
-            "return_mask": "false",
-            "coord_crs": f"epsg:{epsg}",
+    params: dict[str, object] = {
+        "collection": collection,
+        "item": item_id,
+        "assets": asset,
+        "asset_bidx": f"{asset}|1,2,3",
+        "nodata": 0,
+        "return_mask": "false",
+        "coord_crs": f"epsg:{epsg}",
+    }
+    if hide_clouds:
+        cloud = "|".join(f"(SCL_b1=={c})" for c in sorted(SCL_HIDDEN))
+        params |= {
+            "assets": [asset, "SCL"],
+            "expression": ";".join(f"where({cloud},0,{asset}_b{b})" for b in (1, 2, 3)),
+            "rescale": ["0,255"] * 3,  # else stretched over its float range
         }
-    )
+        del params["asset_bidx"]
+    query = urllib.parse.urlencode(params, doseq=True)
     box = ",".join(f"{v:.3f}" for v in bounds)
     url = f"{_PC_DATA_API}/item/bbox/{box}/{size[0]}x{size[1]}.png?{query}"
     return _urlopen_safe(urllib.request.Request(url), timeout, "PC preview")

@@ -17,11 +17,13 @@ from qgis.core import (
 from qgis.PyQt.QtCore import pyqtSignal
 
 from ..log import log
+from ..stac.collections import SCL_ASSETS
 from .clip import (
     _CANCEL_DRAIN_S,
     _CANCEL_POLL_S,
     _HEDGE_COARSE_S,
     CLIP_CREATION_OPTIONS,
+    ClearViews,
     _materialize_window_tiles,
     _viewport_projwin,
 )
@@ -39,6 +41,7 @@ from .index import _INDEX_NODATA, _bake_index, _index_source
 from .layers import (
     BAKED_INDEX,
     BAKED_RGB,
+    MASK_CLIP,
     REMOTE_BAKED,
     REMOTE_VRT,
     _build_local_mosaic,
@@ -46,9 +49,10 @@ from .layers import (
     _local_mosaics,
     _remote_source,
     scene_clip,
+    scene_mask,
     view_clip,
 )
-from .vrt import _band_type, _build_vrt
+from .vrt import _add_scl_mask, _band_type, _build_vrt, _composite
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -131,8 +135,21 @@ class MosaicBuildTask(_EventTask):
         preview_clips: dict[str, str | None] | None = None,
         remote: bool = True,
         render: SceneRender | None = None,
+        hide_clouds: bool = False,
+        composite: str = "newest",
+        goal: list[dict] | None = None,
     ) -> None:
         super().__init__(f"Mosaicking {len(parts)} scenes")
+        # The tiles of the area (GeoJSON, WGS84): with them, the share of
+        # the view the finished mosaic leaves empty there (missing_share).
+        self.goal = goal
+        self.missing_share: float | None = None
+        self._sharp: list = []  # the last sharp mosaics shown
+        # Each scene's SCL clouds are 0, nodata (``layers.scene_mask``).
+        self.hide_clouds = hide_clouds
+        # Where scenes overlap: "median", "mean" (``vrt._composite``) or
+        # "newest" on top. Local mosaics only: a remote one stays newest.
+        self.composite = composite
         self.view = view
         self.remote = remote  # else the view clips alone (a later view)
         # The catalog renders a scene's part of the view itself, at the
@@ -164,6 +181,8 @@ class MosaicBuildTask(_EventTask):
                 for i, a, e, p in self.parts
             ]
             if self._build_local(parts) or not self.remote:
+                self._bake_composite()
+                self._measure()
                 return True  # the layers follow the view on local clips
             built = _build_mosaic_vrt(
                 parts,
@@ -190,7 +209,7 @@ class MosaicBuildTask(_EventTask):
         cancel = self._cancel.is_set
         if self.index_preset is not None:  # computed here from the view's bands
             sharp = _build_local_index_mosaic(
-                parts, self.index_preset, self.view, cancel
+                parts, self.index_preset, self.view, cancel, self.hide_clouds
             )
             self._show(sharp, True)
             return bool(sharp)
@@ -203,11 +222,15 @@ class MosaicBuildTask(_EventTask):
         if self.render is not None:  # rendered at the canvas resolution: final
             return self._show_rendered(parts, bands[0])
         if self.preview_clips is None:  # no tile search made them: here
-            preview = _build_local_mosaic(parts, bands[0], half, "preview", cancel)
+            preview = _build_local_mosaic(
+                parts, bands[0], half, "preview", cancel, hide_clouds=self.hide_clouds
+            )
             self._show(preview, False)
         else:
             self._show_preview(parts, bands[0], half, False)
-        sharp = _build_local_mosaic(parts, bands[0], self.view, "sharp", cancel)
+        sharp = _build_local_mosaic(
+            parts, bands[0], self.view, "sharp", cancel, hide_clouds=self.hide_clouds
+        )
         self._show(sharp, True)
         return bool(sharp)
 
@@ -220,12 +243,20 @@ class MosaicBuildTask(_EventTask):
         cancel = self._cancel.is_set
 
         def fill(part: tuple) -> None:
-            item_id, _, epsg, proj = part
+            item_id, assets, epsg, proj = part
             if item_id in clips or cancel():
                 return
             clips[item_id] = ""
+            scl = scene_mask(assets, proj) if self.hide_clouds else None
             clips[item_id] = scene_clip(
-                item_id, "", proj.get(band), epsg, self.view, "render", self.render
+                item_id,
+                "",
+                proj.get(band),
+                epsg,
+                self.view,
+                "render",
+                self.render,
+                scl=scl,
             )
 
         pool = concurrent.futures.ThreadPoolExecutor(32)
@@ -249,7 +280,47 @@ class MosaicBuildTask(_EventTask):
 
     def _show(self, mosaics: list, sharp: bool) -> None:
         if mosaics and not self._cancel.is_set():
+            if sharp:
+                self._sharp = mosaics
             self.previewReady.emit(mosaics, sharp)
+
+    def _bake_composite(self) -> None:
+        """The finished mosaic as its composite (``vrt._composite``), computed
+        once into a GeoTIFF per CRS and shown: drawn from the VRT, each
+        redraw ran it over every scene (France: 900 a zone, seconds each,
+        cut off by the next update and left half drawn); baked, 3 s once,
+        then 3 ms a redraw. The updates before it show the newest on top."""
+        if self.composite == "newest" or not self._sharp:
+            return
+        baked = []
+        try:
+            for path, epsg, ids in self._sharp:
+                if self._cancel.is_set():
+                    return
+                _composite(path, self.composite)
+                tif = f"{path.removesuffix('.vrt')}_{self.composite}.tif"
+                out = gdal.Translate(tif, path, creationOptions=CLIP_CREATION_OPTIONS)
+                if out is None:
+                    return
+                out = None  # flush + close
+                baked.append((tif, epsg, ids))
+        except Exception as exc:  # the newest-on-top mosaic stays
+            log(f"Could not compute the mosaic's {self.composite}: {exc}")
+            return
+        self._show(baked, True)
+
+    def _measure(self) -> None:
+        """The share of the view's tiles (*goal*) the finished mosaic leaves
+        empty, read at 256 px: the search's own count is taken before the
+        build has clipped every scene (France: 31 % said, 3 % left)."""
+        if self.goal is None or not self._sharp or self.view is None:
+            return
+        views = ClearViews(self.view[0])
+        for path, _, _ in self._sharp:
+            views.add(path, None)
+        for shape in self.goal:
+            views.expect(shape)
+        self.missing_share = views.missing()
 
     def _show_preview(self, parts: list, band: str, view: tuple, sharp: bool) -> None:
         """The tile search's preview clips (of *view*; *sharp*: at the canvas
@@ -277,13 +348,19 @@ def _build_local_index_mosaic(
     index_preset: IndexPreset,
     view: tuple[tuple[float, float, float, float], tuple[int, int]],
     cancel: Callable[[], bool],
+    hide_clouds: bool = False,
 ) -> list[tuple[str, int | None, list[str]]]:
     """*index_preset* of *parts* over *view*: each scene's bands clipped (all
     at once), its index computed from them (``_bake_index``), then mosaicked.
-    Its remote mosaic drew 7 Sentinel-2 NDVI scenes in 20 s, blank meanwhile."""
+    Its remote mosaic drew 7 Sentinel-2 NDVI scenes in 20 s, blank meanwhile.
+    With *hide_clouds*, a scene's SCL too: its clouds are nodata."""
     names = list(index_preset.assets)
+    masks = SCL_ASSETS if hide_clouds else ()
     jobs = [
-        (part, n) for part in parts if all(part[1].get(n) for n in names) for n in names
+        (part, n)
+        for part in parts
+        if all(part[1].get(n) for n in names)
+        for n in [*names, *(m for m in masks if part[1].get(m))]
     ]
 
     def clip(job: tuple) -> str | None:
@@ -301,7 +378,10 @@ def _build_local_index_mosaic(
         got = [clips.get((item_id, n)) for n in names]
         if all(got) and not cancel():
             prefix = _vrt_path(f"{item_id}_index")
-            tif = _bake_index(prefix, got, [proj.get(n) for n in names], index_preset)
+            mask = next(filter(None, (clips.get((item_id, m)) for m in masks)), None)
+            tif = _bake_index(
+                prefix, got, [proj.get(n) for n in names], index_preset, mask
+            )
             baked.append((item_id, epsg, tif))
     return _local_mosaics(baked, _INDEX_NODATA, "index")
 
@@ -367,8 +447,19 @@ class CogPrefetchTask(_EventTask):
         index_preset: IndexPreset | None = None,
         prepare: Callable[[], object] | None = None,
         remote_only: bool = False,
+        hide_clouds: bool = False,
     ) -> None:
         super().__init__("Prefetching COG tiles")
+        # Item id → its Sentinel-2 SCL asset, clipped and read beside the
+        # bands to hide clouds (``_add_scl_mask``).
+        self.hide_clouds = hide_clouds
+        self.mask_of = {
+            it.id: k
+            for it in items
+            if hide_clouds
+            for k in SCL_ASSETS
+            if k in it.assets and k not in asset_names
+        }
         # No clips: only each item's remote source (``remoteReady``), for a
         # layer whose first pan came after the load's own had expired.
         self.remote_only = remote_only
@@ -442,7 +533,8 @@ class CogPrefetchTask(_EventTask):
         jobs: list[_Job] = []
         for item in self.items:
             # A formula may read one asset twice (``nir`` and ``B08``): fetch once.
-            for name in dict.fromkeys(self.asset_names):
+            mask = [self.mask_of[item.id]] if item.id in self.mask_of else []
+            for name in dict.fromkeys([*self.asset_names, *mask]):
                 href = item.assets.get(name)
                 if not href:
                     continue
@@ -540,6 +632,8 @@ class CogPrefetchTask(_EventTask):
         self, signal: pyqtSignal, item_id: str, paths: dict[str, str], tag: str
     ) -> None:
         """Emit ``(item_id, {asset: path})`` if every asset of the item clipped."""
+        if (scl := paths.pop(self.mask_of.get(item_id, ""), None)) is not None:
+            paths[MASK_CLIP] = scl  # deleted with the clips it masks
         if not all(n in paths for n in self.asset_names):
             delete_clips(paths.values())  # no layer reads a partial set
             return
@@ -550,6 +644,7 @@ class CogPrefetchTask(_EventTask):
                 [paths[n] for n in self.asset_names],
                 [item.asset_proj.get(n) for n in self.asset_names],
                 self.index_preset,
+                paths.get(MASK_CLIP),
             )
             delete_clips(paths.values())
             if baked is None:
@@ -560,6 +655,8 @@ class CogPrefetchTask(_EventTask):
             if baked is not None:
                 delete_clips(paths.values())
                 paths = {BAKED_RGB: baked}
+        elif MASK_CLIP in paths and len(self.asset_names) == 1:
+            _add_scl_mask(paths[self.asset_names[0]], paths[MASK_CLIP])
         signal.emit(item_id, dict(paths))
 
     def _emit_remote(self, jobs: list[_Job]) -> None:
@@ -575,10 +672,13 @@ class CogPrefetchTask(_EventTask):
             if self._cancel.is_set():
                 return
             item = self._items_by_id[item_id]
+            scl = signed.get(self.mask_of.get(item_id, ""))
             if self.index_preset is not None:
                 src = _index_source(
                     signed, self.index_preset, item.epsg, item.asset_proj
                 )
+                if src and scl:
+                    src = _add_scl_mask(src, _vsicurl(scl)) or src
                 remote = {REMOTE_VRT: src} if src else None
             else:
                 built = _remote_source(
@@ -590,7 +690,10 @@ class CogPrefetchTask(_EventTask):
                 )
                 remote = None
                 if built is not None:
-                    remote = {REMOTE_VRT: built[0]}
+                    src = built[0]
+                    if scl:
+                        src = _add_scl_mask(src, _vsicurl(scl)) or src
+                    remote = {REMOTE_VRT: src}
                     if built[1]:
                         remote[REMOTE_BAKED] = "1"
             if remote is not None:
@@ -615,6 +718,8 @@ class CogPrefetchTask(_EventTask):
             )
             if stacked is None:
                 return None
+            if MASK_CLIP in paths:  # the GeoTIFF keeps it, an internal mask
+                _add_scl_mask(stacked, paths[MASK_CLIP])
             vmin, vmax = self.bake_stretch  # type: ignore[misc]
             out = gdal.Translate(
                 f"{prefix}.tif",

@@ -20,9 +20,11 @@ from qgis.core import (
 )
 from qgis.PyQt.QtCore import QDateTime, Qt, QTime
 
+from ..stac.collections import SCL_ASSETS
 from .clip import (
     _HEDGE_COARSE_S,
     _HEDGE_SHARP_S,
+    _burn_scl,
     _materialize_window_tiles,
     render_clip,
 )
@@ -35,6 +37,7 @@ from .cog import (
 from .style import (
     _apply_rgb_renderer,
     _apply_singleband_renderer,
+    _mask_alpha,
     label_classes,
     resolve_bake_stretch,
 )
@@ -57,10 +60,10 @@ if TYPE_CHECKING:
     from ..stac.collections import CollectionInfo, IndexPreset
     from ..stac.items import AssetProj, StacItemResult
 
-    # (item id, EPSG, bounds in it, size in pixels) → a PNG of the scene's
-    # asset there, rendered by its catalog (``stac.auth.pc_render``).
+    # (item id, EPSG, hide clouds, bounds in it, size in pixels) → a PNG of
+    # the scene's asset there, rendered by its catalog (``stac.auth.pc_render``).
     SceneRender = Callable[
-        [str, int, tuple[float, float, float, float], tuple[int, int]], bytes
+        [str, int, bool, tuple[float, float, float, float], tuple[int, int]], bytes
     ]
 
 __all__ = [
@@ -71,6 +74,7 @@ __all__ = [
     "build_layer",
     "enable_time_stack",
     "open_mosaic_layer",
+    "scene_mask",
     "set_layer_temporal",
     "stamp_layer",
     "swap_layer_source",
@@ -152,6 +156,9 @@ BAKED_INDEX = "__baked_index__"
 # ``REMOTE_BAKED`` rides along when that VRT has the stretch baked in.
 REMOTE_VRT = "__remote_vrt__"
 REMOTE_BAKED = "__remote_baked__"
+# ``local_clips`` key for the SCL clip a cloud-masked clip reads its mask from
+# (``CogPrefetchTask.mask_of``): kept beside it, deleted with it.
+MASK_CLIP = "__mask_clip__"
 
 
 def _remote_source(
@@ -305,6 +312,7 @@ def swap_layer_source(
     if not layer.isValid():
         return False
     layer.setMetadata(md)
+    _mask_alpha(layer, renderer)  # a kept renderer, the new source's mask
     layer.setRenderer(renderer)
     layer.triggerRepaint()
     return True
@@ -618,6 +626,14 @@ def view_clip(
     )
 
 
+def scene_mask(
+    assets: dict[str, str], proj: dict[str, AssetProj]
+) -> tuple[str, AssetProj | None] | None:
+    """The scene's Sentinel-2 SCL (href, proj) to hide its clouds with, if any."""
+    name = next((n for n in SCL_ASSETS if assets.get(n)), None)
+    return (assets[name], proj.get(name)) if name else None
+
+
 def scene_clip(
     item_id: str,
     href: str,
@@ -627,17 +643,29 @@ def scene_clip(
     tag: str,
     render: SceneRender | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    scl: tuple[str, AssetProj | None] | None = None,
 ) -> str | None:
     """A local clip of a scene over *view*: rendered by its catalog when it
     can (*render*: a few KB at the canvas resolution, where the COGs' smallest
     overview is ~0.5 MB a scene, 300 MB for France), else read from the COG
-    at signed *href* (:func:`view_clip`)."""
-    if render is None:
+    at signed *href* (:func:`view_clip`). With *scl* (:func:`scene_mask`)
+    its clouds are 0, nodata: the scenes under them show through."""
+    if render is not None:
+        if proj is None or not epsg:
+            return None
+        fetch = partial(render, item_id, epsg, scl is not None)
+        return render_clip(fetch, proj, epsg, view, _vrt_path(f"{item_id}_{tag}"))
+    if scl is None:
         return view_clip(item_id, href, proj, epsg, view, tag, cancel_check)
-    if proj is None or not epsg:
-        return None
-    fetch = partial(render, item_id, epsg)
-    return render_clip(fetch, proj, epsg, view, _vrt_path(f"{item_id}_{tag}"))
+    with concurrent.futures.ThreadPoolExecutor(1) as pool:
+        mask = pool.submit(
+            view_clip, item_id, scl[0], scl[1], epsg, view, f"{tag}_scl", cancel_check
+        )
+        clip = view_clip(item_id, href, proj, epsg, view, tag, cancel_check)
+        mask = mask.result()
+    if clip is None or mask is None:
+        return clip
+    return _burn_scl(clip, mask, _vrt_path(f"{item_id}_{tag}_clear") + ".tif") or clip
 
 
 def _local_mosaics(
@@ -668,6 +696,7 @@ def _build_local_mosaic(
     clips: dict[str, str | None] | None = None,
     render: SceneRender | None = None,
     fill: bool = False,
+    hide_clouds: bool = False,
 ) -> list[tuple[str, int | None, list[str]]]:
     """*parts*' *band* over *view*, from local clips: (path, epsg, ids) per CRS.
 
@@ -687,8 +716,9 @@ def _build_local_mosaic(
         href = assets.get(band)
         if not href:
             return None
+        scl = scene_mask(assets, proj) if hide_clouds else None
         return scene_clip(
-            item_id, href, proj.get(band), epsg, view, tag, render, cancel_check
+            item_id, href, proj.get(band), epsg, view, tag, render, cancel_check, scl
         )
 
     if not parts:

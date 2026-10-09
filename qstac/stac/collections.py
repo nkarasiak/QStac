@@ -5,6 +5,12 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, replace
 
+# Sentinel-2's scene classification asset (Planetary Computer, Earth Search)
+# and the classes *Hide clouds* hides: no data, saturated, cloud shadow,
+# cloud medium and high probability, thin cirrus. 11 is snow.
+SCL_ASSETS = ("SCL", "scl")
+SCL_HIDDEN = frozenset({0, 1, 3, 8, 9, 10})
+
 
 @dataclass(frozen=True, slots=True)
 class BandPreset:
@@ -463,6 +469,8 @@ __all__ = [
     "DISCOVERED_CATEGORY",
     "EARTH_SEARCH_COLLECTIONS",
     "PLANETARY_COMPUTER_COLLECTIONS",
+    "SCL_ASSETS",
+    "SCL_HIDDEN",
     "BandPreset",
     "CollectionInfo",
     "IndexPreset",

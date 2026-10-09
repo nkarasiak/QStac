@@ -379,8 +379,12 @@ def scene_render(
         return None
     timeout = settings.http_timeout()
 
-    def render(item_id: str, epsg: int, bounds: tuple, size: tuple) -> bytes:
-        return pc_render(coll.id, item_id, assets[0], epsg, bounds, size, timeout)
+    def render(
+        item_id: str, epsg: int, hide_clouds: bool, bounds: tuple, size: tuple
+    ) -> bytes:
+        return pc_render(
+            coll.id, item_id, assets[0], epsg, bounds, size, timeout, hide_clouds
+        )
 
     return render
 
@@ -831,6 +835,7 @@ class LayerLoader(QObject):
             index_preset=index_preset,
             # The task reads the assets: it hands GDAL the login first.
             prepare=_asset_login(items, catalog),
+            hide_clouds=settings.hide_clouds(),
         )
         ld = _ProgressiveLoad(
             task=task,
@@ -1068,6 +1073,7 @@ class LayerLoader(QObject):
             index_preset=ld.index_preset,
             prepare=_asset_login(items, ld.catalog),
             remote_only=True,
+            hide_clouds=ld.task.hide_clouds,
         )
         task.remoteReady.connect(lambda i, remote: self._on_rebuilt(by_id[i], remote))
         self.run_task(task)
@@ -1103,6 +1109,8 @@ class LayerLoader(QObject):
         index_preset: IndexPreset | None = None,
         band_preset: BandPreset | None = None,
         preview: tuple | None = None,
+        goal: list[dict] | None = None,
+        on_done: Callable[[MosaicBuildTask], object] | None = None,
     ) -> None:
         """Mosaic several scenes off the GUI thread: one layer per CRS.
 
@@ -1163,8 +1171,15 @@ class LayerLoader(QObject):
             prepare=_asset_login(items, catalog),
             index_preset=preset,
             render=scene_render(catalog, coll, assets),
+            hide_clouds=settings.hide_clouds(),
+            # A DEM's or a land cover's tiles: the one value each, no dates.
+            composite="newest"
+            if stack or coll.timeless
+            else settings.mosaic_composite(),
         )
-        task = make(view=view, preview_clips=clips)
+        task = make(view=view, preview_clips=clips, goal=goal)
+        if on_done is not None:  # *goal*'s share left empty: task.missing_share
+            task.taskCompleted.connect(lambda: on_done(task))
         ml = _MosaicLoad(task, key, label, items, catalog, stack, make=make)
         task.previewReady.connect(
             lambda m, sharp: self._on_mosaic_preview(ml, m, sharp, task)
