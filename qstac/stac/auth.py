@@ -11,7 +11,7 @@ import urllib.request
 from typing import TYPE_CHECKING
 
 from .collections import SCL_HIDDEN
-from .net import StacError, _urlopen_safe
+from .net import StacError, _parse_json, _urlopen_safe
 
 if TYPE_CHECKING:
     from .catalogs import CatalogProvider
@@ -20,6 +20,7 @@ __all__ = [
     "AUTH_CONFIG_PREFIX",
     "auth_config_problem",
     "create_auth_config",
+    "pc_point",
     "pc_sign_url",
     "planetary_computer_auth_config",
     "request_headers",
@@ -349,6 +350,31 @@ def pc_sign_url(href: str) -> str:
     token = _pc_get_sas_token(*blob)
     sep = "&" if parsed.query else "?"
     return f"{href}{sep}{token}"
+
+
+def pc_point(
+    collection: str,
+    item_id: str,
+    assets: list[str],
+    lon: float,
+    lat: float,
+    timeout: int,
+) -> list[float | None]:
+    """The raw values of *assets* (first band each) at a WGS84 point, read by
+    the Planetary Computer data API beside its COGs; None where masked.
+
+    One small request a scene, ~0.3 s, where reading the COGs pulls a whole
+    ~0.5 MB tile per asset for one value: 86 Sentinel-2 dates in ~2.5 s,
+    against 12-17 s from the COGs.
+    """
+    query = urllib.parse.urlencode(
+        {"collection": collection, "item": item_id, "assets": assets}, doseq=True
+    )
+    url = f"{_PC_DATA_API}/item/point/{lon:.6f},{lat:.6f}?{query}"
+    raw = _urlopen_safe(urllib.request.Request(url), timeout, "PC point")
+    data = _parse_json(raw, url)
+    values = data.get("values") or []
+    return [None if v is None else float(v) for v in values[: len(assets)]]
 
 
 def pc_render(

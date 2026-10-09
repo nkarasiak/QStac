@@ -7,17 +7,22 @@ import contextlib
 import threading
 import time
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from osgeo import gdal
+from osgeo import gdal, osr
 from qgis.core import (
     QgsTask,
 )
 from qgis.PyQt.QtCore import pyqtSignal
 
 from ..log import log
-from ..stac.collections import SCL_ASSETS
+from ..stac.auth import pc_point, request_headers
+from ..stac.collections import SCL_ASSETS, SCL_HIDDEN
+from ..stac.indices import resolve_variables
+from ..stac.net import StacError
+from ..stac.search import search_catalog
 from .clip import (
     _CANCEL_DRAIN_S,
     _CANCEL_POLL_S,
@@ -37,6 +42,7 @@ from .cog import (
     configure_gdal_for_cog,
     delete_clips,
     explain_read_error,
+    set_asset_headers,
 )
 from .index import _INDEX_NODATA, _bake_index, _index_source
 from .layers import (
@@ -59,6 +65,7 @@ from .vrt import _add_scl_mask, _band_type, _build_vrt, _composite
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from ..stac.catalogs import CatalogProvider
     from ..stac.collections import CollectionInfo, IndexPreset
     from ..stac.items import AssetProj, StacItemResult
     from .layers import SceneRender
@@ -69,6 +76,8 @@ __all__ = [
     "DownloadTask",
     "ExportClipTask",
     "MosaicBuildTask",
+    "Observation",
+    "PixelSeriesTask",
 ]
 
 # Longest-side canvas size the coarse placeholder is rendered for, for a
@@ -986,3 +995,187 @@ class DiagnoseTask(_EventTask):
                 "GDAL opens the file, but QStac could not build a layer on it."
             )
         return True
+
+
+# Most days a pixel series reads: a year of Sentinel-2 is ~150 of them.
+_SERIES_MAX = 400
+# Scenes read at once: PC's point requests or, elsewhere, COG tile reads.
+_SERIES_WORKERS = 16
+
+
+@dataclass(frozen=True)
+class Observation:
+    """One scene's NDVI at a pixel series' point."""
+
+    day: str  # YYYY-MM-DD, UTC
+    item_id: str
+    value: float | None  # None where a band has no data there
+    scl: int | None  # the scene classification there, if the scene has one
+    cloud: float | None  # the whole scene's eo:cloud_cover
+
+    @property
+    def clear(self) -> bool:
+        return self.value is not None and self.scl not in SCL_HIDDEN
+
+
+def _one_per_day(items: list[StacItemResult]) -> list[StacItemResult]:
+    """Each UTC day's clearest scene: neighbouring tiles overlap, so a point
+    is often in two of one pass."""
+    best: dict[str, StacItemResult] = {}
+    for it in items:
+        day = it.datetime_str[:10]
+        cloud = it.cloud_cover if it.cloud_cover is not None else 101.0
+        kept = best.get(day)
+        if kept is None or cloud < (kept.cloud_cover or 101.0):
+            best[day] = it
+    return sorted(best.values(), key=lambda it: it.datetime_str)
+
+
+def _series_assets(item: StacItemResult) -> tuple[str, str, str | None] | None:
+    """The red, NIR and SCL assets of *item* (SCL None if it has none), or
+    None without red and NIR."""
+    found, missing = resolve_variables(("red", "nir"), item.assets, item.asset_meta)
+    if missing:
+        return None
+    scl = next((a for a in SCL_ASSETS if a in item.assets), None)
+    return found["red"], found["nir"], scl
+
+
+def _ndvi(
+    item: StacItemResult, red: str, nir: str, dn: tuple[float | None, float | None]
+) -> float | None:
+    """NDVI from raw red and NIR values, through each asset's scale and
+    offset (PC's Sentinel-2 subtracts 0.1 from baseline 04.00 on)."""
+    values = []
+    for asset, v in zip((red, nir), dn, strict=True):
+        if v is None:
+            return None
+        proj = item.asset_proj.get(asset)
+        values.append(v * proj.scale + proj.offset if proj else v)
+    r, n = values
+    return (n - r) / (n + r) if n + r > 0 else None
+
+
+def _pixel_at(url: str, lon: float, lat: float) -> float | None:
+    """The first band's value of the raster at *url* under a WGS84 point,
+    None outside it or on its nodata."""
+    ds = gdal.Open(url)
+    wgs84 = osr.SpatialReference()
+    wgs84.ImportFromEPSG(4326)
+    srs = ds.GetSpatialRef()
+    for ref in (wgs84, srs):
+        ref.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    x, y, _ = osr.CoordinateTransformation(wgs84, srs).TransformPoint(lon, lat)
+    gt = ds.GetGeoTransform()
+    col, row = int((x - gt[0]) / gt[1]), int((y - gt[3]) / gt[5])
+    if not (0 <= col < ds.RasterXSize and 0 <= row < ds.RasterYSize):
+        return None
+    band = ds.GetRasterBand(1)
+    value = float(band.ReadAsArray(col, row, 1, 1)[0][0])
+    return None if value == band.GetNoDataValue() else value
+
+
+class PixelSeriesTask(_EventTask):
+    """NDVI over time at one point: every scene of the dates there, one a
+    day, whatever its cloud cover, with its SCL class there.
+
+    Planetary Computer's values come from its data API (``auth.pc_point``),
+    one small request a scene; any other catalog's from the COGs, a whole
+    tile read for each value. Emits ``found`` with the number of scenes,
+    then ``observed`` with each scene's :class:`Observation` as it lands.
+    """
+
+    found = pyqtSignal(int)
+    observed = pyqtSignal(object)  # an Observation
+
+    def __init__(
+        self,
+        catalog: CatalogProvider,
+        collection: str,
+        point: tuple[float, float],
+        datetime_range: str,
+        timeout: int,
+    ) -> None:
+        super().__init__("Reading NDVI over time")
+        self.catalog, self.collection = catalog, collection
+        self.point, self.datetime_range, self.timeout = point, datetime_range, timeout
+        self.error: str | None = None
+        self.failed = 0  # scenes whose values could not be read
+
+    def run(self) -> bool:
+        cat = self.catalog
+        lon, lat = self.point
+        try:
+            items, _ = search_catalog(
+                self.collection,
+                (lon, lat, lon, lat),
+                self.datetime_range,
+                max_items=_SERIES_MAX,
+                catalog_url=cat.search_url,
+                page_limit=cat.page_limit,
+                auth_headers=request_headers(cat) or None,
+                http_timeout=self.timeout,
+                cancel_check=self._cancel.is_set,
+                server_side_sort=cat.supports_sortby,
+                intersects={"type": "Point", "coordinates": [lon, lat]},
+            )
+        except StacError as exc:
+            self.error = str(exc)
+            return False
+        jobs = [(it, a) for it in _one_per_day(items) if (a := _series_assets(it))]
+        if items and not jobs:
+            self.error = "Its scenes have no red and near-infrared bands for NDVI."
+            return False
+        self.found.emit(len(jobs))
+        if cat.auth_assets:
+            hrefs = [it.assets[a] for it, names in jobs for a in names if a]
+            set_asset_headers(cat.id, hrefs, request_headers(cat))
+        read = self._read_pc if cat.asset_signer == "pc_sas" else self._read_cogs
+        with concurrent.futures.ThreadPoolExecutor(_SERIES_WORKERS) as pool:
+            futures = [pool.submit(read, it, *names) for it, names in jobs]
+            for i, fut in enumerate(concurrent.futures.as_completed(futures)):
+                if self._cancel.is_set():
+                    for f in futures:
+                        f.cancel()
+                    return False
+                try:
+                    self.observed.emit(fut.result())
+                except Exception:  # one scene less, said in the count
+                    self.failed += 1
+                self.setProgress(100 * (i + 1) / len(futures))
+        return True
+
+    def _observation(
+        self,
+        item: StacItemResult,
+        red: str,
+        nir: str,
+        values: list[float | None],
+    ) -> Observation:
+        scl = values[2] if len(values) > 2 else None
+        return Observation(
+            item.datetime_str[:10],
+            item.id,
+            _ndvi(item, red, nir, (values[0], values[1])),
+            None if scl is None else int(scl),
+            item.cloud_cover,
+        )
+
+    def _read_pc(
+        self, item: StacItemResult, red: str, nir: str, scl: str | None
+    ) -> Observation:
+        assets = [red, nir] + ([scl] if scl else [])
+        lon, lat = self.point
+        values = pc_point(item.collection, item.id, assets, lon, lat, self.timeout)
+        return self._observation(item, red, nir, values)
+
+    def _read_cogs(
+        self, item: StacItemResult, red: str, nir: str, scl: str | None
+    ) -> Observation:
+        names = [red, nir] + ([scl] if scl else [])
+        lon, lat = self.point
+        with concurrent.futures.ThreadPoolExecutor(len(names)) as pool:
+            values = list(
+                pool.map(lambda a: _pixel_at(_vsicurl(item.assets[a]), lon, lat), names)
+            )
+        return self._observation(item, red, nir, values)

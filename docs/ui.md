@@ -260,3 +260,18 @@ on the scene (`_guess_item_asset()`) takes a `visual` COG, else the assets
 whose common names are red/green/blue, else the first `data` raster, else
 the first raster.
 
+
+*NDVI over time at a point…* (the top row's ⋯ menu) hands the map a point
+tool (`QgsMapToolEmitPoint`, given back as a drawing tool is). The point
+clicked gets every scene of the form's collection and dates there, at any
+cloud cover, one a day (the clearest of the tiles that cover it), read in a
+`raster.tasks.PixelSeriesTask`: on Planetary Computer one data-API request a
+scene (`stac.auth.pc_point()`, 109 Sentinel-2 dates in 5 s), elsewhere the
+red, NIR and SCL COGs, a tile read for each value (Earth Search, 27 s from
+Europe). Red and NIR are found by common name (`resolve_variables`), so any
+optical collection with them works; a timeless one has no series. Its dock
+(`ui/series_panel.py`, on the right) charts NDVI through the clear dates as
+they land, the dates the SCL marks cloudy, shadowed or empty as ticks on a
+*cloud* rail under it (their value is the cloud's); hovering a date gives its
+value or why it has none, and the scene's cloud cover. A circle marks the
+point on the map while the dock is open.

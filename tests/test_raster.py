@@ -18,7 +18,7 @@ from types import SimpleNamespace
 os.environ.setdefault("PROJ_DATA", str(Path(sys.prefix) / "share" / "proj"))
 
 import numpy as np
-from osgeo import gdal
+from osgeo import gdal, osr
 from qgis.core import QgsGeometry, QgsRectangle
 
 import qstac.raster.layers as layers_mod
@@ -112,6 +112,85 @@ def test_clip_grid_takes_the_tile_size_read_where_the_cog_lives() -> None:
         assert _cog_geometry(other, view, proj, 32631)[3] == 512
     finally:
         _BLOCKS.clear()
+
+
+def test_pixel_series_reads_each_day_once_and_flags_clouds() -> None:
+    """NDVI at a point from the COGs (a catalog that is not PC): one scene a
+    day, the clearer of two tiles; a scene whose SCL says cloud is not clear."""
+    import functools
+    import http.server
+    import threading
+
+    import qstac.raster.tasks as tasks_mod
+    from qstac.stac.items import AssetMeta, StacItemResult
+
+    def cog(path: str, value: int, dtype: int) -> None:
+        ds = gdal.GetDriverByName("GTiff").Create(path, 4, 4, 1, dtype)
+        ds.SetGeoTransform(_GRID)
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(32631)
+        ds.SetProjection(srs.ExportToWkt())
+        ds.GetRasterBand(1).Fill(value)
+        ds = None
+
+    with tempfile.TemporaryDirectory() as tmp:
+        handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=tmp)
+        handler.log_message = lambda *_a: None
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+
+        def scene(name: str, day: str, cloud: float, dn: tuple) -> StacItemResult:
+            assets = {}
+            for asset, v, dtype in zip(
+                ("B04", "B08", "SCL"),
+                dn,
+                (gdal.GDT_UInt16,) * 2 + (gdal.GDT_Byte,),
+                strict=True,
+            ):
+                cog(f"{tmp}/{name}_{asset}.tif", v, dtype)
+                assets[asset] = f"{base}/{name}_{asset}.tif"
+            proj = AssetProj([4, 4], [10, 0, 500000, 0, -10, 4000000], 1e-4, -0.1)
+            return StacItemResult(
+                name, "s2", f"{day}T10:56:00Z", cloud, None, 32631, None, assets,
+                {"B04": proj, "B08": proj},
+                asset_meta={"B04": AssetMeta(common_name="red"),
+                            "B08": AssetMeta(common_name="nir")},
+            )  # fmt: skip
+
+        items = [
+            scene("a", "2026-06-01", 50, (1100, 4100, 4)),
+            scene("b", "2026-06-01", 10, (1500, 3500, 4)),  # same day, clearer
+            scene("c", "2026-06-06", 80, (5000, 5200, 9)),  # SCL: thick cloud
+        ]
+        utm, wgs84 = osr.SpatialReference(), osr.SpatialReference()
+        utm.ImportFromEPSG(32631)
+        wgs84.ImportFromEPSG(4326)
+        wgs84.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        to_wgs84 = osr.CoordinateTransformation(utm, wgs84)
+        lon, lat, _ = to_wgs84.TransformPoint(500015, 3999985)  # pixel (1, 1)
+        catalog = SimpleNamespace(
+            id="t", search_url="-", page_limit=10, supports_sortby=False,
+            asset_signer=None, auth_assets=False,
+        )  # fmt: skip
+        saved = tasks_mod.search_catalog, tasks_mod.request_headers
+        tasks_mod.search_catalog = lambda *_a, **_k: (items, None)
+        tasks_mod.request_headers = lambda _c: {}
+        try:
+            task = tasks_mod.PixelSeriesTask(catalog, "s2", (lon, lat), "-", 10)
+            found, obs = [], []
+            task.found.connect(found.append)
+            task.observed.connect(obs.append)
+            assert task.run(), task.error
+        finally:
+            tasks_mod.search_catalog, tasks_mod.request_headers = saved
+            srv.shutdown()
+    assert found == [2] and task.failed == 0, (found, task.failed)
+    by_day = {o.day: o for o in obs}
+    june1, june6 = by_day["2026-06-01"], by_day["2026-06-06"]
+    assert june1.item_id == "b" and june1.clear, june1
+    assert abs(june1.value - (0.25 - 0.05) / (0.25 + 0.05)) < 1e-6, june1.value
+    assert june6.scl == 9 and not june6.clear, june6
 
 
 def test_fast_path_nodata_and_type() -> None:

@@ -81,7 +81,7 @@ qstac/                   The plugin — the zip is exactly this folder (+ LICENS
 │   ├── style.py         Per-collection stretch, RGB/single-band/index renderers
 │   ├── layers.py        build_layer, swap, stamp/temporal, mosaic, add_layers_to_project
 │   ├── index.py         Spectral index VRT + in-worker bake
-│   └── tasks.py         CogPrefetchTask, MosaicBuildTask, ExportClipTask, DownloadTask, DiagnoseTask
+│   └── tasks.py         CogPrefetchTask, MosaicBuildTask, ExportClipTask, DownloadTask, DiagnoseTask, PixelSeriesTask
 └── ui/                  Qt UI layer
     ├── dock.py          Main dock widget (toolbar, search form, results, _SearchRun)
     ├── loading.py       LayerLoader: progressive loads, live tasks, clips, signed_assets
@@ -90,6 +90,7 @@ qstac/                   The plugin — the zip is exactly this folder (+ LICENS
     ├── settings_dialog.py  SettingsDialog (pages: catalogs, search, display, mosaic, network), CatalogEditor, ask_s3_keys
     ├── collection_combo.py _CollectionDelegate, _ComboFilter
     ├── area_tool.py     AreaTool: the map tool drawing a search rectangle or polygon
+    ├── series_panel.py  SeriesDock, SeriesChart: NDVI over time at a clicked point
     ├── index_dialog.py  IndexDialog (custom index), custom_index_presets
     ├── widgets.py       ClickableDateEdit, _ResultCard, _WheelGuard, MosaicButton
     ├── constants.py     Palette, display helpers (ids, emoji)
@@ -115,9 +116,10 @@ docs/                    One file per area, see "Where to read" above
 stac:    net, items, collections (leaves) ← detect;  collections ← catalogs ← auth
          catalogs, items, net ← search ← search_task (+ auth, collections)
 raster:  pixel_fn, vrt (leaves) ← cog ← clip, style ← layers ← index ← tasks
-         (cog imports stac/items for s3_to_https, vrt stac/collections for SCL)
+         (cog imports stac/items for s3_to_https, vrt stac/collections for SCL,
+         tasks stac/search + auth + indices for the pixel series)
 ui:      theme ← constants, styles ← widgets, collection_combo, thumbnails ← loading ← index_dialog ← dock
-         area_tool (leaf) ← dock
+         area_tool (leaf), series_panel (constants, styles) ← dock
 geo.py, log.py   leaves (qgis.core only); raster/ and ui/ log, stac/ never does
 plugin.py → ui/ lazily in _open_dock(); settings.py → raster/cog, stac/auth lazily
 ```

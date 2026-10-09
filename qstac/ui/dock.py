@@ -28,7 +28,7 @@ from qgis.core import (
     QgsVectorLayer,
     QgsWkbTypes,
 )
-from qgis.gui import QgsRubberBand
+from qgis.gui import QgsMapToolEmitPoint, QgsRubberBand
 from qgis.PyQt import sip
 from qgis.PyQt.QtCore import (
     QT_VERSION_STR,
@@ -81,7 +81,7 @@ from ..log import log
 from ..raster.clip import ClearViews
 from ..raster.cog import _HAS_PATH_OPTIONS, clear_asset_headers
 from ..raster.layers import enable_time_stack, scene_clip, scene_mask
-from ..raster.tasks import ExportClipTask
+from ..raster.tasks import ExportClipTask, PixelSeriesTask
 from ..stac.auth import request_headers
 from ..stac.catalogs import (
     CATALOG_BY_ID,
@@ -122,6 +122,7 @@ from .loading import (
     scene_render,
     viewport_bbox_4326,
 )
+from .series_panel import SeriesDock, _day_label
 from .styles import fs
 from .thumbnails import ThumbnailLoader
 from .widgets import (
@@ -136,6 +137,7 @@ from .widgets import (
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
 
+    from qgis.core import QgsPointXY
     from qgis.gui import QgisInterface
 
     from ..raster.tasks import MosaicBuildTask
@@ -393,6 +395,7 @@ class QStacDock(QDockWidget):
         self._area_kind = "view"
         self._area_tool = None  # the drawing map tool, kept alive while used
         self._prev_map_tool = None  # given back once drawn
+        self._series: SeriesDock | None = None  # NDVI over time, made on first use
 
         # Animated search progress
         self._progress_timer = QTimer(self)
@@ -684,6 +687,11 @@ class QStacDock(QDockWidget):
         """
         self._closed = True
         self._end_area_tool()
+        if self._series is not None:
+            self._series.shutdown()
+            self.iface.removeDockWidget(self._series)
+            sip.delete(self._series)  # as the plugin deletes this dock
+            self._series = None
         self._loader.shutdown()
         self._thumbs.clear()
         for band in (self._rubber_band, self._search_band):
@@ -790,6 +798,9 @@ class QStacDock(QDockWidget):
         more.addAction(
             icon("mIconSelected.svg"), "Search the selected features"
         ).triggered.connect(self._use_selected_features)
+        more.addAction(
+            icon("mActionIdentify.svg"), "NDVI over time at a point\u2026"
+        ).triggered.connect(self._pick_series_point)
         more.addSeparator()
         # Enabled on user catalogs only, by _sync_catalog_combo.
         self.action_edit = more.addAction(
@@ -1521,6 +1532,58 @@ class QStacDock(QDockWidget):
         self._set_area(geom, kind)
         if not self._search_in_flight():
             self._on_search()
+
+    def _pick_series_point(self) -> None:
+        """Hand the map a point tool; the point clicked gets its NDVI over time."""
+        canvas = self.iface.mapCanvas()
+        if canvas.mapTool() is not self._area_tool or self._area_tool is None:
+            self._prev_map_tool = canvas.mapTool()
+        tool = QgsMapToolEmitPoint(canvas)
+        tool.canvasClicked.connect(lambda point, _button: self._read_series(point))
+        self._area_tool = tool  # given back as a drawing tool is: _end_area_tool
+        canvas.setMapTool(tool)
+        self._notify(
+            "Click a point to chart its NDVI over the search dates.",
+            Qgis.MessageLevel.Info,
+            6,
+        )
+
+    def _read_series(self, point: QgsPointXY) -> None:
+        """Read NDVI over the form's dates at *point* (canvas CRS), in a task,
+        and show it in the series dock as it lands."""
+        self._end_area_tool()
+        run = self._form_run()
+        if run is None:
+            return
+        catalog, coll = run.catalog, run.collection
+        if coll.timeless:
+            self._flash_status(f"{coll.label} has one date: there is no series.")
+            return
+        if not self._loader.ensure_s3_login(catalog):
+            return
+        to_wgs84 = QgsCoordinateTransform(
+            self.iface.mapCanvas().mapSettings().destinationCrs(),
+            QgsCoordinateReferenceSystem(_WGS84),
+            QgsProject.instance(),
+        )
+        at = to_wgs84.transform(point)
+        task = PixelSeriesTask(
+            catalog,
+            coll.id,
+            (at.x(), at.y()),
+            f"{run.date_from}T00:00:00Z/{run.date_to}T23:59:59Z",
+            settings.http_timeout(),
+        )
+        if self._series is None:
+            self._series = SeriesDock(self.iface)
+            self.iface.addDockWidget(
+                Qt.DockWidgetArea.RightDockWidgetArea, self._series
+            )
+        dates = f"{_day_label(run.date_from)} \u2013 {_day_label(run.date_to)}"
+        self._series.follow(
+            task, f"NDVI · {coll.label} · {dates}", point, (at.x(), at.y())
+        )
+        self._loader.run_task(task)
 
     def _use_selected_features(self) -> None:
         """Search the selected features of the active vector layer."""
