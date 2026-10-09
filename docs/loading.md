@@ -102,7 +102,18 @@ Composite (`mosaic_composite`, median by default): a local mosaic's VRT
 (`_has_pixel_fn()`, a probe) gets `pixel_fn.composite_pixel_fn`, NumPy. Any
 scene of the dates is kept (`keep_any`), SCL or not, until each pixel has
 three clear views (`ClearViews(need=3)`, `_COMPOSITE_VIEWS` when
-estimated): a median outvotes what the cloud mask misses. The default,
+estimated): a median outvotes what the cloud mask misses. A pixel
+whose footprints came _TRIES (6) times needs one clear view
+(`ClearViews._short()`): France and Iberia over 3 months chased the pixels
+cloudy in most scenes through every date, up to all 3916 scenes under 20 %;
+capped so, still 1454; fed clearest first in batches, 1860 (a batch's scenes
+were all taken before any clip landed). So where the API sorts
+(`supports_sortby`), a composite's search asks for the dates' scenes
+clearest first (`sortby` eo:cloud_cover, then datetime: one chain of pages,
+0.4-0.7 s each) and a tile takes one where it shows ground fewer than three
+taken do, by footprint, no clip waited for (`TileCover.deepen()`): there,
+882 scenes, 248 from the first page in 0.7 s, all 16 pages read in 11 s for
+the cloudy Galician tiles, the clips rendering meanwhile. The default,
 `recent`, is the median of each pixel's newest 3 (`composite_pixel_fn`,
 NumPy: GDAL has none; the sources come oldest first): recent, and clean.
 It fills 3 slots per pixel from the newest source (`_newest_median()`);

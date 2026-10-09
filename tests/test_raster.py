@@ -22,7 +22,13 @@ from osgeo import gdal
 from qgis.core import QgsGeometry, QgsRectangle
 
 import qstac.raster.layers as layers_mod
-from qstac.geo import TileCover, _filter_by_overlap, area_cover, day_cover
+from qstac.geo import (
+    TileCover,
+    _filter_by_overlap,
+    area_cover,
+    day_cover,
+    holes_cover,
+)
 from qstac.raster.clip import _cog_geometry, _hedge_url, render_clip
 from qstac.raster.cog import (
     _vrt_path,
@@ -287,7 +293,7 @@ def test_mosaic_search_reads_on_until_each_pixel_has_data() -> None:
     """A clip's 0 (a hidden cloud) leaves its pixels wanting an older scene;
     a pixel no footprint covers (the sea), or a speck SCL fails on every
     date (snow taken for cloud), never holds the search."""
-    from qstac.raster.clip import ClearViews
+    from qstac.raster.clip import _TRIES, ClearViews
 
     def clip(
         path: str, cloud_from: int = 8, speck: bool = False, line: bool = False
@@ -346,6 +352,13 @@ def test_mosaic_search_reads_on_until_each_pixel_has_data() -> None:
             assert not three.enough()
             three.add(clip(f"{tmp}/{n}.tif"), box(0, 8))
         assert three.enough()
+        # Cloudy east in all but one of _TRIES scenes: one view does there.
+        tries = ClearViews((0, 0, 8, 8), need=3, width=8)
+        tries.add(clip(f"{tmp}/t0.tif"), box(0, 8))
+        for n in range(1, _TRIES):
+            tries.add(clip(f"{tmp}/t{n}.tif", cloud_from=4), box(0, 8))
+            assert tries.enough() == (n == _TRIES - 1), n
+        assert not tries.wants(box(4, 8))
         # Land to lon 4, sea east of it: the west alone needs data.
         coast = ClearViews((0, 0, 8, 8), width=8)
         coast.add(clip(f"{tmp}/coast.tif", cloud_from=4), box(0, 4))
@@ -1003,6 +1016,34 @@ def test_mosaic_by_time_takes_every_scene_of_the_dates() -> None:
     assert all(cloud == 20 for _end, cloud in seen), seen  # no reach search
     assert not task.capped
     assert task.day_cover == dict.fromkeys(days, 1.0), task.day_cover
+
+
+def test_composite_takes_the_clearest_scenes_three_deep() -> None:
+    """Clearest first, a composite's tile takes a scene where it shows ground
+    fewer than three others do, by footprint, then no more."""
+
+    def scene(fid: str, x0: float, x1: float) -> SimpleNamespace:
+        ring = [[x0, 0], [x1, 0], [x1, 1], [x0, 1], [x0, 0]]
+        return SimpleNamespace(
+            id=fid,
+            datetime_str="2026-09-01 10:56",
+            geometry={"type": "Polygon", "coordinates": [ring]},
+            facets={"s2:mgrs_tile": "31TDL"},
+            cloud_cover=0.5,
+        )
+
+    cover = TileCover([scene("r", 0, 1)], keep_since="2026-07-01", keep_any=True)
+    cover.deepen([scene("a", 0, 1), scene("b", 0, 1), scene("west", 0, 0.5)])
+    assert cover.missing() == ["tile 31TDL"]  # the east seen twice only
+    cover.deepen([scene("west2", 0, 0.5), scene("c", 0, 1), scene("d", 0, 1)])
+    assert [i.id for i in cover.picked] == ["a", "b", "west", "c"], cover.picked
+    assert cover.missing() == []
+    # Filling holes: two scenes over each, whatever their tile.
+    holes = holes_cover(scene("hole", 0, 1).geometry)
+    holes.deepen([scene("west", 0, 0.5), scene("a", 0, 1)])
+    assert holes.missing() == ["holes"]  # the east under one scene only
+    holes.deepen([scene("b", 0, 1), scene("c", 0, 1)])
+    assert [i.id for i in holes.picked] == ["west", "a", "b"], holes.picked
 
 
 def test_new_layers_go_on_top() -> None:

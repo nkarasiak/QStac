@@ -313,6 +313,10 @@ def _burn_scl(src: str, scl: str, out: str) -> str | None:
 # A tile mosaic's search stops once this share of the view's pixels, of
 # those a picked scene covers, is clear in enough scenes (ClearViews).
 _VIEW_CLEAR = 0.99
+# ...and a composite's pixel (need > 1) seen this many times needs one clear
+# view, not need: France and Iberia over 3 months chased the pixels cloudy in
+# most scenes through every date, up to all 3916 scenes under 20 %.
+_TRIES = 6
 
 
 class ClearViews:
@@ -350,6 +354,7 @@ class ClearViews:
         self.gt = (x0, (x1 - x0) / w, 0.0, y1, 0.0, -(y1 - y0) / h)
         self.clear = np.zeros((h, w), np.uint16)
         self.covered = np.zeros((h, w), bool)
+        self.seen = np.zeros((h, w), np.uint16)  # footprints over each pixel
         self.taken = np.zeros((h, w), bool)  # the footprints of the scenes added
         self._lock = threading.Lock()
 
@@ -376,6 +381,7 @@ class ClearViews:
             return
         with self._lock:
             self.clear += clear
+            self.seen += shape
             self.covered |= shape
             self.taken |= shape
 
@@ -410,7 +416,7 @@ class ClearViews:
             return True
         need = self.need if need is None else need
         with self._lock:
-            holes = self._holes(self.covered & (self.clear < need))
+            holes = self._holes(self.covered & self._short(need))
         # Any hole: a wedge between two orbits is far under 1 % of a tile.
         return bool(holes[shape].any())
 
@@ -464,8 +470,15 @@ class ClearViews:
         holes (:func:`_holes`), not specks."""
         with self._lock:
             covered = self.covered.copy()
-            holes = self._holes(covered & (self.clear < need))
+            holes = self._holes(covered & self._short(need))
         return float(holes.sum() / covered.sum()) if covered.any() else 0.0
+
+    def _short(self, need: int) -> np.ndarray:
+        """The pixels clear fewer than *need* times, one seen _TRIES times
+        needing one clear view (the caller holds the lock)."""
+        if need > 1:
+            need = np.where(self.seen >= _TRIES, 1, need)
+        return self.clear < need
 
     def _gaps(self) -> float:
         """The share of the covered pixels no scene taken covers."""

@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 from qgis.core import QgsTask
 
-from ..geo import TileCover, area_cover, day_cover, search_area
+from ..geo import TileCover, area_cover, day_cover, holes_cover, search_area
 from .auth import request_headers
 from .collections import SCL_ASSETS
 from .net import StacError
@@ -236,9 +236,15 @@ class TileSearchTask(QgsTask):
         return [i for page in self._pages(when, cloud, headers) for i in page]
 
     def _pages(
-        self, when: str, cloud: int | None, headers: dict | None, newest: bool = False
+        self,
+        when: str,
+        cloud: int | None,
+        headers: dict | None,
+        newest: bool = False,
+        clearest: bool = False,
     ) -> Iterator[list[StacItemResult]]:
-        """The scenes of *when*, a page at a time (*newest*: newest first)."""
+        """The scenes of *when*, a page at a time (*newest*: newest first;
+        *clearest*: lowest eo:cloud_cover first, then newest)."""
         cat = self.catalog
         fields = None
         if cat.supports_fields:
@@ -268,6 +274,7 @@ class TileSearchTask(QgsTask):
                         server_side_sort=newest and cat.supports_sortby,
                         fields=fields,
                         intersects=self.holes,
+                        clearest_first=clearest,
                     )
                     break
                 except StacError as e:
@@ -298,6 +305,8 @@ class TileSearchTask(QgsTask):
         any cloud cover) shows, those handed to *expect* first."""
         if self.by_time:
             return _EveryScene(self.max_scenes)
+        if self.holes and self._clearest():
+            return holes_cover(self.holes)
         cover = TileCover(
             [i for f in reach for i in f.result()],
             _FILL_GAPS,
@@ -311,6 +320,14 @@ class TileSearchTask(QgsTask):
         elif self.expect is not None and cover.goal:
             self.expect(list(cover.goal.values()))
         return cover
+
+    def _clearest(self) -> bool:
+        """Whether the dates' scenes come clearest first, in pages, to
+        :meth:`TileCover.deepen`: a composite's, and Fill from older scenes'
+        (newest first, each 2-day window waiting for the last's clips)."""
+        if self.by_time or not (self.keep_any or self.holes):
+            return False
+        return self.catalog.supports_sortby
 
     def _clear(self, cover: TileCover | _EveryScene) -> bool:
         """Whether the scenes taken leave no cloud to fill under the dates'."""
@@ -395,6 +412,17 @@ class TileSearchTask(QgsTask):
         self.scenes = cover.scenes()
         return not self.isCanceled()
 
+    def _ends(self) -> list[datetime.date]:
+        """The last days of the dates' _WINDOW_DAYS windows, newest first."""
+        day = datetime.date.fromisoformat
+        step = datetime.timedelta(days=_WINDOW_DAYS)
+        last, first = day(self.date_to), day(self.date_from)
+        ends = []
+        while last >= first:
+            ends.append(last)
+            last -= step
+        return ends
+
     def run(self) -> bool:
         self._started = time.monotonic()
         if not self.reach_days and not self.by_time:
@@ -403,25 +431,25 @@ class TileSearchTask(QgsTask):
             except Exception as e:
                 self.error = f"{e}\n{traceback.format_exc()}"
                 return False
-        day = datetime.date.fromisoformat
-        step = datetime.timedelta(days=_WINDOW_DAYS)
-        last, first = day(self.date_to), day(self.date_from)
-        ends = []
-        while last >= first:
-            ends.append(last)
-            last -= step
+        ends = self._ends()
         reach_ends = [] if self.by_time else ends[: -(-self.reach_days // _WINDOW_DAYS)]
         pool = ThreadPoolExecutor(_IN_FLIGHT)
         picks = ThreadPoolExecutor(_PICK_THREADS)
         try:
             headers = request_headers(self.catalog) or None
             reach = [pool.submit(self._window, e, None, headers) for e in reach_ends]
-            windows = self._read_ahead(pool, ends, headers)
             cover = self._cover(reach)
+            clearest = self._clearest()
+            when = f"{self.date_from}T00:00:00Z/{self.date_to}T23:59:59Z"
+            windows = (
+                self._pages(when, self.cloud, headers, clearest=True)
+                if clearest
+                else self._read_ahead(pool, ends, headers)
+            )
             for n, items in enumerate(windows):
                 if self.isCanceled():
                     return False
-                cover.add(items)
+                (cover.deepen if clearest else cover.add)(items)
                 self._hand_picks(cover, picks)
                 # No tile seen in the reach (none published lately): no goal
                 # to meet, so every window is read rather than none.
@@ -429,13 +457,20 @@ class TileSearchTask(QgsTask):
                 # tile still uncovered cannot spare (France: 5 s became 27).
                 # Filling holes, the clear pixels are the goal.
                 goal = cover.goal or self.holes
-                if goal and not cover.missing() and self._clear(cover):
+                if goal and not cover.missing() and (clearest or self._clear(cover)):
                     break
-                self.setProgress(100 * (n + 1) / len(ends))
+                if clearest:  # TileCover: tiles three deep
+                    self.setProgress(100 * len(cover.done) / max(len(goal), 1))
+                else:
+                    self.setProgress(100 * (n + 1) / len(ends))
             under = [] if self.by_time else self._past_the_limit(cover, reach, picks)
             ids = {it.id for it in under}
             self.scenes = under + [s for s in cover.scenes() if s.id not in ids]
-            self.missing = cover.missing()
+            if self.holes:
+                # Their clips counted: the fill's note says what is left.
+                wait(self._picks)
+            else:  # a tile the dates have no scene for (no tile: holes)
+                self.missing = cover.missing()
             self.goal = list(cover.goal.values())
             self.capped = self.by_time and len(cover.found) > self.max_scenes
             if self.by_time:  # here: it grows with the scenes

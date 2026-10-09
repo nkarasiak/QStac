@@ -81,6 +81,9 @@ _CLOUD_LEFT = 0.02
 # ...and, for a median or mean, is seen this many times: a median needs
 # three to throw out one outlier (haze the cloud mask missed).
 _COMPOSITE_VIEWS = 3
+# Filling holes clearest first (holes_cover), by footprint: two scenes over
+# each, one may be cloudy just there (holes are where clouds stay).
+_FILL_VIEWS = 2
 
 
 class TileCover:
@@ -100,7 +103,8 @@ class TileCover:
     SCL, its clouds hidden so that the older scenes show through them. Taken
     while *wants* says it shows pixels not clear enough yet (the search
     counts them on its clips), else until its tile is likely clear
-    (:meth:`cloudy`, from eo:cloud_cover).
+    (:meth:`cloudy`, from eo:cloud_cover). A composite's scenes fed
+    clearest first go to :meth:`deepen` instead.
     """
 
     def __init__(
@@ -112,8 +116,12 @@ class TileCover:
         keep_since: str = "",
         keep_any: bool = False,
         wants: Callable[[StacItemResult], bool] | None = None,
+        depth: int = _COMPOSITE_VIEWS,
     ) -> None:
         self.fill = fill
+        self.depth = depth  # how many scenes deep deepen() takes the ground
+        # Tile → the ground shown by at least 1, 2... *depth* scenes.
+        self.deep: dict[str, list[QgsGeometry]] = {}
         self.keep_since = keep_since
         self.keep_any = keep_any
         self.wants = wants
@@ -176,6 +184,44 @@ class TileCover:
             if goal.difference(have).area() < 0.01 * goal.area():
                 self.done.add(tile)
 
+    def deepen(self, items: list[StacItemResult]) -> None:
+        """Take each of *items* (a composite's, clearest first) where it shows
+        ground of its tile fewer than *depth* scenes taken show, by
+        footprint, until each tile's ground is that deep: no clip waited
+        for. Newest first and counted on the clips, France and Iberia over 3
+        months under 20 % took 1454 scenes chasing the clouds of every date."""
+        for item in items:
+            tile = self.key(item)
+            if tile and tile not in self.done:
+                self._deepen(item, tile)
+
+    def _deepen(self, item: StacItemResult, tile: str) -> None:
+        shape = self._shape(item)
+        if shape is None:  # nothing to reason with: up to that many
+            if self.views.get(tile, 0) < self.depth:
+                self._pick(item, tile, True)
+            return
+        if shape.isEmpty():
+            return  # outside the search area
+        deep = self.deep.setdefault(tile, [])
+        full = len(deep) == self.depth
+        if full and shape.difference(deep[-1]).area() < 0.01 * shape.area():
+            return  # as many scenes show all of it already
+        self._pick(item, tile, True)
+        # What it adds at each depth: all of it at 1, its overlap with the
+        # ground shown once at 2...
+        grown = [shape] + [shape.intersection(d) for d in deep]
+        for k, more in enumerate(grown[: self.depth]):
+            if k < len(deep):
+                deep[k] = deep[k].combine(more)
+            else:
+                deep.append(more)
+        goal = self.goal.get(tile, deep[0])  # a tile it did not see: as is
+        if len(deep) == self.depth and (
+            goal.difference(deep[-1]).area() < 0.01 * goal.area()
+        ):
+            self.done.add(tile)
+
     def _pick(self, item: StacItemResult, tile: str, fills: bool) -> None:
         self.picked.append(item)
         if fills:
@@ -204,6 +250,14 @@ class TileCover:
     def scenes(self) -> list[StacItemResult]:
         """The picked scenes, oldest first: a mosaic paints the later on top."""
         return sorted(self.picked, key=lambda i: i.datetime_str)
+
+
+def holes_cover(holes: dict) -> TileCover:
+    """A :class:`TileCover` whose one tile is *holes* (GeoJSON, WGS84: what
+    Fill from older scenes searches), _FILL_VIEWS deep by :meth:`deepen`."""
+    cover = TileCover([], key=lambda _item: "holes", depth=_FILL_VIEWS)
+    cover.goal["holes"] = QgsGeometry.fromWkt(_geojson_to_wkt(holes))
+    return cover
 
 
 def area_cover(

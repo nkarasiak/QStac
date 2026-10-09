@@ -232,6 +232,7 @@ def _build_search_body(
     sortby: bool = False,
     fields: dict | None = None,
     intersects: dict | None = None,
+    clearest: bool = False,
 ) -> dict:
     """Build the POST body for a STAC search request.
 
@@ -252,8 +253,12 @@ def _build_search_body(
     # tradeoff below 100, but not when the user asked to filter nothing.
     if cloud_cover_max is not None and cloud_cover_max < 100:
         body["query"] = {"eo:cloud_cover": {"lte": cloud_cover_max}}
-    if sortby:
-        body["sortby"] = [{"field": "properties.datetime", "direction": "desc"}]
+    newest = {"field": "properties.datetime", "direction": "desc"}
+    if clearest:  # a composite's: clearest first, then newest
+        cloud = {"field": "properties.eo:cloud_cover", "direction": "asc"}
+        body["sortby"] = [cloud, newest]
+    elif sortby:
+        body["sortby"] = [newest]
     if fields:  # the fields extension: only these parts of each item
         body["fields"] = fields
     return body
@@ -307,6 +312,7 @@ def search_catalog(
     server_side_sort: bool = False,
     fields: dict | None = None,
     intersects: dict | None = None,
+    clearest_first: bool = False,
 ) -> tuple[list[StacItemResult], PageToken | None]:
     """Search a STAC API.
 
@@ -339,6 +345,8 @@ def search_catalog(
         client-side check still runs — it is cheap and harmless).
     server_side_sort : bool
         Ask the API to sort by datetime descending (``sortby`` extension).
+    clearest_first : bool
+        Ask it to sort by eo:cloud_cover ascending, then datetime descending.
     intersects : dict or None
         A GeoJSON geometry searched instead of *bbox*.
 
@@ -368,6 +376,7 @@ def search_catalog(
             sortby=server_side_sort,
             fields=fields,
             intersects=intersects,
+            clearest=clearest_first,
         )
 
     # Credentials only go to the API that was configured, never to a next

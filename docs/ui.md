@@ -135,7 +135,11 @@ before its dates (`_year_before()`) over its holes only
 the COGs: NDVI near Ussel, 2.0 % empty to 0.01 % in 12 s, true colour's PC
 renders 4 s), a scene taken only where a pixel has no clear view
 yet, until 0.1 % of it lacks one (`_FILL_LEFT`: 1 % left the cloud blobs
-all over a zoomed-in view; 0.1 % took one scene and 0.9 s more), then
+all over a zoomed-in view; 0.1 % took one scene and 0.9 s more); where
+the API sorts, clearest first instead, two scenes over each hole by
+footprint, no clip waited for (`geo.holes_cover()`, `_FILL_VIEWS`: newest
+first, each 2-day window waited for the last's clips; 20 holes over the
+Pyrenees, a year back: 21 scenes of July-September in 0.7 s), then
 builds the mosaic again with them, the older under its own scenes, in its
 layers' place (`_Fill.scenes`, `load_mosaic(replaces=)`, the search's clips
 reused): its median or mean over them all, as a mosaic of those dates would
@@ -204,7 +208,8 @@ stopping a month back had fetched the year's 188 while its clips rendered:
 14 s, 7.7 s without) (no next-page token chain: one took 30 s for France and
 Iberia) and trimmed by the fields extension (`supports_fields`, from
 `conformsTo`) to the footprint, properties and the assets the mosaic reads.
-Windows are read newest first, from the end date back to the start date,
+Windows are read newest first (a composite's scenes come clearest first
+instead, in loading.md), from the end date back to the start date,
 and the search stops once every tile is covered within the search
 area (`TileCover(within=)`: a tile the view clips needs only its part, not
 its older scenes' slivers outside it); the last
