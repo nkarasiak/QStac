@@ -70,14 +70,14 @@ Font sizes are relative to the QGIS application font (`styles.fs()` for
 stylesheets, `styles.pt()` for `QFont`), never px, so the dock follows the
 QGIS font size setting.
 
-The search area is the map view, so the *Area* field over the Search row
-(`combo_area`, a `widgets.MenuCombo`: styled as the combos above it, it opens
-a menu, not a list) says *This map view*,
-and `_show_search_area()` tints the searched box on the map until the search
-ends (`_stop_progress()`). Its menu (`_show_area_menu()`) swaps in a
-drawn rectangle or polygon (`ui/area_tool.py`, clicks, not a drag)
-or the active layer's selected features, which is searched right away, stays
-tinted and is kept for later searches until *This map view* is picked again
+The search area is the map view, and nothing on the form says so: the
+empty list's text does, and `_show_search_area()` tints the searched box on
+the map until the search ends (`_stop_progress()`). The top row's ⋯ menu
+swaps in a drawn rectangle or polygon (`ui/area_tool.py`, clicks, not a drag;
+Esc or another map tool keeps the area there was) or the active layer's
+selected features, which is searched right away, stays tinted and is kept for
+later searches; meanwhile a dim line over Search names it (`area_line`,
+"Drawn polygon ✕") and its ✕ goes back to the map view
 (`_set_area()`, `_SearchRun.area`, WGS84). The server only gets its bbox
 (every API takes one; `intersects` is optional and a detailed shape is too
 big to send), and `_filter_by_overlap(area=)` trims the results to its shape.

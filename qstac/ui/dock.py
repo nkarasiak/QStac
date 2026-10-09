@@ -122,7 +122,6 @@ from .widgets import (
     _CARD_H,
     ClickableDateEdit,
     ElidedLabel,
-    MenuCombo,
     MosaicButton,
     RefreshingCombo,
     _WheelGuard,
@@ -244,9 +243,12 @@ def _lookback_text(days: int) -> str:
     )
 
 
-# The map view as the area: the caption above Search reads "Area: this map
-# view" (drawn areas and selections say theirs the same way).
-_SEARCH_TEXT = "Search this map view"
+# The line over Search while a drawn area or the selection is searched.
+_AREA_NAMES = {
+    "rectangle": "Drawn rectangle",
+    "polygon": "Drawn polygon",
+    "selection": "Selected features",
+}
 
 # Basemap added to an empty project, so there is something to zoom on.
 _OSM_URI = (
@@ -344,10 +346,10 @@ class QStacDock(QDockWidget):
         self._next_page: PageToken | None = None
         self._rubber_band: QgsRubberBand | None = None  # hovered footprint
         self._search_band: QgsRubberBand | None = None  # area being searched
-        # The search area picked from the Search button's ▾ (WGS84), and the
-        # button's text for it; None searches the map view.
+        # The search area picked on the Area row (WGS84), and its chip's key;
+        # None searches the map view.
         self._area: QgsGeometry | None = None
-        self._area_text = _SEARCH_TEXT
+        self._area_kind = "view"
         self._area_tool = None  # the drawing map tool, kept alive while used
         self._prev_map_tool = None  # given back once drawn
 
@@ -735,6 +737,19 @@ class QStacDock(QDockWidget):
             self.open_settings_dialog
         )
         more = QMenu(self)
+        # Search covers the map view; another area is a choice made rarely,
+        # so here, off the form (a field, an arrow glued to Search, and
+        # segments under an "Area:" caption were all tried).
+        more.addAction(
+            icon("mActionSelectRectangle.svg"), "Search a drawn rectangle\u2026"
+        ).triggered.connect(lambda: self._draw_area(polygon=False))
+        more.addAction(
+            icon("mActionSelectPolygon.svg"), "Search a drawn polygon\u2026"
+        ).triggered.connect(lambda: self._draw_area(polygon=True))
+        more.addAction(
+            icon("mIconSelected.svg"), "Search the selected features"
+        ).triggered.connect(self._use_selected_features)
+        more.addSeparator()
         # Enabled on user catalogs only, by _sync_catalog_combo.
         self.action_edit = more.addAction(
             icon("mActionToggleEditing.svg"), "Edit this STAC API…"
@@ -1037,28 +1052,29 @@ class QStacDock(QDockWidget):
         layout.addLayout(cloud_row)
 
     def _build_search_button(self, layout: QVBoxLayout) -> None:
-        """The Area field, then Search and the outlined Mosaic beside it.
+        """Search and the outlined Mosaic beside it; over them, the drawn area.
 
-        The area is a field like the ones above it, not an arrow glued to
-        Search: what to cover, then what to do. Search is the one filled
-        action; Mosaic is outlined, so a newcomer is not asked to pick
-        between two equal buttons (tried, as was a mode switch).
+        Search is the one filled action; Mosaic is outlined, so a newcomer
+        is not asked to pick between two equal buttons (tried, as was a mode
+        switch). The area line shows only while a drawn area or the
+        selection replaces the map view, with its \u2715 to go back.
         """
-        # "This map view": the search area is the map extent, which nothing
-        # else on the dock says.
-        self._add_caption(
-            layout,
-            "Area",
-            "What Search and the mosaic cover: the map view, a drawn\n"
-            "rectangle or polygon, or the selected features.",
-        )
-        self.combo_area = MenuCombo(self._show_area_menu)
-        self.combo_area.setStyleSheet(styles.combo_style(P))
-        self.combo_area.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._area_wheel_guard = _WheelGuard(self.combo_area)
-        self.combo_area.installEventFilter(self._area_wheel_guard)
-        layout.addWidget(self.combo_area)
-        layout.addSpacing(6)
+        self.area_line = QWidget()
+        line = QHBoxLayout(self.area_line)
+        line.setContentsMargins(0, 0, 0, 2)
+        line.setSpacing(4)
+        self.label_area = QLabel()
+        self.label_area.setStyleSheet(f"color: {P.text_dim}; font-size: {fs(0.85)};")
+        line.addWidget(self.label_area)
+        btn_clear = QPushButton("\u2715")
+        btn_clear.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_clear.setToolTip("Search the map view again")
+        btn_clear.setStyleSheet(styles.link_btn_style(P))
+        btn_clear.clicked.connect(lambda: self._set_area(None, "view"))
+        line.addWidget(btn_clear)
+        line.addStretch()
+        self.area_line.setVisible(False)
+        layout.addWidget(self.area_line)
         self.btn_search = QPushButton("Search")
         self.btn_search.setFixedHeight(34)
         self.btn_search.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1397,37 +1413,14 @@ class QStacDock(QDockWidget):
             self._search_band = band
         self._search_band.setToGeometry(area, QgsCoordinateReferenceSystem(_WGS84))
 
-    def _show_area_menu(self) -> None:
-        """The Area field's menu: which area the next searches cover."""
-        menu = QMenu(self)
-        view = menu.addAction(_SEARCH_TEXT.replace("Search this", "This"))
-        view.setCheckable(True)
-        view.setChecked(self._area is None)
-        view.triggered.connect(lambda: self._set_area(None, _SEARCH_TEXT))
-        menu.addAction("Draw a rectangle…").triggered.connect(
-            lambda: self._draw_area(polygon=False)
-        )
-        menu.addAction("Draw a polygon…").triggered.connect(
-            lambda: self._draw_area(polygon=True)
-        )
-        layer = self.iface.activeLayer()
-        n = layer.selectedFeatureCount() if isinstance(layer, QgsVectorLayer) else 0
-        sel = menu.addAction(f"Selected features ({n})" if n else "Selected features")
-        sel.setEnabled(n > 0)
-        if not n:
-            sel.setToolTip("Select features on a vector layer first.")
-            menu.setToolTipsVisible(True)
-        sel.triggered.connect(self._use_selected_features)
-        combo = self.combo_area
-        menu.setMinimumWidth(combo.width())
-        menu.exec(combo.mapToGlobal(combo.rect().bottomLeft()))
-
-    def _set_area(self, area: QgsGeometry | None, text: str) -> None:
+    def _set_area(self, area: QgsGeometry | None, kind: str) -> None:
         """Search *area* (WGS84) from now on, or the map view when None."""
         if area is not None and not area.isGeosValid():
             area = area.makeValid()  # a self-crossing polygon
-        self._area, self._area_text = area, text
-        self._sync_mosaic_button()  # and the area caption
+        self._area, self._area_kind = area, kind
+        self.area_line.setVisible(area is not None)
+        if area is not None:
+            self.label_area.setText(_AREA_NAMES[kind])
         if area is not None:
             self._show_search_area(area)
         elif self._search_band is not None:
@@ -1444,8 +1437,8 @@ class QStacDock(QDockWidget):
             QColor(*P.accent_rgba_fill),
             rectangle=not polygon,
         )
-        text = "Search drawn polygon" if polygon else "Search drawn rectangle"
-        tool.drawn.connect(lambda g: self._on_area_drawn(g, text))
+        kind = "polygon" if polygon else "rectangle"
+        tool.drawn.connect(lambda g: self._on_area_drawn(g, kind))
         if polygon:
             hint = (
                 "Click the corners of the area, then double-click to search it"
@@ -1470,7 +1463,7 @@ class QStacDock(QDockWidget):
         else:
             canvas.unsetMapTool(tool)
 
-    def _on_area_drawn(self, geom: QgsGeometry, text: str) -> None:
+    def _on_area_drawn(self, geom: QgsGeometry, kind: str) -> None:
         """A drawing tool finished: *geom* in the canvas CRS, null if given up."""
         self._end_area_tool()
         if geom.isNull() or geom.isEmpty():
@@ -1484,7 +1477,7 @@ class QStacDock(QDockWidget):
                 QgsProject.instance(),
             )
         )
-        self._set_area(geom, text)
+        self._set_area(geom, kind)
         if not self._search_in_flight():
             self._on_search()
 
@@ -1492,6 +1485,9 @@ class QStacDock(QDockWidget):
         """Search the selected features of the active vector layer."""
         layer = self.iface.activeLayer()
         if not isinstance(layer, QgsVectorLayer) or not layer.selectedFeatureCount():
+            self._notify(
+                "Select features on a vector layer first.", Qgis.MessageLevel.Info, 5
+            )
             return
         geom = QgsGeometry.unaryUnion([f.geometry() for f in layer.selectedFeatures()])
         if geom.isNull() or geom.isEmpty():
@@ -1504,8 +1500,7 @@ class QStacDock(QDockWidget):
                 layer.crs(), QgsCoordinateReferenceSystem(_WGS84), QgsProject.instance()
             )
         )
-        n = layer.selectedFeatureCount()
-        self._set_area(geom, f"Search {n} selected feature{'s' if n > 1 else ''}")
+        self._set_area(geom, "selection")
         if not self._search_in_flight():
             self._on_search()
 
@@ -1902,7 +1897,7 @@ class QStacDock(QDockWidget):
         self.btn_search.setEnabled(True)
         self.btn_search.setText("Cancel search")
         self.btn_search.setStyleSheet(styles.outline_btn_style(P))
-        self.combo_area.setEnabled(False)
+        self.area_line.setEnabled(False)
         self._sync_more_bar()
 
     def _restore_search_button(self) -> None:
@@ -1910,7 +1905,7 @@ class QStacDock(QDockWidget):
         self.btn_search.setEnabled(True)
         self.btn_search.setText("Search")
         self.btn_search.setStyleSheet(styles.search_btn_style(P))
-        self.combo_area.setEnabled(True)
+        self.area_line.setEnabled(True)
 
     def _cancel_search(self) -> None:
         """Cancel the in-flight search task, if any, and reset the UI."""
@@ -2290,12 +2285,10 @@ class QStacDock(QDockWidget):
         )
 
     def _sync_mosaic_button(self, progress: float = 0.0) -> None:
-        """The Area field, and the Mosaic button: its rule, or progress.
+        """The Mosaic button: its rule, or progress.
 
         *progress* comes from the tile mosaic's task (a worker signal).
         """
-        where = self._area_text.removeprefix("Search ")
-        self.combo_area.set_value(where[:1].upper() + where[1:])
         btn = self.btn_mosaic
         if self._tile_task is not None:
             btn.set_progress(progress)

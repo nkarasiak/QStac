@@ -609,25 +609,6 @@ class RefreshingCombo(QComboBox):
         super().showPopup()
 
 
-class MenuCombo(QComboBox):
-    """A combo that shows one value and opens *on_open*'s menu, not a list.
-
-    The search area: its choices are actions (draw a rectangle…) whose Esc
-    keeps the area it had, which a combo's own list cannot express.
-    """
-
-    def __init__(self, on_open: Callable[[], None], parent: QWidget | None = None):
-        super().__init__(parent)
-        self._on_open = on_open
-
-    def set_value(self, text: str) -> None:
-        self.clear()
-        self.addItem(text)
-
-    def showPopup(self) -> None:  # noqa: N802 (Qt override)
-        self._on_open()
-
-
 class ElidedLabel(QLabel):
     """One-line label that elides what does not fit instead of growing.
 
