@@ -27,8 +27,11 @@ Nodata: a declared one (file, else STAC `raster:bands`) always wins. A
 Byte/UInt16 file with no nodata, mask or alpha (PC's Sentinel-2 TCI and
 bands declare nothing) gets the STAC one, else 0 (`_build_vrt(default_nodata=)`,
 `vrt._stac_nodata()`), so its black edge is transparent and a mosaic's empty
-corners never paint over a neighbour. Never a signed or float file: a DEM's
-0 (Cop-DEM, ALOS) is sea level; a mosaic of those gets a nodata of the VRT
+corners never paint over a neighbour. A multi-band one (TCI) gets it per
+source only, plus a dataset mask that is nodata where every band is 0
+(`vrt._with_any_band_mask()`): one band's 0 is a dark pixel (blue in a
+forest shadow), never a hole; `clip._burn_scl()` makes such a 0 a 1.
+Never a signed or float file: a DEM's 0 (Cop-DEM, ALOS) is sea level; a mosaic of those gets a nodata of the VRT
 alone (`vrt._GAP`, -32768), so where no tile is (open sea) is transparent,
 not 0, black, and the tiles' own 0 stays a value.
 Clouds: with *Hide clouds* on (Display settings, the default), a scene

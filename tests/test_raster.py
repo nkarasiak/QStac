@@ -542,6 +542,48 @@ def test_default_nodata_only_fills_unmasked_sources() -> None:
         assert band.ReadAsArray().tolist() == [[0, 3, gap, gap, 0, 4]]
 
 
+def test_true_colour_zero_in_one_band_is_a_dark_pixel() -> None:
+    """PC's TCI: blue 0 in a forest shadow is data; nodata is all bands 0,
+    on the scene, its clip, a mosaic, the SCL-masked and burned copies."""
+    from qstac.raster.clip import _burn_scl
+    from qstac.raster.vrt import _add_scl_mask
+
+    def tci(path: str, rgb: list[list[int]], x: int = 0) -> str:
+        ds = gdal.GetDriverByName("GTiff").Create(path, len(rgb), 1, 3)
+        for band, plane in enumerate(np.array(rgb, np.uint8).T, start=1):
+            ds.GetRasterBand(band).WriteArray(plane[None])
+        ds.SetGeoTransform([_GRID[0] + 10 * x, *_GRID[1:]])
+        ds = None
+        return path
+
+    def valid(src: str) -> list[bool]:
+        ds = gdal.Open(src)
+        assert ds.GetRasterBand(1).GetNoDataValue() is None
+        return (ds.GetRasterBand(1).GetMaskBand().ReadAsArray()[0] > 0).tolist()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        a = tci(f"{tmp}/a.tif", [[0, 0, 0], [9, 11, 0], [40, 50, 60]])
+        assert valid(_build_vrt("", [a], default_nodata=0)) == [False, True, True]
+        clip = _build_vrt(f"{tmp}/clip.vrt", [a], default_nodata=0)
+        assert valid(clip) == [False, True, True]
+        assert gdal.Open(clip).ReadAsArray()[:, 0, 1].tolist() == [9, 11, 0]
+        # A newer scene's black corner leaves the older one's pixel.
+        b = tci(f"{tmp}/b.tif", [[7, 7, 7], [0, 0, 0], [0, 0, 0]], x=1)
+        mosaic = _build_vrt("", [a, b], default_nodata=0)
+        assert valid(mosaic) == [False, True, True, False]
+        got = gdal.Open(mosaic).ReadAsArray()[:, 0].T.tolist()
+        assert got[1:3] == [[7, 7, 7], [40, 50, 60]], got
+        # The SCL replaces the mask (its class 0 is no data), and the burned
+        # copy keeps the dark pixel: a band's nodata 0 only where all are.
+        scl = _tif(f"{tmp}/s.tif", np.array([[0, 4, 9]], np.uint8), gdal.GDT_Byte)
+        masked = gdal.Open(_add_scl_mask(_build_vrt("", [a], default_nodata=0), scl))
+        assert masked.GetRasterBand(1).GetMaskBand().ReadAsArray().tolist() == [
+            [0, 255, 0]
+        ]
+        burned = gdal.Open(_burn_scl(clip, scl, f"{tmp}/clear.tif"))
+        assert burned.ReadAsArray()[:, 0].T.tolist() == [[0, 0, 0], [9, 11, 1], [0] * 3]
+
+
 def test_palette_keeps_the_stac_classes_named() -> None:
     """ESA WorldCover: 256 colours in the COG, 11 classes named in STAC."""
     from qgis.core import QgsRasterLayer

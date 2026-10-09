@@ -303,12 +303,15 @@ def _burn_scl(src: str, scl: str, out: str) -> str | None:
     )
     dst.SetGeoTransform(ds.GetGeoTransform())
     dst.SetProjection(ds.GetProjection())
-    for i in range(1, ds.RasterCount + 1):
-        values = ds.GetRasterBand(i).ReadAsArray()
-        values[hidden] = 0
+    values = ds.ReadAsArray().reshape(ds.RasterCount, *hidden.shape)
+    # A band's 0 where another is not is a dark pixel (_build_vrt): 1, so
+    # each band's nodata 0 is only where every band is.
+    values[(values == 0) & (values != 0).any(axis=0)] = 1
+    values[:, hidden] = 0
+    for i, plane in enumerate(values, start=1):
         band = dst.GetRasterBand(i)
         band.SetNoDataValue(0)
-        band.WriteArray(values)
+        band.WriteArray(plane)
     dst = None  # flush + close
     return out
 

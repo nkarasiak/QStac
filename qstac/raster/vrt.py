@@ -42,10 +42,14 @@ def _build_vrt(
     """
     mosaic = len(sources) > 1 and not separate
     asks = nodata is None and (default_nodata is not None or mosaic)
-    dtype = _unmasked_type(sources[0]) if asks else None
+    dtype, count = _unmasked_type(sources[0]) if asks else (None, 0)
     if dtype in _UNSIGNED and default_nodata is not None:
         nodata = default_nodata
-    gap = nodata
+    # A 0 in one band of a true-colour file is a dark pixel (blue in a forest
+    # shadow): each source still leaves its 0 unpainted, but nodata is where
+    # every band is 0, a dataset mask, never one band's own.
+    masked = nodata == 0 and count > 1 and not separate
+    gap = "None" if masked else nodata
     if dtype in _SIGNED and mosaic:
         gap = _GAP  # the VRT's alone: a source's 0 stays a value
     ds = None
@@ -62,7 +66,39 @@ def _build_vrt(
         return None
     _strip_scale_offset(ds)
     ds.FlushCache()
-    return path or ds.GetMetadata("xml:VRT")[0]
+    if not masked:
+        return path or ds.GetMetadata("xml:VRT")[0]
+    xml = _with_any_band_mask(ds.GetMetadata("xml:VRT")[0])
+    ds = None  # closed before the file is rewritten
+    if not path:
+        return xml
+    Path(path).write_text(xml, encoding="utf-8")
+    return path
+
+
+_SOURCE = re.compile(r"<(Simple|Complex)Source[^>]*>(.*?)</\1Source>", re.DOTALL)
+_SOURCE_PLACE = re.compile(
+    r"\s*<(SourceFilename|SourceBand|SrcRect|DstRect)\b.*?(?:/>|</\1>)", re.DOTALL
+)
+
+
+def _with_any_band_mask(xml: str) -> str:
+    """*xml* with a dataset mask valid where any band of any source is not 0:
+    every source again, 0 left unwritten, any other value painted 255."""
+    places = (
+        "".join(m.group(0) for m in _SOURCE_PLACE.finditer(body))
+        for _, body in _SOURCE.findall(xml)
+    )
+    sources = "".join(
+        f"      <ComplexSource>{place}\n        <NODATA>0</NODATA>\n"
+        "        <LUT>0:255,255:255</LUT>\n      </ComplexSource>\n"
+        for place in places
+    )
+    band = (
+        '  <MaskBand>\n    <VRTRasterBand dataType="Byte">\n'
+        f"{sources}    </VRTRasterBand>\n  </MaskBand>\n"
+    )
+    return xml.replace("</VRTDataset>", f"{band}</VRTDataset>")
 
 
 _UNSIGNED = (gdal.GDT_Byte, gdal.GDT_UInt16)
@@ -70,15 +106,18 @@ _SIGNED = (gdal.GDT_Int16, gdal.GDT_Int32, gdal.GDT_Float32, gdal.GDT_Float64)
 _GAP = -32768  # below any elevation, and Int16's own nodata by habit
 
 
-def _unmasked_type(src: str) -> int | None:
-    """*src*'s GDAL data type when every pixel is valid (no nodata, mask, alpha)."""
+def _unmasked_type(src: str) -> tuple[int | None, int]:
+    """(*src*'s GDAL data type, band count) when every pixel is valid (no
+    nodata, mask, alpha), else (None, 0)."""
     ds = None
     with contextlib.suppress(RuntimeError):
         ds = gdal.Open(src)
     if ds is None:
-        return None
+        return None, 0
     band = ds.GetRasterBand(1)
-    return band.DataType if band.GetMaskFlags() == gdal.GMF_ALL_VALID else None
+    if band.GetMaskFlags() != gdal.GMF_ALL_VALID:
+        return None, 0
+    return band.DataType, ds.RasterCount
 
 
 def _add_virtual_overviews(path: str) -> None:
@@ -309,6 +348,8 @@ def _add_scl_mask(src: str, scl: str) -> str | None:
     )
     is_xml = src.lstrip().startswith("<")
     xml = src if is_xml else Path(src).read_text(encoding="utf-8")
+    # SCL's class 0 is no data: it replaces an all-bands-0 mask (_build_vrt).
+    xml = re.sub(r"  <MaskBand>.*?</MaskBand>\n", "", xml, flags=re.DOTALL)
     xml = xml.replace("</VRTDataset>", f"{band}</VRTDataset>")
     if is_xml:
         return xml
