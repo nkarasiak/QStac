@@ -129,8 +129,8 @@ class TileSearchTask(QgsTask):
 
     The dates are cut into _WINDOW_DAYS windows, searched _IN_FLIGHT at a
     time and read newest first into a :class:`TileCover`, from *date_to*
-    back to *lookback_days* before *date_from* (the ``mosaic_lookback_days``
-    setting; 0 stays within the dates), stopping once every tile is
+    back to *lookback_days* before *date_from* (the mosaic menu's *Only the
+    search dates*: 0 stays within the dates), stopping once every tile is
     covered within the search area. The last *reach_days* (the
     collection's revisit and publishing delay:
     ``CollectionInfo.mosaic_reach_days``), searched alongside without the

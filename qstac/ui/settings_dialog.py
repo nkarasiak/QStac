@@ -562,30 +562,6 @@ class SettingsDialog(QDialog):
         form = self._group(page, "The Mosaic button")
         self._row(
             form,
-            "A click builds:",
-            "mosaic_kind",
-            self._combo(
-                [
-                    ("Newest scene per tile", "tile"),
-                    ("One mosaic per date, with the time slider", "time"),
-                ]
-            ),
-            "Also picked from the button's right-click menu.",
-        )
-        lookback = self._spin(0, 1825, " days", 30)
-        lookback.setSpecialValueText("Only the search dates")
-        self._row(
-            form,
-            "Look back before the start date:",
-            "mosaic_lookback_days",
-            lookback,
-            "Newest scene per tile: how far back to look for a tile the dates "
-            "leave empty. Only the search dates leaves it empty (the basemap "
-            "shows), and keeps a mosaic with no tile grid to the dates too. Also "
-            "in the mosaic button's right-click menu.",
-        )
-        self._row(
-            form,
             "Most scenes per mosaic:",
             "mosaic_max_scenes",
             self._spin(50, 5000, " scenes", 50),

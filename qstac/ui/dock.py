@@ -10,6 +10,7 @@ import urllib.parse
 from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import date, timedelta
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
@@ -42,6 +43,8 @@ from qgis.PyQt.QtCore import (
 )
 from qgis.PyQt.QtGui import QColor, QDesktopServices, QKeySequence
 from qgis.PyQt.QtWidgets import (
+    QButtonGroup,
+    QCheckBox,
     QComboBox,
     QCommandLinkButton,
     QDialog,
@@ -55,6 +58,7 @@ from qgis.PyQt.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QRadioButton,
     QShortcut,
     QSizePolicy,
     QSlider,
@@ -62,6 +66,7 @@ from qgis.PyQt.QtWidgets import (
     QToolButton,
     QVBoxLayout,
     QWidget,
+    QWidgetAction,
 )
 from qgis.utils import pluginMetadata
 
@@ -340,9 +345,14 @@ class QStacDock(QDockWidget):
         self._results: list[StacItemResult] = []
         self._facet_filter: dict[str, str] = {}  # FACETS key → chosen value
         self._tile_task: TileSearchTask | None = None  # Tile mosaic's search
-        # What the mosaic button shows, per collection id: a band combination
-        # or index label, "" (absent) the default. For the session only.
+        # The mosaic menu's picks, for the session only (a click builds the
+        # default, see _mosaic_options): what it shows, per collection id (a
+        # band combination or index label, "" or absent the default), and
+        # which mosaic ("tile" or "time") and its look back before the start
+        # date (0: the search dates only).
         self._mosaic_render: dict[str, str] = {}
+        self._mosaic_kind = "tile"
+        self._mosaic_lookback = 0
         self._next_page: PageToken | None = None
         self._rubber_band: QgsRubberBand | None = None  # hovered footprint
         self._search_band: QgsRubberBand | None = None  # area being searched
@@ -1819,7 +1829,7 @@ class QStacDock(QDockWidget):
             if "date_buttons" in changed:
                 self._fill_date_presets()
                 self._sync_date_presets()
-            self._sync_mosaic_button()  # mosaic_kind
+            self._sync_mosaic_button()
 
     # --- Footprint highlight on hover ---
 
@@ -2305,20 +2315,34 @@ class QStacDock(QDockWidget):
         cloud = self.cloud_slider.value()
         has_limit = coll.has_cloud_cover and cloud < 100
         limit = f" under {cloud}% clouds" if has_limit else ""
+        kind, days, _ = self._mosaic_options(coll, picked=False)
         rule = (
             f"one per date{limit}, with the time slider"
-            if settings.mosaic_kind() == "time" and not coll.timeless
+            if kind == "time" and not coll.timeless
             else f"each tile's newest scene{limit}"
             if coll.mosaic_reach_days
             else f"the newest scene of each place{limit}"
         )
-        if settings.mosaic_kind() == "tile" and settings.mosaic_lookback_days() == 0:
+        if kind == "tile" and days == 0:
             rule += ", search dates only"
 
         # Short: hovering also tints the area it covers on the map.
-        render = self._mosaic_render.get(coll.id)
-        shows = f" of {render}" if render else ""
-        btn.setToolTip(f"Mosaic{shows}: {rule}\nRight-click: options")
+        btn.setToolTip(
+            f"Mosaic of {_default_label(coll)}: {rule}"
+            "\nRight-click: other dates, bands or an index"
+        )
+
+    def _mosaic_options(
+        self, coll: CollectionInfo, picked: bool
+    ) -> tuple[str, int, str]:
+        """(kind, look-back days, render) of a mosaic of *coll*: a click
+        builds the default, each tile's newest scene of the search dates in
+        the default look; one started from the right-click menu (*picked*)
+        its picks, kept for the session."""
+        if not picked:
+            return "tile", 0, ""
+        render = self._mosaic_render.get(coll.id, "")
+        return self._mosaic_kind, self._mosaic_lookback, render
 
     def _invite_mosaic(self) -> None:
         """A collection the 9 squares can mosaic was picked: they animate.
@@ -2331,60 +2355,67 @@ class QStacDock(QDockWidget):
             self.btn_mosaic.animate(settings.mosaic_animation())
 
     def _show_mosaic_menu(self, pos: QPoint) -> None:
-        """Right-click on the 9 squares: which mosaic a click builds, and
-        what it shows (the default, a band combination or an index)."""
+        """Right-click on the 9 squares: which mosaic (radio buttons and a
+        checkbox: the menu stays open on them), then what it shows (the
+        default, a band combination, an index): a pick of that builds it."""
         coll = self._current_collection()
         if coll is None or self._tile_task is not None:
             return  # building: a click cancels, a pick would start another
         menu = QMenu(self)
+        menu.setToolTipsVisible(True)
         if not coll.timeless:  # else no dates: the newest is the one mosaic
             self._add_mosaic_kinds(menu, coll)
-            only = menu.addAction("Only the search dates")
-            only.setCheckable(True)
-            only.setChecked(settings.mosaic_lookback_days() == 0)
-            only.setEnabled(settings.mosaic_kind() == "tile")  # by date: always
-            only.setToolTip(
-                "Newest scenes: none from before the start date, an area the"
-                " dates leave empty stays empty"
-            )
-            only.toggled.connect(self._set_only_dates)
             menu.addSeparator()
-        render = self._mosaic_render.get(coll.id, "")
+        _, _, render = self._mosaic_options(coll, picked=True)
         # The TCI preset is the default already when the TCI is used.
         tci = (coll.visual_asset,) if _uses_visual(coll) else None
         bands = ["", *(b.label for b in coll.band_presets if b.assets != tci)]
-        for group in (bands, _mosaic_index_labels(coll)):
-            for label in group:
-                action = menu.addAction(label or _default_label(coll))
-                action.setCheckable(True)
-                action.setChecked(label == render)
-                action.triggered.connect(
-                    lambda _=False, r=label: self._set_mosaic_render(coll.id, r)
-                )
+        indices = _mosaic_index_labels(coll)
+        self._add_mosaic_renders(menu, coll, bands, render)
+        if indices:
             menu.addSeparator()
-        menu.setToolTipsVisible(True)
+            picked = f": {render}" if render in indices else ""
+            sub = menu.addMenu(f"Spectral index{picked}")
+            self._add_mosaic_renders(sub, coll, indices, render)
         menu.exec(self.btn_mosaic.mapToGlobal(pos))
 
+    def _add_mosaic_renders(
+        self, menu: QMenu, coll: CollectionInfo, labels: list[str], render: str
+    ) -> None:
+        """One action per look in *labels* ("" the default), a pick builds
+        it; *render*'s alone ticked (an empty box on each said "toggle")."""
+        for label in labels:
+            action = menu.addAction(label or _default_label(coll))
+            action.setCheckable(label == render)
+            action.setChecked(label == render)
+            action.triggered.connect(
+                lambda _=False, r=label: self._set_mosaic_render(coll.id, r)
+            )
+
     def _set_mosaic_render(self, coll_id: str, render: str) -> None:
-        """A pick builds that mosaic now; a later click builds it again."""
+        """A pick builds that mosaic now, and again from the menu later."""
         self._mosaic_render[coll_id] = render
-        self._sync_mosaic_button()
-        self._tile_mosaic()
+        self._tile_mosaic(picked=True)
 
     def _add_mosaic_kinds(self, menu: QMenu, coll: CollectionInfo) -> None:
-        """The mosaic menu's first choice: newest scenes, or one per date."""
-        kind = settings.mosaic_kind()
+        """Newest scenes or one per date, and the search dates only: set in
+        place, the menu open (a ``QWidgetAction``), so they go with the
+        pick below rather than each building a mosaic."""
+        kind, days, _ = self._mosaic_options(coll, picked=True)
         newest = (
-            (
-                "Newest scene per tile",
-                _lookback_text(settings.mosaic_lookback_days()),
-            )
+            ("Newest scene per tile", _lookback_text(days))
             if coll.mosaic_reach_days
             else (
                 "Newest scene of each place",
                 "Newest first, until the area is covered",
             )
         )
+        box = QWidget(menu)
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(10, 6, 12, 4)
+        lay.setSpacing(4)
+        group = QButtonGroup(box)
+        only = QCheckBox("Only the search dates", box)
         for key, text, tip in (
             ("tile", *newest),
             (
@@ -2394,23 +2425,45 @@ class QStacDock(QDockWidget):
                 " the dates that have scenes",
             ),
         ):
-            action = menu.addAction(text)
-            action.setCheckable(True)
-            action.setChecked(key == kind)
-            action.setToolTip(tip)
-            action.triggered.connect(lambda _=False, k=key: self._set_mosaic_kind(k))
+            radio = QRadioButton(text, box)
+            radio.setToolTip(tip)
+            radio.setChecked(key == kind)
+            radio.toggled.connect(
+                lambda on, k=key: on and self._set_mosaic_kind(k, only)
+            )
+            group.addButton(radio)
+            lay.addWidget(radio)
+            if key == "tile":  # right under Newest: its option
+                row = QHBoxLayout()
+                row.addSpacing(22)
+                row.addWidget(only)
+                lay.addLayout(row)
+        only.setToolTip(
+            "Newest scenes: none from before the start date, an area the"
+            " dates leave empty stays empty. One mosaic per date: always"
+        )
+        self._sync_only_dates(only)
+        only.toggled.connect(self._set_only_dates)
+        action = QWidgetAction(menu)
+        action.setDefaultWidget(box)
+        menu.addAction(action)
 
-    def _set_mosaic_kind(self, kind: str) -> None:
-        settings.save_all({"mosaic_kind": kind})
-        self._sync_mosaic_button()
-        self._tile_mosaic()
+    def _set_mosaic_kind(self, kind: str, only: QCheckBox) -> None:
+        self._mosaic_kind = kind
+        self._sync_only_dates(only)
+
+    def _sync_only_dates(self, only: QCheckBox) -> None:
+        """Newest scenes: the pick; one mosaic per date: ticked and greyed,
+        as it never looks back."""
+        by_time = self._mosaic_kind == "time"
+        only.blockSignals(True)  # not a pick of the user's
+        only.setChecked(by_time or self._mosaic_lookback == 0)
+        only.blockSignals(False)
+        only.setEnabled(not by_time)
 
     def _set_only_dates(self, on: bool) -> None:
-        """Off: a year's look back (Settings > Mosaic sets others)."""
-        days = 0 if on else 365
-        settings.save_all({"mosaic_lookback_days": days})
-        self._sync_mosaic_button()
-        self._tile_mosaic()
+        """Off: a year's look back for the tiles the dates leave empty."""
+        self._mosaic_lookback = 0 if on else 365
 
     def _on_mosaic_clicked(self) -> None:
         if self._tile_task is not None:
@@ -2431,18 +2484,18 @@ class QStacDock(QDockWidget):
         elif self._area is None and self._search_band is not None:
             self._search_band.reset(QgsWkbTypes.GeometryType.Polygon)
 
-    def _tile_mosaic(self) -> None:
+    def _tile_mosaic(self, picked: bool = False) -> None:
         """Mosaic every tile of the form's area, its newest scenes on top.
 
         A search of its own (TileSearchTask), going back in time for the
         tiles the dates leave uncovered: the result list is not used.
+        *picked*: with the right-click menu's options (``_mosaic_options``).
         """
         run = self._form_run()
         if run is None or self._tile_task is not None:
             return
-        assets = _mosaic_assets(
-            run.collection, self._mosaic_render.get(run.collection.id)
-        )
+        kind, days, shows = self._mosaic_options(run.collection, picked)
+        assets = _mosaic_assets(run.collection, shows)
         sign = _sign_func(run.catalog)
         canvas = self.iface.mapCanvas()
         view = (viewport_bbox_4326(canvas), _canvas_pixel_size(canvas))
@@ -2474,9 +2527,9 @@ class QStacDock(QDockWidget):
             assets,  # what the mosaic reads
             settings.http_timeout(),
             run.collection.mosaic_reach_days,
-            by_time=settings.mosaic_kind() == "time" and not run.collection.timeless,
+            by_time=kind == "time" and not run.collection.timeless,
             area=run.area,
-            lookback_days=settings.mosaic_lookback_days(),
+            lookback_days=days,
             max_scenes=settings.mosaic_max_scenes(),
             timeless=run.collection.timeless,
             on_pick=clip,
@@ -2485,16 +2538,22 @@ class QStacDock(QDockWidget):
         # A bound method: the signal comes from the worker thread.
         task.progressChanged.connect(self._sync_mosaic_button)
         preview = (view, clips)
-        task.taskCompleted.connect(lambda: self._on_tiles_found(task, run, preview))
-        task.taskTerminated.connect(lambda: self._on_tiles_found(task, run, preview))
+        found = partial(self._on_tiles_found, task, run, shows, preview)
+        task.taskCompleted.connect(found)
+        task.taskTerminated.connect(found)
         self._sync_mosaic_button()
         self._loader.run_task(task)
 
     def _on_tiles_found(
-        self, task: TileSearchTask, run: _SearchRun, preview: tuple | None = None
+        self,
+        task: TileSearchTask,
+        run: _SearchRun,
+        render: str = "",
+        preview: tuple | None = None,
     ) -> None:
-        """The tile search ended: build its mosaic. *preview*: the view at the
-        click and the preview clips made of it (``MosaicBuildTask``)."""
+        """The tile search ended: build its mosaic, showing *render* (a band
+        combination or index label, "" the default). *preview*: the view at
+        the click and the preview clips made of it (``MosaicBuildTask``)."""
         if self._closed or task is not self._tile_task:
             return
         self._tile_task = None
@@ -2545,7 +2604,6 @@ class QStacDock(QDockWidget):
             return
         # Its own snapshot's collection: there may have been no search at all.
         coll = run.collection
-        render = self._mosaic_render.get(coll.id, "")
         band = next((b for b in coll.band_presets if b.label == render), None)
         index = None
         if render and band is None:

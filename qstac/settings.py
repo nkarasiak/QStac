@@ -50,13 +50,6 @@ DEFAULTS: dict[str, object] = {
     # default loads: one 8-bit COG instead of a 3-band 16-bit VRT.
     "use_visual_asset": True,
     "stretch_method": "fixed",  # "fixed", "cumulative_cut", "min_max"
-    # The Mosaic button's mosaic (its right-click menu): "tile", each
-    # tile's newest scene going back in time, or "time", every scene of the
-    # dates with the newest on top.
-    "mosaic_kind": "tile",
-    # How far before the start date a tile mosaic looks for a tile the dates
-    # leave empty; 0 (the default) keeps it to the search dates.
-    "mosaic_lookback_days": 0,
     # A mosaic per date keeps the newest this many scenes of its dates; one
     # with no tile grid (a DEM) reads at most this many to cover the area.
     "mosaic_max_scenes": 500,
@@ -401,14 +394,6 @@ def date_presets() -> list[int | str]:
 
 def use_visual_asset() -> bool:
     return bool(_get("use_visual_asset", bool))
-
-
-def mosaic_kind() -> str:
-    return "time" if _get("mosaic_kind", str) == "time" else "tile"
-
-
-def mosaic_lookback_days() -> int:
-    return int(_get("mosaic_lookback_days", int))
 
 
 def mosaic_max_scenes() -> int:

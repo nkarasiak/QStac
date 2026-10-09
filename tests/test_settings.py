@@ -54,19 +54,19 @@ def test_dialog_round_trip() -> None:
         assert str(value) == str(settings.DEFAULTS[key]), (key, value)
 
     # Reset page touches only that page's widgets.
-    lookback, mosaic_page = dlg._fields["mosaic_lookback_days"]
+    most, mosaic_page = dlg._fields["mosaic_max_scenes"]
     timeout, _ = dlg._fields["http_timeout"]
-    lookback.setValue(365)
+    most.setValue(1000)
     timeout.setValue(99)
     dlg._pages.setCurrentIndex(mosaic_page)
     dlg._reset_page()
-    assert lookback.value() == 0
+    assert most.value() == 500
     assert timeout.value() == 99
     dlg._restore_defaults()
     assert timeout.value() == settings.DEFAULTS["http_timeout"]
 
     # Saved values come back in a new dialog.
-    lookback.setValue(365)
+    most.setValue(1000)
     editor = dlg._fields["date_buttons"][0]
     editor._add()  # a 90-day button at the end
     editor._table.selectRow(0)
@@ -83,11 +83,11 @@ def test_dialog_round_trip() -> None:
     assert editor.presets() == [14, "this_year", "all", "last_year", 90]
     dlg._fields["start_on"][0].setCurrentIndex(1)
     changed = settings.save_all(dlg.collect_values())
-    assert changed == {"mosaic_lookback_days", "date_buttons", "start_on"}, changed
+    assert changed == {"mosaic_max_scenes", "date_buttons", "start_on"}, changed
     assert settings.date_presets() == [14, "this_year", "all", "last_year", 90]
     assert settings.start_on() == "last"
     again = SettingsDialog().collect_values()
-    assert again["mosaic_lookback_days"] == 365
+    assert again["mosaic_max_scenes"] == 1000
     assert again["date_buttons"] == "14, this_year, all, last_year, 90"
 
 

@@ -104,9 +104,14 @@ shows) plays one animation of the squares
 (`_invite_mosaic()`, `MosaicButton.animate()`): the `mosaic_animation` setting
 (Settings > Mosaic), *sweep* (a light crosses them diagonally twice, 2.1 s, the default),
 *build* (they land one by one, centre first, 2 s), *pulse* (they breathe twice, 2.4 s) or
-*off*. Not at dock start (it restores a collection), not while a mosaic runs. Right-click (`_show_mosaic_menu()`) picks what a
-click builds, kept in the `mosaic_kind` setting: *Newest scene per tile*
-(`tile`, the default, below) or *One mosaic per date, with the time slider*
+*off*. Not at dock start (it restores a collection), not while a mosaic runs. A click builds the default: each tile's newest scene of the
+search dates, in the collection's default look (`_mosaic_options(picked=False)`).
+Right-click (`_show_mosaic_menu()`) builds another, its picks kept for the
+session, never saved (two saved settings for it once made a click build one
+mosaic per date unasked). On top, set in place while the menu stays open
+(a `QWidgetAction` of radio buttons and a checkbox: as submenus each pick
+built a mosaic, and per-date NDVI took two builds): *Newest scene per tile*
+(`tile`, below) or *One mosaic per date, with the time slider*
 (`time`, to see the area change: `TileSearchTask(by_time=True)` with
 `_EveryScene` in place of `TileCover` takes every scene of the dates, no
 reach, the newest `mosaic_max_scenes` (500, Settings > Mosaic); `_mosaic_per_date()` builds one mosaic per
@@ -115,14 +120,15 @@ UTC day, `load_mosaic(stack=True)` so the time filter is not lifted, and
 over `_DATES_ASKED` (12) dates it asks first, via `_choose()`, whether to build
 only the 12 covering most of the area — `geo.day_cover()`, computed in the
 task — or all: over a wide area most dates are one orbit's strip of it).
-Under them *Only the search dates* (enabled for the newest-scenes kind) sets
-`mosaic_lookback_days` to 0 (the default), or to 365 when unchecked: no scene
-from before the start date, for a tile mosaic or an area cover alike.
-A pick builds that mosaic at once (not while one builds: no menu then), and
-later clicks build it again. Below that it picks what the mosaic shows, per collection for the session
-(`_mosaic_render`): the default, a band combination, or an index (the
-curated ones, then the templates of its kind, radar or not, and saved ones:
-`_mosaic_index_labels()`). No scene is known yet, so a template is resolved
+Right under *Newest*, indented as its option, *Only the search dates* (ticked)
+looks back 0 days, unticked 365: no scene from before the start date, for a
+tile mosaic or an area cover alike; one mosaic per date shows it ticked and
+greyed. Below them, what the mosaic shows, a pick building it (not while one
+builds: no menu then): the default and the band combinations, then the
+*Spectral index* submenu (the curated ones, then the templates of its kind,
+radar or not, and saved ones: `_mosaic_index_labels()`), titled with an index
+picked; only the current look is ticked, as an empty box on each read as a
+toggle. No scene is known yet, so a template is resolved
 on the scenes found (`_on_tiles_found()`; refused if they lack its bands) and
 the search keeps every asset for it (`_mosaic_assets()`). Tried before: two equal
 Search/Mosaic buttons, a Scenes | Mosaic mode switch, a text link under
@@ -139,7 +145,7 @@ published late), MODIS 09Q1 (40: 8-day composites, ~3 weeks late). Any
 other collection (no tile grid, or none tried) is covered by area instead
 (`geo.area_cover()`: `TileCover` with the search area as its one tile): its
 scenes up to the end date (from 1900: the Copernicus Data Space API refuses
-`../end`; from the start date when `mosaic_lookback_days` is 0), newest first (`sortby`), a scene kept only where it adds ground,
+`../end`; from the start date with *Only the search dates*), newest first (`sortby`), a scene kept only where it adds ground,
 until the area is covered or `mosaic_max_scenes` are read; then it asks
 before building the part they cover (a world-wide view of CDSE's 30 m DEM
 is thousands of 1° tiles, the newest 1000 a strip of it). A DEM or yearly
@@ -157,8 +163,8 @@ tile mosaic the dates are cut into 2-day windows,
 searched 8 at a time (no next-page token chain: one took 30 s for France and
 Iberia) and trimmed by the fields extension (`supports_fields`, from
 `conformsTo`) to the footprint, properties and the assets the mosaic reads.
-Windows are read newest first, from the end date back to `mosaic_lookback_days`
-(0 by default: the search dates only; Settings > Mosaic) before the
+Windows are read newest first, from the end date back to the look back
+(0 by default: the search dates only; the right-click menu) before the
 start date, and the search stops once every tile is covered within the search
 area (`TileCover(within=)`: a tile the view clips needs only its part, not
 its older scenes' slivers outside it); the last
